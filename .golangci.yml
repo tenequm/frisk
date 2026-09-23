@@ -1,0 +1,116 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - copyloopvar
+    - dupl
+    - durationcheck
+    - err113
+    - errname
+    - errorlint
+    - exhaustive
+    - exptostd
+    - fatcontext
+    - goconst
+    - gocritic
+    - gosec
+    - intrange
+    - misspell
+    - modernize
+    - musttag
+    - nakedret
+    - nestif
+    - nilerr
+    - noctx
+    - nolintlint
+    - nonamedreturns
+    - perfsprint
+    - prealloc
+    - revive
+    - sqlclosecheck
+    - testifylint
+    - thelper
+    - unconvert
+    - unparam
+    - usestdlibvars
+    - usetesting
+    - wastedassign
+    - whitespace
+    - wrapcheck
+  settings:
+    govet:
+      enable:
+        - shadow
+    gocritic:
+      enabled-checks:
+        - nestingReduce
+    revive:
+      enable-all-rules: true
+      rules:
+        # enable-all-rules turns on `unhandled-error`, which flags `fmt.Println` in main.
+        # Under enable-all-rules a rule's `arguments` are ignored (the rule registers
+        # twice), so an allowlist does not work here - only `disabled` takes effect.
+        - name: unhandled-error
+          disabled: true
+        # Single-file CLI: rule/prose tables and the tier walk trip line-count
+        # and literal-count heuristics without being wrong.
+        - name: add-constant
+          disabled: true
+        - name: cognitive-complexity
+          disabled: true
+        - name: cyclomatic
+          disabled: true
+        - name: function-length
+          disabled: true
+        - name: line-length-limit
+          disabled: true
+    errcheck:
+      check-type-assertions: true
+  exclusions:
+    generated: strict
+    presets:
+      - comments
+      - std-error-handling
+      - common-false-positives
+    rules:
+      - path: _test\.go
+        linters:
+          - gocyclo
+          - errcheck
+          - dupl
+          - goconst
+          - gosec
+          - wrapcheck
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    gofumpt:
+      # Select rules individually. `extra-rules: true` is deprecated, and it also
+      # switches on `balance_calls`, which gofumpt itself demoted as controversial.
+      extra:
+        group-params: true
+        clothe-returns: true
+        balance-calls: false
+  exclusions:
+    generated: strict
+    paths:
+      - vendor/
+
+output:
+  formats:
+    text:
+      path: stdout
+      print-linter-name: true
+      colors: true
+  sort-order:
+    - linter
+    - file
+  show-stats: true

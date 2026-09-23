@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": ["$defaults", "just check", "kubectl get *"],
+    "deny": ["gopass show -o *"],
+    "ask": ["ssh prod *"]
+  },
+  "judge": {
+    "environment": ["$defaults", "Hosts under *.internal.example.com are the user's own machines"],
+    "allow": ["$defaults"],
+    "soft_deny": ["$defaults", "Modifying local tool state outside the project"],
+    "hard_deny": ["$defaults"]
+  },
+  "jev": {
+    "model": "jev-1.13.0",
+    "keyCmd": ["gopass", "show", "-o", "api/typesafe"],
+    "timeoutMs": 5000
+  }
+}

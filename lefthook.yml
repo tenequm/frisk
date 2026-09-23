@@ -1,0 +1,30 @@
+assert_lefthook_installed: true
+
+pre-commit:
+  piped: true
+  commands:
+    gitleaks:
+      run: gitleaks git --staged --redact --no-banner
+    fmt:
+      glob: "*.go"
+      run: golangci-lint fmt {staged_files}
+      stage_fixed: true
+    lint:
+      glob: "*.go"
+      # Never pass a bare file list to `golangci-lint run`: one file of a
+      # multi-file package reports phantom typecheck errors. Lint packages.
+      run: printf '%s\n' {staged_files} | xargs -n1 dirname | sort -u | xargs golangci-lint run --fix
+      stage_fixed: true
+    mod-tidy:
+      glob: "*.{go,mod,sum}"
+      run: go mod tidy
+
+pre-push:
+  commands:
+    test:
+      run: go test -race ./...
+
+post-checkout:
+  commands:
+    kasetto:
+      run: command -v kst >/dev/null 2>&1 && kst sync -q --color never || true
