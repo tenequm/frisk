@@ -2,3 +2,4 @@
 coverage.out
 .claude/skills/
 .agents/skills/
+/ops/classifier-data/classifier.duckdb
