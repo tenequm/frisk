@@ -38,6 +38,9 @@ Conventions:
 - [Core is generic, config is personal](core-generic-config-specific.md) - Builtin
   rules must be right for any user on Linux or macOS; one user's tools, hosts and
   secret-handling policy live in their config.
+- [Weak judge verdicts are not acted on](confidence-floors.md) - A judge allow
+  below 0.75, an ask below 0.50 or a deny below 0.50 is downgraded rather than
+  enforced, because low-confidence verdicts were mostly wrong in live use.
 
 ## Findings
 
@@ -50,6 +53,10 @@ Conventions:
 - [Static allow needs argument screening](static-allow-needs-argument-screening.md) -
   A read-only verb list is not a safe allow rule; arguments, flags, environment
   prefixes and globs can turn a reader into a writer, an executor or a secret leak.
+- [A script the judge cannot see must be reported](unseen-script-must-be-reported.md) -
+  When a command runs a script whose body is not attached, the judge rates the
+  harmless-looking command line and allows it, so the probe must follow the command
+  to the real file and say so when it cannot.
 
 ## References
 

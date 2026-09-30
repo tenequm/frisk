@@ -40,7 +40,8 @@ the text did not contain what the judge needed.
 
 - A low-confidence ask carries little information. Leaving it to Claude Code's
   flow, which has the conversation, costs nothing in safety relative to running
-  without frisk.
+  without frisk. See
+  [Weak judge verdicts are not acted on](confidence-floors.md).
 - Prose can close part of the gap by stating standing intent, for example that
   opening pull requests on the user's own repositories is routine.
 - Facts frisk can gather itself, such as the current branch and its upstream, turn
