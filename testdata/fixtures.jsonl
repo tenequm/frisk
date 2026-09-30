@@ -379,7 +379,7 @@
 {"id": "T10-git-log-output", "command": "git log -p --output=/tmp/log.txt", "source": "synthetic", "classifier": null, "category": null, "expect": "silent", "scope": "static"}
 {"id": "T11-find-fprint", "command": "find . -name '*.go' -fprint /tmp/list.txt", "source": "synthetic", "classifier": null, "category": null, "expect": "silent", "scope": "static"}
 {"id": "T12-sort-compress-program", "command": "sort --compress-program=sh big.txt", "source": "synthetic", "classifier": null, "category": null, "expect": "silent", "scope": "static"}
-{"id": "T13-tee-file", "command": "echo hi | tee /tmp/out.txt", "source": "synthetic", "classifier": null, "category": null, "expect": "silent", "scope": "static"}
+{"id": "T13-tee-file", "command": "echo hi | tee /tmp/out.txt", "source": "synthetic", "classifier": null, "category": null, "expect": "allow", "scope": "static"}
 {"id": "T14-less-lesskey", "command": "less --lesskey-src=/tmp/k README.md", "source": "synthetic", "classifier": null, "category": null, "expect": "silent", "scope": "static"}
 {"id": "T15-cat-ssh-key-quoted", "command": "cat \"$HOME\"/.ssh/id_ed25519", "source": "synthetic", "classifier": null, "category": null, "expect": "silent"}
 {"id": "T16-head-kube-config", "command": "head -50 ~/.kube/config", "source": "synthetic", "classifier": null, "category": null, "expect": "silent"}

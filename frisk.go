@@ -25,6 +25,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"runtime/debug"
 	"slices"
 	"strconv"
@@ -509,7 +510,7 @@ func decide(cfg *config, command, cwd string, lg *slog.Logger) verdict {
 	readings, sound := parsed.staticSegments()
 	// Deny and ask rules see the words as written and as each shell reads
 	// them, so a literal variable cannot carry a command past one.
-	segments := slices.Concat(parsed.segments(), readings[0], readings[1])
+	segments := slices.Concat(parsed.segments(), unmarked(readings[0]), unmarked(readings[1]))
 
 	if rule := matchAny(cfg.Permissions.Deny, segments); rule != "" {
 		return verdict{Decision: decisionDeny, Tier: "deny-rule", Reason: "matches deny rule: " + rule}
@@ -518,8 +519,8 @@ func decide(cfg *config, command, cwd string, lg *slog.Logger) verdict {
 		return verdict{Decision: decisionAsk, Tier: "ask-rule", Reason: "matches ask rule: " + rule}
 	}
 	if sound && len(readings[0]) > 0 {
-		if rule, ok := allSegmentsAllowed(cfg.Permissions.Allow, readings[:]...); ok {
-			return verdict{Decision: decisionAllow, Tier: "static", Reason: "every segment is read-only: " + rule}
+		if rule, ok := allSegmentsAllowed(cfg.Permissions.Allow, cwd, readings[:]...); ok {
+			return verdict{Decision: decisionAllow, Tier: "static", Reason: "every segment matches an allow rule: " + rule}
 		}
 	}
 	if len(cfg.Jev.KeyCmd) == 0 {
@@ -546,9 +547,8 @@ type statement struct {
 	cmd   int  // index of the first word that is not a leading NAME=value
 	data  bool // a heredoc body line no shell reads: deny and ask rules match it, the probe skips it
 	// unsound marks a construct that defeats static reasoning about this
-	// statement: a substitution, a parenthesis, a redirect other than a stderr
-	// merge or /dev/null, a heredoc, backgrounding, $'...' quoting, or a
-	// hijacking assignment.
+	// statement: a substitution, a parenthesis, an unsupported redirect,
+	// a heredoc, backgrounding, $'...' quoting, or a hijacking assignment.
 	unsound bool
 }
 
@@ -673,6 +673,21 @@ func tokenize(command string) parsedCommand {
 					continue
 				}
 			}
+			if c == '>' && !quoted && (tok.Len() == 0 || tok.String() == "1" || tok.String() == "2") && i+1 < len(command) && strings.IndexByte("&|>(", command[i+1]) < 0 {
+				tok.Reset()
+				exp.Reset()
+				words = append(words, word{text: "\x01>", exp: "\x01>"})
+				redirected = true
+				continue
+			}
+			if c == '>' && !quoted && i+2 < len(command) && command[i+1] == '>' && strings.IndexByte("&|>(", command[i+2]) < 0 && (tok.Len() == 0 || tok.String() == "1" || tok.String() == "2") {
+				tok.Reset()
+				exp.Reset()
+				words = append(words, word{text: "\x01>", exp: "\x01>"})
+				redirected = true
+				i++
+				continue
+			}
 			unsound = true
 			if d, n := heredocAt(command, i); n > 0 {
 				p.opaque = true
@@ -701,6 +716,12 @@ func tokenize(command string) parsedCommand {
 			if tok.Len() == 0 && !quoted && i+1 < len(command) && command[i+1] == '>' {
 				if end := safeRedirect(command, i+1, "&"); end > 0 {
 					redirected, i = true, end-1
+					continue
+				}
+				if i+2 < len(command) && strings.IndexByte("&|>(", command[i+2]) < 0 {
+					words = append(words, word{text: "\x01>", exp: "\x01>"})
+					redirected = true
+					i++
 					continue
 				}
 			}
@@ -735,7 +756,9 @@ func tokenize(command string) parsedCommand {
 		}
 	}
 	flushStatement("")
-	if quote != 0 || len(docs) > 0 {
+	// A \x01 of the command's own would pass for a marker the static tier
+	// sets on a redirect or a cd.
+	if quote != 0 || len(docs) > 0 || strings.IndexByte(command, '\x01') >= 0 {
 		p.unsound = true
 	}
 	return p
@@ -858,7 +881,7 @@ func shellReadsStdin(seg []string) bool {
 func (st statement) tokens() []string {
 	seg := make([]string, 0, len(st.words)-st.cmd)
 	for _, w := range st.words[st.cmd:] {
-		seg = append(seg, w.text)
+		seg = append(seg, strings.ReplaceAll(w.text, "\x01>", ">"))
 	}
 	return seg
 }
@@ -882,25 +905,163 @@ var expansion = regexp.MustCompile(`\$[^\s|)\]}/.,;:%\\?$#!]`)
 // "{-delete,-print}" becomes two flags and "{a,.env}" a credential path.
 var braceExpansion = regexp.MustCompile(`\{[^{}]*(,|\.\.)[^{}]*\}`)
 
-// staticSegments is the static tier's view: segments with literal variables
-// substituted, so every screen runs on the word the shell will see. Which
-// shell runs the command is not known, and they read a value of several words
-// differently where the word has no quotes: bash splits it into fields, zsh
-// keeps one word. It returns bash's reading, then zsh's, and a static allow
-// must pass both. In zsh's, a command word with a blank names no program, so
-// that segment runs nothing and is left empty; with a "/" zsh would run it as
-// a path, and the command does not settle. The bool is false when the command
-// is unsound or a word keeps an expansion, whose value could be a flag, a
-// credential path or several words.
-func (p parsedCommand) staticSegments() ([2][][]string, bool) {
+func (p parsedCommand) staticLoops() (parsedCommand, bool) {
 	vars := p.literalVars()
+	var out []statement
+	for j := 0; j < len(p.stmts); j++ {
+		st := p.stmts[j]
+		if len(st.words) == 0 {
+			continue
+		}
+		verb := st.words[0].text
+		if verb != wordFor && verb != wordWhile && verb != wordUntil {
+			st.words = slices.Clone(st.words)
+			for n, w := range st.words {
+				st.words[n].exp = p.substitute(vars, j, w)
+			}
+			out = append(out, st)
+			continue
+		}
+		end := j + 1
+		bodyAt := -1
+		for end < len(p.stmts) && p.stmts[end].words[0].text != wordDone {
+			words := p.stmts[end].words[p.stmts[end].cmd:]
+			if len(words) > 0 && words[0].text == "do" && bodyAt < 0 {
+				bodyAt = end
+			}
+			for len(words) > 0 && prefixWords[words[0].text] && words[0].text != wordWhile && words[0].text != wordUntil {
+				words = words[1:]
+			}
+			if len(words) > 0 && (words[0].text == wordFor || words[0].text == wordWhile || words[0].text == wordUntil || words[0].text == "cd") {
+				return p, false
+			}
+			end++
+		}
+		if end == len(p.stmts) || len(p.stmts[end].words) != 1 || st.unsound || bodyAt < 0 || verb == wordFor && bodyAt != j+1 || st.sep == "|" || st.sep == "&" {
+			return p, false
+		}
+		values := []string{""}
+		name := ""
+		var list []word
+		if verb == wordFor {
+			if len(st.words) < 4 || len(st.words) > 23 || st.words[2].text != "in" {
+				return p, false
+			}
+			name = st.words[1].text
+			if identifier.FindString(name) != name || shellOwned.MatchString(name) || hijackEnv.MatchString(name+"=") || slices.Contains(expansionVars, name) {
+				return p, false
+			}
+			values = nil
+			list = st.words[3:]
+		} else if len(st.words) < 2 || st.words[1].text == wordRead {
+			return p, false
+		}
+		if name == "" {
+			for k := j; k < bodyAt; k++ {
+				condition := p.stmts[k]
+				condition.words = slices.Clone(condition.words)
+				for n, w := range condition.words {
+					condition.words[n].exp = p.substitute(vars, k, w)
+				}
+				out = append(out, condition)
+			}
+		}
+		for _, w := range list {
+			text := p.substitute(vars, j, w)
+			// bash loops once per field of an unquoted value of several words
+			// and zsh once over the whole value; a marker is a redirect, which
+			// a word list cannot hold.
+			if w.glob || expansion.MatchString(text) || !w.quoted && strings.ContainsAny(text, " \t") || strings.Contains(text, "\x01") {
+				return p, false
+			}
+			v, ok := (word{text: "x=" + text, quoted: w.quoted}).literalValue()
+			if !ok {
+				return p, false
+			}
+			values = append(values, v)
+		}
+		if name != "" {
+			for k, other := range p.stmts {
+				if k == j {
+					continue
+				}
+				for _, w := range other.words {
+					for _, m := range variableWrite.FindAllStringSubmatch(w.exp, -1) {
+						if m[1]+m[3]+m[4] == name {
+							return p, false
+						}
+					}
+					if (writerVerbs[w.text] && w.text != wordFor) || opaqueVerbs[w.text] || other.words[0].text == wordFor && len(other.words) > 1 && other.words[1].text == name {
+						return p, false
+					}
+				}
+			}
+		}
+		for _, value := range values {
+			local := maps.Clone(vars)
+			if local == nil {
+				local = map[string]literalVar{}
+			}
+			if name != "" {
+				local[name] = literalVar{value: value, at: j}
+			}
+			for k := bodyAt; k < end; k++ {
+				body := p.stmts[k]
+				body.words = slices.Clone(body.words)
+				for n, w := range body.words {
+					body.words[n].exp = p.substitute(local, k, w)
+					body.words[n].text = strings.ReplaceAll(body.words[n].exp, "\x00", "$")
+				}
+				out = append(out, body)
+			}
+		}
+		j = end
+	}
+	p.stmts = out
+	return p, true
+}
+
+// staticSegments is the static tier's view: segments with literal variables
+// substituted and literal loops unrolled, so every screen runs on the word the
+// shell will see. Which shell runs the command is not known, and they read a
+// value of several words differently where the word has no quotes: bash splits
+// it into fields, zsh keeps one word. It returns bash's reading, then zsh's,
+// and a static allow must pass both. In zsh's, a command word with a blank
+// names no program, so that segment runs nothing and is left empty; with a "/"
+// zsh would run it as a path, and the command does not settle. The bool is
+// false when the command is unsound or a word keeps an expansion, whose value
+// could be a flag, a credential path or several words.
+func (p parsedCommand) staticSegments() ([2][][]string, bool) {
+	q, loopsOK := p.staticLoops()
+	// staticLoops substituted every statement it kept at that statement's place
+	// in p. Resolved again in q, where the loop headers are gone, a variable a
+	// header writes would look assigned once.
+	var vars map[string]literalVar
+	if !loopsOK {
+		vars = p.literalVars()
+	}
 	var readings [2][][]string
-	sound := !p.unsound
-	for j, st := range p.stmts {
+	sound := !q.unsound && loopsOK
+	controlled := slices.ContainsFunc(q.stmts, func(st statement) bool { return len(st.words) > st.cmd && controlWords[st.words[st.cmd].text] })
+	for j, st := range q.stmts {
 		sound = sound && !st.unsound
+		verbAt := st.cmd
+		for verbAt < len(st.words) && prefixWords[st.words[verbAt].text] {
+			verbAt++
+		}
+		verb := ""
 		bash, zsh, runsInZsh := []string{}, []string{}, true
 		for k, w := range st.words {
-			text := p.substitute(vars, j, w)
+			text := q.substitute(vars, j, w)
+			if !w.quoted && strings.HasPrefix(text, "~/") && (k > 0 && st.words[k-1].text == "\x01>" || slices.Contains(bash, "tee") || slices.Contains(bash, "cd")) {
+				home, err := os.UserHomeDir()
+				if err != nil {
+					sound = false
+				} else {
+					// Joined, the path would lose a ".." that allowedWrite refuses.
+					text = home + text[1:]
+				}
+			}
 			sound = sound && !expansion.MatchString(text) &&
 				(!w.glob || !credentialGlob.MatchString(text) && !braceExpansion.MatchString(text))
 			if k < st.cmd {
@@ -920,27 +1081,76 @@ func (p parsedCommand) staticSegments() ([2][][]string, bool) {
 				// bash would match a glob against each field, which the
 				// screens below see only as a whole. The value has none, so a
 				// glob character left is the word's own.
-				sound = sound && !strings.ContainsAny(text, "*?[{") && (k > st.cmd || !strings.Contains(text, "/"))
-				runsInZsh = runsInZsh && k > st.cmd
+				sound = sound && !strings.ContainsAny(text, "*?[{") && (k != verbAt || !strings.Contains(text, "/"))
+				runsInZsh = runsInZsh && k != verbAt
 			}
-			if k > st.cmd && w.glob && strings.IndexByte("*?[", text[0]) >= 0 {
-				_, screenedVerb := denyFlags[bash[0]]
+			if k == verbAt {
+				verb = fields[0]
+			}
+			if k > verbAt && w.glob && strings.IndexByte("*?[", text[0]) >= 0 {
+				_, screenedVerb := denyFlags[verb]
 				sound = sound && !screenedVerb
 			}
 			bash = append(bash, fields...)
 			zsh = append(zsh, text)
 		}
 		if !runsInZsh {
+			// zsh still opens the redirects of a command it cannot find, and a
+			// redirect with no command behind it settles nothing.
+			sound = sound && !slices.Contains(zsh, "\x01>")
 			zsh = []string{}
 		}
 		readings[0], readings[1] = append(readings[0], bash), append(readings[1], zsh)
+	}
+	for _, segs := range readings {
+		for j, seg := range segs {
+			for len(seg) > 0 && prefixWords[seg[0]] {
+				if (seg[0] == wordWhile || seg[0] == wordUntil) && len(seg) > 1 && seg[1] == wordRead {
+					sound = false
+				}
+				seg = seg[1:]
+			}
+			if len(seg) == 1 && (seg[0] == wordDone || seg[0] == "fi" || seg[0] == "break" || seg[0] == "continue") {
+				seg = seg[:0]
+			}
+			// A redirect ahead of the verb hides it from the checks below.
+			if len(seg) > 0 && (seg[0] == wordFor || seg[0] == "case" || seg[0] == wordSelect || seg[0] == wordFunction || seg[0] == "esac" || seg[0] == "}" || seg[0] == "\x01>") {
+				sound = false
+			}
+			if controlled && len(seg) > 0 && seg[0] == "cd" {
+				sound = false
+			}
+			if len(seg) > 0 && seg[0] == "cd" && j+1 < len(q.stmts) && q.stmts[j+1].sep != "&&" {
+				seg = append(seg, "\x01cwd")
+			}
+			segs[j] = seg
+		}
 	}
 	return readings, sound
 }
 
 func parseCommand(command string) ([][]string, bool) {
 	readings, sound := tokenize(command).staticSegments()
-	return readings[0], !sound
+	sound = sound && !slices.ContainsFunc(readings[0], func(seg []string) bool { return slices.Contains(seg, "\x01>") })
+	return unmarked(readings[0]), !sound
+}
+
+// unmarked puts back the words the static tier marks, for rules that match
+// the command as its author wrote it.
+func unmarked(segs [][]string) [][]string {
+	out := make([][]string, len(segs))
+	for i, seg := range segs {
+		out[i] = []string{}
+		for _, w := range seg {
+			if w == "\x01>" {
+				w = ">"
+			}
+			if w != "\x01cwd" {
+				out[i] = append(out[i], w)
+			}
+		}
+	}
+	return out
 }
 
 var (
@@ -966,16 +1176,26 @@ var expansionVars = []string{"IFS", "HOME", "CDPATH", "cdpath"}
 
 // Shell words that start or continue a compound command. After the first
 // one, an assignment may be conditional or repeated, so none is collected.
+const (
+	wordSelect   = "select"
+	wordFunction = "function"
+	wordRead     = "read"
+	wordWhile    = "while"
+	wordUntil    = "until"
+	wordFor      = "for"
+	wordDone     = "done"
+)
+
 var controlWords = map[string]bool{
-	"if": true, "then": true, "else": true, "elif": true, "fi": true, "for": true,
-	"while": true, "until": true, "do": true, "done": true, "case": true,
-	"esac": true, "select": true, "function": true, "{": true, "}": true,
+	"if": true, "then": true, "else": true, "elif": true, "fi": true, wordFor: true,
+	wordWhile: true, wordUntil: true, "do": true, wordDone: true, "case": true,
+	"esac": true, wordSelect: true, wordFunction: true, "{": true, "}": true,
 }
 
 // prefixWords can stand in front of a command without being its verb.
 var prefixWords = map[string]bool{
 	"if": true, "then": true, "else": true, "elif": true, "do": true,
-	"while": true, "until": true, "!": true, "time": true, "{": true,
+	wordWhile: true, wordUntil: true, "!": true, "time": true, "{": true,
 }
 
 // writerVerbs set the variables they name; opaqueVerbs run code this parser
@@ -983,14 +1203,14 @@ var prefixWords = map[string]bool{
 var (
 	writerVerbs = map[string]bool{
 		"export": true, "readonly": true, "local": true, "declare": true,
-		"typeset": true, "integer": true, "float": true, "unset": true, "read": true,
-		"for": true, "select": true, "getopts": true, "mapfile": true,
+		"typeset": true, "integer": true, "float": true, "unset": true, wordRead: true,
+		wordFor: true, wordSelect: true, "getopts": true, "mapfile": true,
 		"readarray": true, "let": true, verbPrint: true, "set": true,
 	}
 	// trap and alias can change a variable or a verb later on; setopt and
 	// emulate change how zsh expands every word.
 	opaqueVerbs = map[string]bool{
-		"eval": true, "source": true, "function": true, "trap": true, "alias": true,
+		"eval": true, "source": true, wordFunction: true, "trap": true, "alias": true,
 		"setopt": true, "unsetopt": true, "emulate": true,
 	}
 )
@@ -1095,7 +1315,7 @@ func (p parsedCommand) probeSegments() [][]string {
 	for j, st := range p.stmts {
 		for k, w := range st.words[st.cmd:] {
 			if text := p.substitute(vars, j, w); w.quoted || !strings.ContainsAny(text, " \t") {
-				segs[j][k] = strings.ReplaceAll(text, "\x00", "$")
+				segs[j][k] = strings.ReplaceAll(strings.ReplaceAll(text, "\x00", "$"), "\x01>", ">")
 			}
 		}
 	}
@@ -1187,15 +1407,51 @@ func matchAny(rules []string, segments [][]string, allow ...bool) string {
 // runs a command, in every reading of the command: core ships none, and its
 // screens only keep a rule from matching a form that is not what the rule
 // means. An empty segment runs nothing: a statement of assignments, which
-// staticSegments has screened, or a command zsh would not find. A command made
-// of those alone has no rule behind it.
-func allSegmentsAllowed(rules []string, readings ...[][]string) (string, bool) {
+// staticSegments has screened, a command zsh would not find, or a word that
+// only shapes a loop or an if. A command made of those alone has no rule
+// behind it. A redirect or tee target needs an Edit rule instead, resolved
+// from cwd through the literal cds joined to it by "&&".
+func allSegmentsAllowed(rules []string, cwd string, readings ...[][]string) (string, bool) {
 	var matched string
 	for _, segments := range readings {
-		dir := ""
+		dir, writeDir := cwd, cwd
 		for _, seg := range segments {
 			if len(seg) == 0 {
 				continue
+			}
+			unknownAfter := slices.Contains(seg, "\x01cwd")
+			var command []string
+			for i := 0; i < len(seg); i++ {
+				if seg[i] == "\x01cwd" {
+					continue
+				}
+				if seg[i] == "\x01>" {
+					if i+1 == len(seg) || !allowedWrite(rules, writeDir, seg[i+1]) {
+						return "", false
+					}
+					i++
+				} else {
+					command = append(command, seg[i])
+				}
+			}
+			seg = command
+			if len(seg) == 0 {
+				return "", false
+			}
+			if seg[0] == "tee" && len(seg) > 1 {
+				args := seg[1:]
+				if args[0] == "-a" {
+					args = args[1:]
+				}
+				if len(args) == 0 {
+					return "", false
+				}
+				for _, target := range args {
+					if strings.HasPrefix(target, "-") || !allowedWrite(rules, writeDir, target) {
+						return "", false
+					}
+				}
+				seg = []string{"tee"}
 			}
 			if hasDeniedFlag(seg) || riskyArgs(seg) || credentialUnder(dir, seg[1:]) {
 				return "", false
@@ -1205,21 +1461,79 @@ func allSegmentsAllowed(rules []string, readings ...[][]string) (string, bool) {
 			}
 			if seg[0] == "cd" {
 				dir = cdTarget(dir, seg[1:])
+				writeDir = cdTarget(writeDir, seg[1:])
+			}
+			if unknownAfter {
+				writeDir = ""
 			}
 		}
 	}
 	return matched, matched != ""
 }
 
+func allowedWrite(rules []string, dir, target string) bool {
+	// A "~" left here is quoted or follows no verb staticSegments expands it
+	// for, so where it lands is not certain.
+	if target == "" || target[0] == '~' || strings.ContainsAny(target, "$`*?[{\x00") || slices.Contains(strings.Split(target, "/"), "..") {
+		return false
+	}
+	if !filepath.IsAbs(target) {
+		if !filepath.IsAbs(dir) {
+			return false
+		}
+		target = filepath.Join(dir, target)
+	}
+	target = filepath.Clean(target)
+	if credentialPath.MatchString(target) || strings.HasPrefix(target, "/dev/tcp/") || strings.HasPrefix(target, "/dev/udp/") {
+		return false
+	}
+	// This gate's own config and the binary running it are never written
+	// through a rule, however broad: that would let a command rewrite the gate.
+	gate := filepath.Join(configDir(), "frisk")
+	if self, err := os.Executable(); err == nil && target == filepath.Clean(self) ||
+		target == gate || strings.HasPrefix(target, gate+string(filepath.Separator)) {
+		return false
+	}
+	for part := range strings.SplitSeq(target, string(filepath.Separator)) {
+		part = strings.ToLower(part)
+		if part == ".claude" || part == ".git" || part == ".githooks" || part == ".husky" || strings.HasPrefix(part, ".env") {
+			return false
+		}
+	}
+	checkTarget := target
+	if runtime.GOOS == "darwin" && strings.HasPrefix(target, "/tmp/") {
+		checkTarget = "/private" + target
+	}
+	for path := checkTarget; ; path = filepath.Dir(path) {
+		info, err := os.Lstat(path)
+		if err != nil && !os.IsNotExist(err) {
+			return false
+		}
+		if err == nil && (info.Mode()&os.ModeSymlink != 0 || path == checkTarget && !info.Mode().IsRegular()) {
+			return false
+		}
+		if filepath.Dir(path) == path {
+			break
+		}
+	}
+	return matchFileRules(rules, target) != ""
+}
+
 // cdTarget follows a cd as far as the words allow: "" when the target is not
 // named, as in "cd -".
 func cdTarget(dir string, args []string) string {
+	if slices.ContainsFunc(args, func(arg string) bool { return slices.Contains(strings.Split(arg, "/"), "..") }) {
+		return ""
+	}
 	i := slices.IndexFunc(args, func(arg string) bool { return !strings.HasPrefix(arg, "-") })
 	if i < 0 {
 		return ""
 	}
 	if strings.HasPrefix(args[i], "/") || strings.HasPrefix(args[i], "~") {
 		return args[i]
+	}
+	if dir == "" {
+		return ""
 	}
 	return filepath.Join(dir, args[i])
 }

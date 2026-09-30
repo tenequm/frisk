@@ -981,7 +981,7 @@ func TestDecideStaticTiers(t *testing.T) {
 		{"find -delete disqualifies", "find . -name x -delete", "", "no-judge"},
 		{"unknown verb is silent without key", "terraform plan", "", "no-judge"},
 		{"substitution never static", "cat $(echo /etc/passwd)", "", "no-judge"},
-		{"redirect never static", "ls > f", "", "no-judge"},
+		{"redirect outside every Edit rule never static", "ls > /srv/f", "", "no-judge"},
 		{"stderr merge is static", "ls 2>&1 | tail -1", decisionAllow, "static"},
 		{"null redirect is static", "git status >/dev/null 2>&1", decisionAllow, "static"},
 		{"null input is static", "cat < /dev/null", decisionAllow, "static"},
@@ -1118,7 +1118,7 @@ func TestDecideStaticTiers(t *testing.T) {
 		{"sed r of a credential file never static", "sed '1r /home/me/.netrc' f", "", "no-judge"},
 		{"find exec with a quoted redirect never static", `find . -exec sh -c 'echo > x' \;`, "", "no-judge"},
 		{"jq env behind a comparison never static", "jq -n 'env | length > 0'", "", "no-judge"},
-		{"real redirect after a quoted one never static", `echo "a > b" > c`, "", "no-judge"},
+		{"real redirect after a quoted one never static", `echo "a > b" > /srv/c`, "", "no-judge"},
 		{"assignment then read stays static", "S=/tmp/x; cat $S/f", decisionAllow, "static"},
 		{"assignment in a chain stays static", `D=src && ls "$D" | head`, decisionAllow, "static"},
 		{"two assignments stay static", "A=src B=docs; ls $A $B", decisionAllow, "static"},
@@ -3336,5 +3336,106 @@ func TestGitRuleGlobals(t *testing.T) {
 		if matchRule("git log *", strings.Fields("git "+global+" log"), true) {
 			t.Errorf("override %q matched", global)
 		}
+	}
+}
+
+func TestStaticLoopsAndWrites(t *testing.T) {
+	cfg := &config{Permissions: permissionsConfig{Allow: exampleAllow(t)}}
+	tests := []struct {
+		command string
+		allow   bool
+	}{
+		{"for x in a b c; do echo $x; done", true},
+		{"for f in README.md DESIGN.md; do wc -l $f; done", true},
+		{"until test -f /tmp/done; do sleep 5; done", true},
+		{"while test -f /tmp/x; do echo x; done", true},
+		{"while test -f /tmp/x && test -f /tmp/y; do echo x; done", true},
+		{"for x in a; do echo while for until cd; done", true},
+		{"if test -f /tmp/x; then echo x; else echo y; fi", true},
+		{"for x in a b; do rm $x; done", false},
+		{"for f in *; do cat $f; done", false},
+		{"for x in $(ls); do echo $x; done", false},
+		{"for x in -delete; do find . $x; done", false},
+		{"while read l; do echo $l; done < f", false},
+		{"for x in a; do echo $x; done; echo $x", false},
+		{"for x in a; do x=b; echo $x; done", false},
+		{"for x in a; do for y in b; do echo $y; done; done", false},
+		{"for ((i=0;i<3;i++)); do echo x; done", false},
+		{"for x in a b c d e f g h i j k l m n o p q r s t u; do echo $x; done", false},
+		{"X=a; for x in $X b; do echo ${x}; done", true},
+		{"for x in a b; do echo $x; continue; done", true},
+		{"rg foo . > /tmp/out.txt", true},
+		{"echo x >> /tmp/out.txt", true},
+		{"echo x 2> /tmp/out.txt", true},
+		{"echo x &> /tmp/out.txt", true},
+		{"just check 2>&1 | tee /tmp/check.log", true},
+		{"echo x | tee -a /tmp/check.log", true},
+		{"echo hi > ~/.claude/settings.json", false},
+		{"echo x > .git/hooks/pre-commit", false},
+		{"echo x > /tmp/../etc/x", false},
+		{"cat f > $OUT", false},
+		{"echo x >| /tmp/f", false},
+		{"echo x > /tmp/.env.foo", false},
+		{"echo x > /tmp/.husky/hook", false},
+		{"echo x > /tmp/.githooks/hook", false},
+		{"echo x > /tmp/.git/config", false},
+		{"echo x > /tmp/.CLAUDE/settings.json", false},
+		{"echo x < /tmp/f", false},
+		{"echo x > /tmp/f 3>&1", false},
+		{"echo x | tee -- /tmp/f", false},
+		{"cd /tmp && echo x > output.txt", true},
+		{"cd -; echo x > output.txt", false},
+		{"cd /tmp/missing; echo x > output.txt", false},
+		{"cd /tmp || echo x > output.txt", false},
+		{"for x in a; do echo $x; done; for y in b; do echo $y; done", true},
+		{"for b in a c; do git log $b; done", true},
+		{"for r in origin; do git fetch --prune $r; done", false},
+		{`A="-l -a"; for x in a b; do ls $A $x; done`, true},
+		{`C="git status"; for x in a; do $C $x; done`, true},
+		{`A="-x rm"; for x in a; do fd . $A; done`, false},
+		{`C="./tool arg"; for x in a; do $C $x; done`, false},
+		{`A="a b"; for x in "$A"; do echo $x; done`, true},
+		{`A="a b"; for x in $A; do echo $x; done`, false},
+		{`A="-l -a"; ls $A > /tmp/out.txt`, true},
+		{`C="git status"; $C --short > /tmp/out.txt`, false},
+		{"V=x-delete; for IFS in x; do find . $V; done", false},
+		{"> /tmp/out.txt find . *", false},
+		{"echo x > ~/../../../tmp/f", false},
+		{"cd /tmp && echo x | tee '~/f'", false},
+		{"echo \"\x01>\" /tmp/f", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.command, func(t *testing.T) {
+			got := decide(cfg, tt.command, t.TempDir(), nil)
+			if (got.Decision == decisionAllow) != tt.allow {
+				t.Fatalf("decision=%q tier=%q reason=%q", got.Decision, got.Tier, got.Reason)
+			}
+		})
+	}
+	for _, rule := range []string{"Edit(/Users/**)", "Edit(~/**)"} {
+		broad := &config{Permissions: permissionsConfig{Allow: append(slices.Clone(cfg.Permissions.Allow), rule)}}
+		if got := decide(broad, "echo hi > ~/.claude/settings.json", t.TempDir(), nil); got.Decision == decisionAllow {
+			t.Fatal("allowed protected target with", rule)
+		}
+	}
+	gate := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", gate)
+	broad := &config{Permissions: permissionsConfig{Allow: append(slices.Clone(cfg.Permissions.Allow), "Edit("+gate+"/**)")}}
+	for _, command := range []string{"echo {} > " + gate + "/frisk/config.json", "echo x | tee -a " + gate + "/frisk/config.json"} {
+		if got := decide(broad, command, t.TempDir(), nil); got.Decision == decisionAllow {
+			t.Fatal("allowed a write to the gate's own config:", command)
+		}
+	}
+	dir := t.TempDir()
+	target := filepath.Join(dir, "link")
+	if err := os.Symlink(t.TempDir(), target); err != nil {
+		t.Fatal(err)
+	}
+	scoped := &config{Permissions: permissionsConfig{Allow: []string{"echo *", "Edit(" + dir + "/**)"}}}
+	if got := decide(scoped, "echo x > "+target+"/file", dir, nil); got.Decision == decisionAllow {
+		t.Fatal("followed symlink")
+	}
+	if got := decide(&config{Permissions: permissionsConfig{Allow: []string{"echo *"}}}, "echo x > /tmp/f", dir, nil); got.Decision == decisionAllow {
+		t.Fatal("allowed write without Edit rule")
 	}
 }
