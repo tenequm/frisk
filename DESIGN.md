@@ -26,7 +26,8 @@ parse into pipeline segments (|, &&, ||, ;, newline)
 2. permissions.ask   match -> "ask"
 3. static allow: EVERY segment provably read-only
    (builtin verb table + config allow; bails on
-    $(), backticks, heredocs, &, # comments, and redirects
+    $(), backticks, heredocs, &, # comments, variables
+    the command does not set to a literal, and redirects
     other than 2>&1 and /dev/null) -> "allow"
 4. judge (needs jev.keyCmd): one Choice question
      allow + confidence >= 0.75 -> "allow"
@@ -110,7 +111,15 @@ less certain, and any command with a subshell, substitution, heredoc, `eval`,
 `source`, `trap` or `alias`, stays `unresolvable`. Names the shell rewrites
 itself (`PWD`, `OLDPWD`, `RANDOM`, `BASH*`, `ZSH*`, ...) never resolve, nor
 does a bare `$NAME` followed by `:` or `[`, which zsh reads as a modifier or
-subscript. The static tier never sees the substitution.
+subscript.
+
+The static tier and the `permissions.deny` / `permissions.ask` rules read the
+same substitution, so every screen runs on the word the shell will see:
+`A=-x; fd . "$A" rm` is screened as `fd . -x rm`, and a deny rule for
+`gopass show *` matches `X=show; gopass $X k`. A word that keeps any expansion
+after that - `$NAME`, `${...}`, a positional parameter, zsh's `$=NAME` - is
+never allowed statically, because its value could be a flag, a credential path
+or several words. `$?`, `$$`, `$#` and `$!` are numbers and pass.
 
 `probe.status` tells the judge why a body is absent: `attached`, `missing`,
 `unresolvable`, `oversize`, `non-utf8`, `multiple-truncated`. A script whose

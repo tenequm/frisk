@@ -508,7 +508,10 @@ func runCheck(cfg *config, cfgErr error, command string, stdout io.Writer, lg *s
 
 func decide(cfg *config, command, cwd string, lg *slog.Logger) verdict {
 	parsed := tokenize(command)
-	segments, unsound := parsed.segments(), parsed.unsound
+	static, sound := parsed.staticSegments()
+	// Deny and ask rules see the words both as written and as the static tier
+	// reads them, so a literal variable cannot carry a command past one.
+	segments := slices.Concat(parsed.segments(), static)
 
 	if rule := matchAny(cfg.Permissions.Deny, segments); rule != "" {
 		return verdict{Decision: decisionDeny, Tier: "deny-rule", Reason: "matches deny rule: " + rule}
@@ -516,8 +519,8 @@ func decide(cfg *config, command, cwd string, lg *slog.Logger) verdict {
 	if rule := matchAny(cfg.Permissions.Ask, segments); rule != "" {
 		return verdict{Decision: decisionAsk, Tier: "ask-rule", Reason: "matches ask rule: " + rule}
 	}
-	if !unsound && len(segments) > 0 {
-		if rule, ok := allSegmentsAllowed(cfg.Permissions.Allow, segments); ok {
+	if sound && len(static) > 0 {
+		if rule, ok := allSegmentsAllowed(cfg.Permissions.Allow, static); ok {
 			return verdict{Decision: decisionAllow, Tier: "static", Reason: "every segment is read-only: " + rule}
 		}
 	}
@@ -533,6 +536,7 @@ func decide(cfg *config, command, cwd string, lg *slog.Logger) verdict {
 type word struct {
 	text, exp string
 	quoted    bool // any quoting or escaping, which stops tilde expansion
+	glob      bool // an unquoted "*", "?", "[" or "{", which the shell may expand into paths
 }
 
 type statement struct {
@@ -568,8 +572,7 @@ type parsedCommand struct {
 	stmts []statement
 	// unsound reports constructs that defeat static reasoning: substitution,
 	// redirection (except stderr merges and /dev/null, which write nothing),
-	// heredocs, backgrounding, "#" comments, hijacking env assignments, and
-	// unquoted globs that could expand onto credential paths.
+	// heredocs, backgrounding, "#" comments, and hijacking env assignments.
 	unsound bool
 	// opaque reports constructs whose variable flow is not followed:
 	// subshells, substitution, function bodies, heredocs.
@@ -589,10 +592,7 @@ func tokenize(command string) parsedCommand {
 	globbed, quoted, dollarQuote, sep := false, false, false, ""
 	flushToken := func() {
 		if tok.Len() > 0 {
-			if globbed && credentialGlob.MatchString(tok.String()) {
-				p.unsound = true
-			}
-			words = append(words, word{text: tok.String(), exp: exp.String(), quoted: quoted})
+			words = append(words, word{text: tok.String(), exp: exp.String(), quoted: quoted, glob: globbed})
 			tok.Reset()
 			exp.Reset()
 		}
@@ -843,7 +843,7 @@ func (st statement) tokens() []string {
 	return seg
 }
 
-// segments is the static tier's view: every statement's tokens, heredoc
+// segments is the command as written: every statement's tokens, heredoc
 // bodies included.
 func (p parsedCommand) segments() [][]string {
 	segs := make([][]string, 0, len(p.stmts))
@@ -853,9 +853,33 @@ func (p parsedCommand) segments() [][]string {
 	return segs
 }
 
+// expansion matches a "$" the shell substitutes: a parameter in any bash or
+// zsh form, arithmetic or a command. "$?", "$$", "$#" and "$!" are numbers, and
+// a "$" that ends the word or precedes plain punctuation, as in "a$|b$", is literal.
+var expansion = regexp.MustCompile(`\$[^\s|)\]}/.,;:%\\?$#!]`)
+
+// staticSegments is the static tier's view: segments with literal variables
+// substituted, so every screen runs on the word the shell will see. It reports
+// false when the command is unsound or a word keeps an expansion, whose value
+// could be a flag, a credential path or several words.
+func (p parsedCommand) staticSegments() ([][]string, bool) {
+	vars := p.literalVars()
+	segs, sound := p.segments(), !p.unsound
+	for j, st := range p.stmts {
+		for k, w := range st.words {
+			text := p.substitute(vars, j, w)
+			sound = sound && !expansion.MatchString(text) && (!w.glob || !credentialGlob.MatchString(text))
+			if k >= st.cmd {
+				segs[j][k-st.cmd] = strings.ReplaceAll(text, "\x00", "$")
+			}
+		}
+	}
+	return segs, sound
+}
+
 func parseCommand(command string) ([][]string, bool) {
-	p := tokenize(command)
-	return p.segments(), p.unsound
+	segs, sound := tokenize(command).staticSegments()
+	return segs, !sound
 }
 
 var (
@@ -918,7 +942,8 @@ type literalVar struct {
 // literalVars finds shell variables whose value is certain at every later
 // use: a plain literal, assigned exactly once as its own statement before any
 // control flow, and never written in any other way. Anything less certain is
-// left out, and the probe then reports the path as unresolvable.
+// left out: the probe then reports the path as unresolvable, and the static
+// tier leaves the command to the judge.
 func (p parsedCommand) literalVars() map[string]literalVar {
 	if p.opaque {
 		return nil
@@ -1002,24 +1027,7 @@ func (p parsedCommand) probeSegments() [][]string {
 	segs := p.segments()
 	for j, st := range p.stmts {
 		for k, w := range st.words[st.cmd:] {
-			if len(vars) == 0 || !strings.Contains(w.exp, "$") {
-				continue
-			}
-			expanded := variableRef.ReplaceAllStringFunc(w.exp, func(ref string) string {
-				tail := ""
-				if last := ref[len(ref)-1]; last == ':' || last == '[' {
-					if ref[1] != '{' {
-						return ref
-					}
-					ref, tail = ref[:len(ref)-1], ref[len(ref)-1:]
-				}
-				v, ok := vars[strings.Trim(ref, "${}")]
-				if !ok || !p.reaches(v.at, j) {
-					return ref + tail
-				}
-				return v.value + tail
-			})
-			segs[j][k] = strings.ReplaceAll(expanded, "\x00", "$")
+			segs[j][k] = strings.ReplaceAll(p.substitute(vars, j, w), "\x00", "$")
 		}
 	}
 	// Heredoc text is not commands: probed as such, its tokens became scripts
@@ -1031,6 +1039,26 @@ func (p parsedCommand) probeSegments() [][]string {
 		}
 	}
 	return kept
+}
+
+// substitute expands the literal variables in word w of statement j. A
+// reference that is not certain keeps its "$"; a "$" the shell would not
+// expand stays NUL.
+func (p parsedCommand) substitute(vars map[string]literalVar, j int, w word) string {
+	return variableRef.ReplaceAllStringFunc(w.exp, func(ref string) string {
+		tail := ""
+		if last := ref[len(ref)-1]; last == ':' || last == '[' {
+			if ref[1] != '{' {
+				return ref
+			}
+			ref, tail = ref[:len(ref)-1], ref[len(ref)-1:]
+		}
+		v, ok := vars[strings.Trim(ref, "${}")]
+		if !ok || !p.reaches(v.at, j) {
+			return ref + tail
+		}
+		return v.value + tail
+	})
 }
 
 // reaches reports whether the assignment in statement at has certainly run
