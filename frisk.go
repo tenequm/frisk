@@ -634,16 +634,24 @@ func parseCommand(command string) ([][]string, bool) {
 
 var (
 	assignmentPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
-	// variableWrite covers NAME=, NAME+=, NAME[i]= and the assigning
-	// expansions ${NAME=x}, ${NAME:=x}, ${NAME::=x}.
-	variableWrite = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)(\[[^\]]*\])?\+?=|\$\{([A-Za-z_][A-Za-z0-9_]*):{0,2}=`)
-	variableRef   = regexp.MustCompile(`\$([A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})`)
-	identifier    = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*`)
+	// variableWrite covers NAME=, NAME+=, NAME[i]=, the assigning expansions
+	// ${NAME=x}, ${NAME:=x}, ${NAME::=x}, and the {NAME}> redirection that
+	// stores a file descriptor number.
+	variableWrite = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)(\[[^\]]*\])?\+?=|\$\{([A-Za-z_][A-Za-z0-9_]*):{0,2}=|\{([A-Za-z_][A-Za-z0-9_]*)\}[<>]`)
+	// variableRef also takes a following ":" or "[": zsh reads those after a
+	// bare $NAME as a modifier ($S:h) or subscript ($S[1]), so that reference
+	// is left alone. After ${NAME} they are literal in bash and zsh alike.
+	variableRef = regexp.MustCompile(`\$([A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})[:\[]?`)
+	identifier  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*`)
+	// shellOwned names are rewritten by bash or zsh themselves (cd updates
+	// PWD, every command updates _), so one literal write proves nothing.
+	shellOwned = regexp.MustCompile(`^(_|PWD|OLDPWD|DIRSTACK|RANDOM|SRANDOM|SECONDS|EPOCHSECONDS|EPOCHREALTIME|LINENO|REPLY|reply|OPTARG|OPTIND|OPTERR|PPID|UID|EUID|GID|EGID|GROUPS|USERNAME|HISTCMD|PIPESTATUS|pipestatus|status|ERRNO|FUNCNAME|funcstack|COLUMNS|LINES|SHLVL|MAPFILE|COPROC|TTYIDLE|ARGC|argv|MATCH|MBEGIN|MEND|match|mbegin|mend|signals)$|^(BASH|ZSH|zsh|COMP_|READLINE_|TRY_BLOCK_)`)
 )
 
 // Writing any of these changes how every other word expands or where cd
 // lands, so a command that touches one gets no variable resolution at all.
-var expansionVars = []string{"IFS", "HOME", "CDPATH"}
+// zsh ties lowercase cdpath to CDPATH.
+var expansionVars = []string{"IFS", "HOME", "CDPATH", "cdpath"}
 
 // Shell words that start or continue a compound command. After the first
 // one, an assignment may be conditional or repeated, so none is collected.
@@ -666,9 +674,14 @@ var (
 		"export": true, "readonly": true, "local": true, "declare": true,
 		"typeset": true, "integer": true, "float": true, "unset": true, "read": true,
 		"for": true, "select": true, "getopts": true, "mapfile": true,
-		"readarray": true, "let": true, "printf": true,
+		"readarray": true, "let": true, "printf": true, "set": true,
 	}
-	opaqueVerbs = map[string]bool{"eval": true, "source": true, "function": true}
+	// trap and alias can change a variable or a verb later on; setopt and
+	// emulate change how zsh expands every word.
+	opaqueVerbs = map[string]bool{
+		"eval": true, "source": true, "function": true, "trap": true, "alias": true,
+		"setopt": true, "unsetopt": true, "emulate": true,
+	}
 )
 
 type literalVar struct {
@@ -705,7 +718,7 @@ func (p parsedCommand) literalVars() map[string]literalVar {
 			}
 			writer = writer || writerVerbs[w.text]
 			for _, m := range variableWrite.FindAllStringSubmatch(w.exp, -1) {
-				writes[m[1]+m[3]]++
+				writes[m[1]+m[3]+m[4]]++
 			}
 		}
 		for _, w := range st.words {
@@ -729,16 +742,20 @@ func (p parsedCommand) literalVars() map[string]literalVar {
 	if slices.ContainsFunc(expansionVars, func(name string) bool { return writes[name] > 0 }) {
 		return nil
 	}
-	maps.DeleteFunc(vars, func(name string, _ literalVar) bool { return writes[name] != 1 })
+	maps.DeleteFunc(vars, func(name string, _ literalVar) bool {
+		return writes[name] != 1 || shellOwned.MatchString(name)
+	})
 	return vars
 }
 
 // literalValue returns the value of a NAME=value word when the shell stores
 // it verbatim. Whitespace is refused because an unquoted use would split it
-// into several words; a quoted "~" is refused because it does not expand.
+// into several words; a quoted "~" because it does not expand; a later "~"
+// because the shell expands it after ":"; a leading "=" because zsh expands
+// "=cmd" to that command's path.
 func (w word) literalValue() (string, bool) {
 	_, value, _ := strings.Cut(w.text, "=")
-	if value == "" || strings.ContainsAny(value, "$`*?[{ \t\n") {
+	if value == "" || value[0] == '=' || strings.ContainsAny(value, "$`*?[{ \t\n") || strings.Contains(value[1:], "~") {
 		return "", false
 	}
 	if !strings.HasPrefix(value, "~") {
@@ -763,11 +780,18 @@ func (p parsedCommand) probeSegments() [][]string {
 				continue
 			}
 			expanded := variableRef.ReplaceAllStringFunc(w.exp, func(ref string) string {
+				tail := ""
+				if last := ref[len(ref)-1]; last == ':' || last == '[' {
+					if ref[1] != '{' {
+						return ref
+					}
+					ref, tail = ref[:len(ref)-1], ref[len(ref)-1:]
+				}
 				v, ok := vars[strings.Trim(ref, "${}")]
 				if !ok || !p.reaches(v.at, j) {
-					return ref
+					return ref + tail
 				}
-				return v.value
+				return v.value + tail
 			})
 			segs[j][k] = strings.ReplaceAll(expanded, "\x00", "$")
 		}
@@ -1286,7 +1310,8 @@ func (d *shellDir) step(seg []string) bool {
 	case len(seg) == 1:
 		home, err := os.UserHomeDir()
 		d.path, d.known = home, err == nil
-	case len(seg) == 2 && seg[1] != "-":
+	case len(seg) == 2 && !strings.HasPrefix(seg[1], "-") && !strings.HasPrefix(seg[1], "+"):
+		// "-", and zsh's "-2" and "+1", name earlier directories, not paths.
 		d.path, d.known = d.resolve(seg[1])
 	default:
 		d.known = false

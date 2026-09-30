@@ -1112,6 +1112,24 @@ func TestProbeScripts(t *testing.T) {
 		{"IFS change resolves nothing", ".", "IFS=/; S={root}/proj; python3 $S/run.py", probeUnresolvable, nil},
 		{"unknown variable beside a known one", ".", "S={root}/proj; python3 $S/$NAME.py", probeUnresolvable, nil},
 		{"cd to unknown variable never falls back", "proj", "cd $NOPE && python3 run.py", probeUnresolvable, nil},
+		{"zsh modifier after bare reference", ".", "S={root}/proj/sub; python3 $S:h/run.py", probeUnresolvable, nil},
+		{"zsh subscript after bare reference", ".", "S={root}/proj; python3 $S[1]/run.py", probeUnresolvable, nil},
+		{"braced reference before a colon is literal", ".", "S={root}/proj; python3 ${S}:h/run.py", probeMissing, nil},
+		{"PWD is rewritten by cd", ".", "PWD={root}/proj; cd {root}/proj/sub; python3 $PWD/run.py", probeUnresolvable, nil},
+		{"OLDPWD is shell-maintained", ".", "OLDPWD={root}/proj; python3 $OLDPWD/run.py", probeUnresolvable, nil},
+		{"REPLY is shell-maintained", ".", "REPLY={root}/proj; python3 $REPLY/run.py", probeUnresolvable, nil},
+		{"BASH-prefixed name is shell-maintained", ".", "BASH_X={root}/proj; python3 $BASH_X/run.py", probeUnresolvable, nil},
+		{"ZSH-prefixed name is shell-maintained", ".", "ZSH_X={root}/proj; python3 $ZSH_X/run.py", probeUnresolvable, nil},
+		{"trap resolves nothing", ".", "S={root}/proj; trap 'S=/b' DEBUG; python3 $S/run.py", probeUnresolvable, nil},
+		{"alias resolves nothing", ".", "S={root}/proj; alias python3=true; python3 $S/run.py", probeUnresolvable, nil},
+		{"setopt resolves nothing", ".", "S={root}/proj; setopt sh_word_split; python3 $S/run.py", probeUnresolvable, nil},
+		{"fd redirection assigns the name", ".", "S={root}/proj; exec {S}>/dev/null; python3 $S/run.py", probeUnresolvable, nil},
+		{"set -A assigns the name", ".", "S={root}/proj; set -A S a b; python3 $S/run.py", probeUnresolvable, nil},
+		{"set options keep resolution", ".", "set -euo pipefail; S={root}/proj; python3 $S/run.py", probeAttached, []string{"proj/run.py"}},
+		{"tilde after a colon in the value", ".", "S={root}/proj:~/x; python3 $S/run.py", probeUnresolvable, nil},
+		{"zsh equals expansion in the value", ".", "S==ls; python3 $S/run.py", probeUnresolvable, nil},
+		{"cdpath change resolves nothing", ".", "cdpath={root}/proj; D=sub; cd $D && python3 build.py", probeUnresolvable, nil},
+		{"cd to a directory stack entry is unknown", "proj", "cd +1 && python3 stats.py", probeUnresolvable, nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1153,6 +1171,8 @@ func TestProbeSegments(t *testing.T) {
 		{"single quotes keep the dollar", "S=/a; echo '$S' $S", []string{"echo", "$S", "/a"}},
 		{"unknown names keep the dollar", "S=/a; echo $S/$T", []string{"echo", "/a/$T"}},
 		{"nothing to substitute", "git status", []string{"git", "status"}},
+		{"bare reference before a modifier or subscript", `S=/a; echo $S:h "$S:t" $S[1] $S:$S`, []string{"echo", "$S:h", "$S:t", "$S[1]", "$S:/a"}},
+		{"braced reference before a modifier or subscript", "S=/a; echo ${S}:h ${S}[1]", []string{"echo", "/a:h", "/a[1]"}},
 	}
 	for _, tt := range tests {
 		segs := tokenize(tt.command).probeSegments()

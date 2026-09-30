@@ -78,8 +78,11 @@ a literal `cd` earlier in the command - never a same-named file elsewhere.
 `$NAME` and `${NAME}` resolve only for a variable the command itself assigns
 exactly once, as its own statement, to a plain literal, before any control
 flow and ahead of the use (`S=/tmp/x; cd "$S" && python3 run.py`); anything
-less certain, and any command with a subshell, substitution, heredoc, `eval`
-or `source`, stays `unresolvable`. The static tier never sees the substitution.
+less certain, and any command with a subshell, substitution, heredoc, `eval`,
+`source`, `trap` or `alias`, stays `unresolvable`. Names the shell rewrites
+itself (`PWD`, `OLDPWD`, `RANDOM`, `BASH*`, `ZSH*`, ...) never resolve, nor
+does a bare `$NAME` followed by `:` or `[`, which zsh reads as a modifier or
+subscript. The static tier never sees the substitution.
 
 `probe.status` tells the judge why a body is absent: `attached`, `missing`,
 `unresolvable`, `oversize`, `non-utf8`, `multiple-truncated`. A script whose
