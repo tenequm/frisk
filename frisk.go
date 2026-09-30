@@ -378,7 +378,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer) int {
 	}
 
 	if len(args) == 0 {
-		fmt.Fprintln(stdout, "usage: frisk hook|check <command>")
+		fmt.Fprintln(stdout, "usage: frisk hook|check|validate <command>")
 		return 2
 	}
 
@@ -391,8 +391,10 @@ func run(args []string, stdin io.Reader, stdout io.Writer) int {
 			return 2
 		}
 		return runCheck(cfg, cfgErr, strings.Join(args[1:], " "), stdout, lg)
+	case "validate":
+		return runValidate(cfg, cfgErr, args[1:], stdout, lg)
 	default:
-		fmt.Fprintln(stdout, "usage: frisk hook|check <command>")
+		fmt.Fprintln(stdout, "usage: frisk hook|check|validate <command>")
 		return 2
 	}
 }
@@ -1500,7 +1502,7 @@ func fetchKey(ctx context.Context, keyCmd []string) (string, error) {
 
 func loadConfig() (*config, error) {
 	cfg := &config{}
-	path := filepath.Join(configDir(), "frisk", "config.json")
+	path := configPath()
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return cfg, nil
@@ -1514,6 +1516,10 @@ func loadConfig() (*config, error) {
 		return cfg, fmt.Errorf("parsing %s: %w", path, err)
 	}
 	return cfg, nil
+}
+
+func configPath() string {
+	return filepath.Join(configDir(), "frisk", "config.json")
 }
 
 func configDir() string {
@@ -1656,6 +1662,144 @@ func decideFile(cfg *config, path string) verdict {
 		return verdict{Decision: decisionAllow, Tier: "allow-rule", Reason: "matches allow rule: " + rule}
 	}
 	return verdict{Tier: "no-rule", Reason: "no file rule matched"}
+}
+
+// runValidate exists because a malformed config silently disables the whole
+// gate; it reuses the hook's loader so it sees exactly what the hook sees.
+func runValidate(cfg *config, cfgErr error, args []string, stdout io.Writer, lg *slog.Logger) int {
+	live := false
+	for _, a := range args {
+		if a != "--live" {
+			fmt.Fprintln(stdout, "usage: frisk validate [--live]")
+			return 2
+		}
+		live = true
+	}
+
+	failures := 0
+	report := func(level, format string, a ...any) {
+		if level == "error" {
+			failures++
+		}
+		fmt.Fprintf(stdout, "%s: %s\n", level, fmt.Sprintf(format, a...))
+	}
+
+	path := configPath()
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		report("info", "config %s does not exist: defaults apply and the judge is off", path)
+	} else {
+		report("info", "config %s exists", path)
+	}
+	if cfgErr != nil {
+		report("error", "%s", cfgErr.Error())
+		return 1
+	}
+
+	checkRules(report, "deny", cfg.Permissions.Deny)
+	checkRules(report, "ask", cfg.Permissions.Ask)
+	checkRules(report, "allow", cfg.Permissions.Allow)
+
+	for _, l := range []struct {
+		name  string
+		items []string
+	}{
+		{"environment", cfg.Judge.Environment},
+		{"allow", cfg.Judge.Allow},
+		{"soft_deny", cfg.Judge.SoftDeny},
+		{"hard_deny", cfg.Judge.HardDeny},
+	} {
+		report("info", "judge.%s: %s", l.name, listState(l.items))
+	}
+
+	if keyOK := checkJev(report, cfg); keyOK && live {
+		liveJudge(report, cfg, lg)
+	}
+	if failures > 0 {
+		return 1
+	}
+	return 0
+}
+
+func listState(items []string) string {
+	switch {
+	case len(items) == 0:
+		return "unset, builtins apply"
+	case slices.Contains(items, defaultsMarker):
+		return "extends the builtins"
+	default:
+		return "replaces the builtins"
+	}
+}
+
+func checkRules(report func(level, format string, a ...any), list string, rules []string) {
+	for i, rule := range rules {
+		where := fmt.Sprintf("permissions.%s[%d]", list, i)
+		if strings.TrimSpace(rule) == "" {
+			report("error", "%s: empty rule", where)
+			continue
+		}
+		if rule == defaultsMarker {
+			continue
+		}
+		if pattern, isFile := fileRulePattern(rule); isFile {
+			if pattern == "" {
+				report("error", "%s: %q has an empty path pattern", where, rule)
+			} else if _, err := filepath.Match(strings.TrimSuffix(pattern, "/**"), ""); err != nil {
+				report("error", "%s: %q has a bad pattern: %v", where, rule, err)
+			}
+			continue
+		}
+		if list != "allow" && strings.TrimSpace(rule) == "*" {
+			report("warning", "%s: %q matches every command", where, rule)
+		}
+		for field := range strings.FieldsSeq(rule) {
+			if !strings.ContainsAny(field, "*?[") {
+				continue
+			}
+			if _, err := filepath.Match(field, ""); err != nil {
+				report("error", "%s: %q has a bad pattern %q: %v", where, rule, field, err)
+			}
+		}
+	}
+}
+
+// checkJev reports whether the key command works, i.e. the judge can run.
+func checkJev(report func(level, format string, a ...any), cfg *config) bool {
+	timeout := defaultJevTimeout
+	if cfg.Jev.TimeoutMs > 0 {
+		timeout = time.Duration(cfg.Jev.TimeoutMs) * time.Millisecond
+	}
+	report("info", "jev.model: %q", cfg.Jev.Model)
+	report("info", "jev.timeout: %s", timeout)
+	if len(cfg.Jev.KeyCmd) == 0 {
+		report("info", "judge disabled (no jev.keyCmd)")
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	// fetchKey's errors never carry the key, so they are safe to print.
+	if _, err := fetchKey(ctx, cfg.Jev.KeyCmd); err != nil {
+		report("error", "jev.keyCmd failed: %v", err)
+		return false
+	}
+	report("info", "jev.keyCmd succeeded, output non-empty")
+	return true
+}
+
+func liveJudge(report func(level, format string, a ...any), cfg *config, lg *slog.Logger) {
+	start := time.Now()
+	v := judge(cfg, "true", "", [][]string{{"true"}}, lg)
+	elapsed := time.Since(start).Milliseconds()
+	if v.Model == "" {
+		report("error", "live judge call failed after %dms (see frisk.log)", elapsed)
+		return
+	}
+	decision := v.Decision
+	if decision == "" {
+		decision = "none"
+	}
+	report("info", "live judge call for `true`: %s in %dms: %s", decision, elapsed, v.Reason)
 }
 
 type guardrail struct {

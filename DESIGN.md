@@ -106,6 +106,7 @@ answers. An auto-approver without a record is a rumour.
 
 - `frisk hook` - the PreToolUse handler
 - `frisk check '<command>'` - dry-run, prints decision + tier + reason
+- `frisk validate [--live]` - config health check, see below
 
 ```json
 {
@@ -131,6 +132,16 @@ Builtin guardrail paths (frisk's own config dir, the frisk binary,
 `~/.claude/settings*.json`, `~/.claude/hooks`) ask, checked raw and
 symlink-resolved. Precedence: config deny > config ask > guardrail ask > config
 allow > silence; there are no builtin allows for file tools.
+
+## Validate
+
+A malformed config makes the hook stay silent for the whole session, so
+`frisk validate` loads it with the hook's own loader and prints `error:`,
+`warning:` and `info:` lines (exit 1 only on errors): parse failures, empty or
+bad-glob rules, empty `Edit()` patterns, bare `*` in deny/ask, whether each
+judge list is unset, extends (`$defaults`) or replaces the builtins, and
+whether `jev.keyCmd` runs - never printing any part of the key. No network
+unless `--live`, which makes one real judge call for `true`.
 
 ## Provenance
 

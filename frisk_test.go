@@ -205,6 +205,122 @@ func TestBareRulesAndFileRulesStaySeparate(t *testing.T) {
 	}
 }
 
+func validateOutput(t *testing.T, cfg string, args ...string) (string, int) {
+	t.Helper()
+	newHookEnv(t, cfg)
+	var out strings.Builder
+	code := run(append([]string{"validate"}, args...), strings.NewReader(""), &out)
+	return out.String(), code
+}
+
+func TestValidateMissingConfig(t *testing.T) {
+	out, code := validateOutput(t, "")
+	if code != 0 || !strings.Contains(out, "does not exist: defaults apply and the judge is off") {
+		t.Fatalf("code = %d, out = %s", code, out)
+	}
+}
+
+func TestValidateValidConfig(t *testing.T) {
+	cfg := `{"permissions":{"deny":["rm -rf *","Edit(~/.ssh/**)"],"allow":["$defaults","just check"]}}`
+	out, code := validateOutput(t, cfg)
+	if code != 0 || strings.Contains(out, "error:") || strings.Contains(out, "warning:") {
+		t.Fatalf("code = %d, out = %s", code, out)
+	}
+	if !strings.Contains(out, "info: config ") || !strings.Contains(out, "judge disabled (no jev.keyCmd)") {
+		t.Fatalf("out = %s", out)
+	}
+}
+
+func TestValidateFindings(t *testing.T) {
+	tests := []struct {
+		name, cfg, want string
+		code            int
+	}{
+		{"malformed json", `{nope`, "error: parsing", 1},
+		{"unknown field", `{"nope":{}}`, "error: parsing", 1},
+		{"empty rule", `{"permissions":{"ask":["  "]}}`, "error: permissions.ask[0]: empty rule", 1},
+		{"bad glob", `{"permissions":{"deny":["cat ["]}}`, "error: permissions.deny[0]", 1},
+		{"bad file glob", `{"permissions":{"allow":["Edit([/**)"]}}`, "error: permissions.allow[0]", 1},
+		{"empty Edit pattern", `{"permissions":{"deny":["Edit()"]}}`, "error: permissions.deny[0]: \"Edit()\" has an empty path pattern", 1},
+		{"bare star in deny warns", `{"permissions":{"deny":["*"]}}`, "warning: permissions.deny[0]: \"*\" matches every command", 0},
+		{"bare star in ask warns", `{"permissions":{"ask":["*"]}}`, "warning: permissions.ask[0]", 0},
+		{"defaults marker is fine", `{"permissions":{"deny":["$defaults"]}}`, "", 0},
+	}
+	for _, tt := range tests {
+		out, code := validateOutput(t, tt.cfg)
+		if code != tt.code || !strings.Contains(out, tt.want) {
+			t.Errorf("%s: code = %d, out = %s", tt.name, code, out)
+		}
+		if tt.name == "defaults marker is fine" && (strings.Contains(out, "error:") || strings.Contains(out, "warning:")) {
+			t.Errorf("$defaults flagged: %s", out)
+		}
+	}
+}
+
+func TestValidateJudgeListStates(t *testing.T) {
+	cfg := `{"judge":{"environment":["mine"],"allow":["$defaults","more"],"soft_deny":["$defaults"]}}`
+	out, code := validateOutput(t, cfg)
+	if code != 0 {
+		t.Fatalf("code = %d, out = %s", code, out)
+	}
+	for _, want := range []string{
+		"info: judge.environment: replaces the builtins",
+		"info: judge.allow: extends the builtins",
+		"info: judge.soft_deny: extends the builtins",
+		"info: judge.hard_deny: unset, builtins apply",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in %s", want, out)
+		}
+	}
+}
+
+func TestValidateKeyCmd(t *testing.T) {
+	out, code := validateOutput(t, `{"jev":{"keyCmd":["echo","hunter2-not-for-output"],"model":"m1","timeoutMs":1500}}`)
+	if code != 0 || !strings.Contains(out, "jev.keyCmd succeeded, output non-empty") ||
+		!strings.Contains(out, `jev.model: "m1"`) || !strings.Contains(out, "jev.timeout: 1.5s") {
+		t.Fatalf("code = %d, out = %s", code, out)
+	}
+	if strings.Contains(out, "hunter2") {
+		t.Fatalf("key leaked into output: %s", out)
+	}
+
+	out, code = validateOutput(t, `{"jev":{"keyCmd":["false"]}}`)
+	if code != 1 || !strings.Contains(out, "error: jev.keyCmd failed") {
+		t.Fatalf("failing keyCmd: code = %d, out = %s", code, out)
+	}
+
+	out, code = validateOutput(t, `{"jev":{"keyCmd":["true"]}}`)
+	if code != 1 || !strings.Contains(out, "error: jev.keyCmd failed") {
+		t.Fatalf("empty keyCmd output: code = %d, out = %s", code, out)
+	}
+}
+
+func TestValidateLive(t *testing.T) {
+	fakeJev(t, jevAnswer{Choice: "allow", Confidence: 0.98})
+	cfg := `{"jev":{"keyCmd":["echo","test-key"],"model":"jev-test"}}`
+	out, code := validateOutput(t, cfg, "--live")
+	if code != 0 || !strings.Contains(out, "live judge call for `true`: allow") || !strings.Contains(out, "ms") {
+		t.Fatalf("code = %d, out = %s", code, out)
+	}
+	if strings.Contains(out, "test-key") {
+		t.Fatalf("key leaked into output: %s", out)
+	}
+
+	out, _ = validateOutput(t, cfg)
+	if strings.Contains(out, "live judge call") {
+		t.Fatalf("no live call without --live: %s", out)
+	}
+
+	prev := jevEndpoint
+	jevEndpoint = "http://127.0.0.1:1"
+	t.Cleanup(func() { jevEndpoint = prev })
+	out, code = validateOutput(t, cfg, "--live")
+	if code != 1 || !strings.Contains(out, "error: live judge call failed") {
+		t.Fatalf("unreachable judge: code = %d, out = %s", code, out)
+	}
+}
+
 func TestMatchRule(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
