@@ -20,6 +20,38 @@ import (
 
 var testLogger = slog.New(slog.NewJSONHandler(io.Discard, nil))
 
+// exampleAllow is the permissions.allow list config.example.json ships. Core
+// has no allow rules, so tests take theirs from the file users copy.
+func exampleAllow(t *testing.T) []string {
+	t.Helper()
+	return configFileAllow(t, "config.example.json")
+}
+
+func configFileAllow(t *testing.T, path string) []string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg config
+	if err := json.Unmarshal(data, &cfg); err != nil || len(cfg.Permissions.Allow) == 0 {
+		t.Fatalf("%s: no permissions.allow (%v)", path, err)
+	}
+	return cfg.Permissions.Allow
+}
+
+// The eval replays fixtures under testdata/eval-config.json, so its numbers
+// describe the example list only while it carries every rule of it.
+func TestEvalConfigCarriesExampleAllow(t *testing.T) {
+	t.Parallel()
+	eval := configFileAllow(t, filepath.Join("testdata", "eval-config.json"))
+	for _, rule := range exampleAllow(t) {
+		if !slices.Contains(eval, rule) {
+			t.Errorf("testdata/eval-config.json lacks %q", rule)
+		}
+	}
+}
+
 func TestParseCommand(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -400,7 +432,7 @@ func TestLogVerdictRedacts(t *testing.T) {
 // The decision is made on the raw command; redaction only changes what is
 // written down afterwards.
 func TestRedactionLeavesDecisionsAlone(t *testing.T) {
-	const cfg = `{"permissions": {"deny": ["psql *"], "ask": ["deploy *"]}}`
+	const cfg = `{"permissions": {"allow": ["rg *"], "deny": ["psql *"], "ask": ["deploy *"]}}`
 	newHookEnv(t, cfg)
 	token := "gh" + "p_" + fakeSecret(alnumChars, 36)
 	tests := []struct {
@@ -733,13 +765,31 @@ func validateOutput(t *testing.T, cfg string, args ...string) (string, int) {
 
 func TestValidateMissingConfig(t *testing.T) {
 	out, code := validateOutput(t, "")
-	if code != 0 || !strings.Contains(out, "does not exist: defaults apply and the judge is off") {
+	if code != 0 || !strings.Contains(out, "does not exist: nothing is allowed statically and the judge is off") {
 		t.Fatalf("code = %d, out = %s", code, out)
 	}
 }
 
+// An allow list written for the builtins frisk once had still loads; validate
+// says the marker no longer brings any rules.
+func TestValidateDefaultsInAllowWarns(t *testing.T) {
+	out, code := validateOutput(t, `{"permissions":{"allow":["$defaults","just check"]}}`)
+	want := `warning: permissions.allow[0]: "$defaults" adds nothing: frisk has no default allow list`
+	if code != 0 || strings.Contains(out, "error:") || !strings.Contains(out, want) || !strings.Contains(out, "config.example.json") {
+		t.Fatalf("code = %d, out = %s", code, out)
+	}
+	if strings.Contains(out, "permissions.allow has no rules") {
+		t.Fatalf("a list with a rule reported as empty: %s", out)
+	}
+
+	out, code = validateOutput(t, `{"permissions":{"allow":["$defaults"]}}`)
+	if code != 0 || !strings.Contains(out, want) || !strings.Contains(out, "info: permissions.allow has no rules: nothing is allowed statically") {
+		t.Fatalf("marker only: code = %d, out = %s", code, out)
+	}
+}
+
 func TestValidateValidConfig(t *testing.T) {
-	cfg := `{"permissions":{"deny":["rm -rf *","Edit(~/.ssh/**)"],"allow":["$defaults","just check"]}}`
+	cfg := `{"permissions":{"deny":["rm -rf *","Edit(~/.ssh/**)"],"allow":["ls *","just check"]}}`
 	out, code := validateOutput(t, cfg)
 	if code != 0 || strings.Contains(out, "error:") || strings.Contains(out, "warning:") {
 		t.Fatalf("code = %d, out = %s", code, out)
@@ -871,7 +921,7 @@ func TestDecideStaticTiers(t *testing.T) {
 	t.Parallel()
 	cfg := &config{
 		Permissions: permissionsConfig{
-			Allow: []string{defaultsMarker, "just check"},
+			Allow: exampleAllow(t),
 			Deny:  []string{"gopass show -o *"},
 			Ask:   []string{"ssh prod *"},
 		},
@@ -1107,14 +1157,33 @@ func TestDecideStaticTiers(t *testing.T) {
 	}
 }
 
-func TestAllowListWithoutDefaultsReplacesBuiltins(t *testing.T) {
+// Core ships no allow rules: what settles statically is what the config lists.
+func TestOnlyConfigRulesAllow(t *testing.T) {
 	t.Parallel()
-	cfg := &config{Permissions: permissionsConfig{Allow: []string{"just check"}}}
+	commands := []string{"ls", "pwd", "true", "cat README.md", "git status", "echo hi", "cd /tmp", "just check"}
+	for name, cfg := range map[string]*config{
+		"no config":      {},
+		"empty list":     {Permissions: permissionsConfig{Allow: []string{}}},
+		"marker only":    {Permissions: permissionsConfig{Allow: []string{defaultsMarker}}},
+		"deny rule only": {Permissions: permissionsConfig{Deny: []string{"rm *"}}},
+	} {
+		for _, command := range commands {
+			if v := decide(cfg, command, t.TempDir(), testLogger); v.Decision != "" || v.Tier != "no-judge" {
+				t.Errorf("%s: decide(%q) = (%q, %q), want silence", name, command, v.Decision, v.Tier)
+			}
+		}
+	}
+
+	cfg := &config{Permissions: permissionsConfig{Allow: []string{defaultsMarker, "just check"}}}
 	if v := decide(cfg, "ls", t.TempDir(), testLogger); v.Decision != "" {
-		t.Fatalf("ls should not be statically allowed when builtins are replaced, got %q", v.Decision)
+		t.Fatalf("ls has no rule and the marker brings none, got %q", v.Decision)
 	}
 	if v := decide(cfg, "just check", t.TempDir(), testLogger); v.Decision != decisionAllow {
 		t.Fatalf("just check should be allowed, got %q", v.Decision)
+	}
+	// The marker is not a rule: a command spelled like it matches nothing.
+	if v := decide(cfg, `'$defaults'`, t.TempDir(), testLogger); v.Decision != "" {
+		t.Fatalf("the marker matched a command, got %q", v.Decision)
 	}
 }
 
@@ -1462,7 +1531,7 @@ func TestJudgeDecisions(t *testing.T) {
 // Rules from config are not the judge's decisions, so judge.decisions leaves
 // them alone; an invalid list silences the hook like any malformed config.
 func TestJudgeDecisionsLeaveRulesAlone(t *testing.T) {
-	newHookEnv(t, `{"permissions":{"ask":["ssh prod *"],"deny":["gopass show -o *"]},"judge":{"decisions":["allow"]}}`)
+	newHookEnv(t, `{"permissions":{"allow":["git status *"],"ask":["ssh prod *"],"deny":["gopass show -o *"]},"judge":{"decisions":["allow"]}}`)
 	for command, want := range map[string]string{
 		"ssh prod uptime": decisionAsk, "gopass show -o k": decisionDeny, "git status": decisionAllow,
 	} {
@@ -1971,8 +2040,7 @@ func TestJudgeState(t *testing.T) {
 }
 
 func TestRunHookEndToEnd(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	newHookEnv(t, `{"permissions":{"allow":["git status *","head *"]}}`)
 
 	input := `{"tool_name":"Bash","tool_input":{"command":"git status | head"},"cwd":"/tmp"}`
 	var out strings.Builder

@@ -24,8 +24,8 @@ parse into pipeline segments (|, &&, ||, ;, newline)
   |
 1. permissions.deny  match -> "deny"
 2. permissions.ask   match -> "ask"
-3. static allow: EVERY segment provably read-only
-   (builtin verb table + config allow; bails on
+3. permissions.allow: EVERY segment matches a rule
+   and trips no screen (core ships no rules; bails on
     $(), backticks, heredocs, &, # comments, variables
     the command does not set to a literal, and redirects
     other than 2>&1 and /dev/null) -> "allow"
@@ -43,8 +43,23 @@ silence -> Claude Code native flow (rules -> classifier -> prompt)
 
 `$XDG_CONFIG_HOME/frisk/config.json` - see [config.example.json](config.example.json).
 Never read from the project directory, so a cloned repo cannot retarget the
-gate. Missing file = defaults with the judge off; malformed file = silent for
-the session (logged). `"$defaults"` splices the built-in entries, autoMode-style.
+gate. Missing file = no rules and the judge off, so every command passes
+through; malformed file = silent for the session (logged).
+
+Core understands commands and config decides about them. Core ships no allow
+list: the static tier allows only what `permissions.allow` lists, and with no
+rule a command passes through to the judge or to silence.
+[config.example.json](config.example.json) carries a read-only starting list.
+What core keeps is the parser and the screens - denied flags, risky arguments,
+program text, credential paths and globs, hijacking environment variables.
+A screen never decides anything: it only stops a rule such as `sed *` from
+matching `sed -i`, a form the rule does not mean, and that command passes
+through too.
+
+In the four `judge` lists `"$defaults"` splices the built-in prose,
+autoMode-style. The `permissions` lists have no built-in entries, so there the
+marker stands for nothing; it is accepted so that a config written for the
+default allow list frisk once had still loads.
 
 Rules use Claude Code's `Bash(...)` rule-content syntax, matched against
 parsed segments - so `cd x && git push` still matches `git push *`. Trailing
@@ -196,15 +211,16 @@ everything under it, otherwise `filepath.Match` on the cleaned absolute path.
 Builtin guardrail paths (frisk's own config dir, the frisk binary,
 `~/.claude/settings*.json`, `~/.claude/hooks`) ask, checked raw and
 symlink-resolved. Precedence: config deny > config ask > guardrail ask > config
-allow > silence; there are no builtin allows for file tools.
+allow > silence; as for Bash, the only allows are the config's.
 
 ## Validate
 
 A malformed config makes the hook stay silent for the whole session, so
 `frisk validate` loads it with the hook's own loader and prints `error:`,
 `warning:` and `info:` lines (exit 1 only on errors): parse failures, empty or
-bad-glob rules, empty `Edit()` patterns, bare `*` in deny/ask, whether each
-judge list is unset, extends (`$defaults`) or replaces the builtins, the
+bad-glob rules, empty `Edit()` patterns, bare `*` in deny/ask, `$defaults` in
+`permissions.allow` (a warning: it adds no rules), an allow list with no rules,
+whether each judge list is unset, extends (`$defaults`) or replaces the builtins, the
 effective `judge.decisions`, and whether `jev.keyCmd` runs - never printing any
 part of the key. No network unless `--live`, which makes one real judge call
 for `true`.
