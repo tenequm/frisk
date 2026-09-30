@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.1](https://github.com/tenequm/frisk/compare/v0.1.0...v0.1.1) - 2026-09-30
+
+### <!-- 1 -->🎉 New Features
+- **judge:** let config choose which decisions the judge issues ([0b27374](https://github.com/tenequm/frisk/commit/0b27374935727805981a281092c3c39056857868))
+
+### <!-- 2 -->🐛 Bug Fixes
+- **probe:** stop reading heredoc bodies as shell commands ([cfcefc4](https://github.com/tenequm/frisk/commit/cfcefc4a6a0218483aa5a974c3437ab8e9a1d88a))
+- **probe:** probe heredoc bodies piped into a shell ([f65b3ec](https://github.com/tenequm/frisk/commit/f65b3ec7c6e389d2f792b9075160e52d1de337ec))
+- **probe:** probe heredoc bodies a shell reads through - or /dev/stdin ([37ab271](https://github.com/tenequm/frisk/commit/37ab27136a3003c2e99c8babbe16f880383828f9))
+
+### <!-- 5 -->📚 Documentation
+- **knowledge:** record judge.decisions, classifier timing and replay skew ([#8](https://github.com/tenequm/frisk/pull/8)) ([5edcad0](https://github.com/tenequm/frisk/commit/5edcad0d6dd8489e4632794f462aaa1a00360b4f))
+
+### <!-- 6 -->🧹 Chores
+- **release:** build every artifact before the tag exists ([#7](https://github.com/tenequm/frisk/pull/7)) ([5d26d2d](https://github.com/tenequm/frisk/commit/5d26d2d0891f14fcd0ebe4af42cbe94ef805c429))
+
+**Full Changelog**: https://github.com/tenequm/frisk/compare/v0.1.0...v0.1.1
+
 ## [0.1.0](https://github.com/tenequm/frisk/releases/tag/v0.1.0) - 2026-09-30
 
 ### <!-- 1 -->🎉 New Features
