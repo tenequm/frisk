@@ -36,6 +36,9 @@ closed.[^audit][^fix][^tokenizer]
 | Brace list or glob qualifier | `find . {-delete,-print}`, zsh `ls *(e:'id':)` | One word becomes several, or runs code, after the screens ran |
 | Reader of the environment | `printenv`, `env`, `echo $GITHUB_TOKEN`, `gh pr list --jq env` | Prints secrets held in variables |
 | Variable in argument position | `fd . $ARGS`, `ls $1` | The value can be a flag, a credential path or several words |
+| Relative path after a `cd` | `cd ~/.aws && cat credentials` | The path screen saw `credentials` without the directory that makes it one |
+| Glob that can expand to a flag | `find * -type f` in a directory holding a file named `-delete` | The shell turns a file name into an option after the screens ran |
+| Output through an operand or flag | `uniq in out`, `yq -s`, `go vet -vettool=x`, `kubectl --kubeconfig x` | A second operand or a flag writes a file or runs a program |
 | Quoting read differently from the shell | an escaped `"` inside double quotes, a backslash-newline inside a flag, `$'-x'`, a `'` inside a `#` comment | The commands or flags that follow were taken for quoted text |
 
 # Rule

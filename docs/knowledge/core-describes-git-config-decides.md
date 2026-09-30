@@ -73,6 +73,13 @@ with that prose dropped it allowed a forced push to a default branch.[^eval]
   earlier segment of the same command may have changed are reported as
   `unknown`: a push that goes by the checked-out branch after a `switch`, a
   discard's file counts after anything but a `cd` or a git read.
+- The same understanding serves the user's own rules: a git rule matches the
+  command git runs, not its spelling. Global options such as `-C dir` are set
+  aside, flags match anywhere with short, long and bundled forms unified, and
+  an allow rule never covers a force, deletion or hook-skipping flag it does
+  not name. A user writes `git commit --no-verify *` once instead of one
+  positional variant per flag position. `-c` and `--config-env` change what
+  git runs, so a command carrying them matches only a rule that names them.
 
 [^maintainer]: How frisk should treat git
 [^design]: frisk design
