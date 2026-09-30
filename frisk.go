@@ -2008,7 +2008,7 @@ func gitFacts(segments, env [][]string, cwd string) (map[string]any, string) {
 	// cannot have git status start its fsmonitor program.
 	git := func(dir string, args ...string) (string, bool) {
 		args = append([]string{"-C", dir, "--no-optional-locks", "-c", "core.fsmonitor=false"}, args...)
-		out, err := exec.CommandContext(ctx, verbGit, args...).Output() //nolint:gosec // argv without a shell; a word from the command passes gitRef first
+		out, err := exec.CommandContext(ctx, verbGit, args...).Output()
 		return strings.TrimSpace(string(out)), err == nil
 	}
 
@@ -2106,7 +2106,7 @@ func (g *gitCommand) settleCheckout(dir string, git gitRunner) {
 	refs := strings.Split(out, "\n")
 	tracking := len(slices.DeleteFunc(slices.Clone(refs), func(ref string) bool { return !strings.HasPrefix(ref, "refs/remotes/") }))
 	branch := slices.Contains(refs, "refs/heads/"+w) || tracking == 1
-	_, err := os.Lstat(filepath.Join(dir, w)) //nolint:gosec // only whether the path exists, which is what git itself checks
+	_, err := os.Lstat(filepath.Join(dir, w))
 	switch {
 	case branch && errors.Is(err, fs.ErrNotExist):
 		g.class = gitLocal
