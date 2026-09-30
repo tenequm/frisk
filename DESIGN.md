@@ -437,8 +437,11 @@ with `&&`. A `cd` inside control flow stays unsound. Targets containing a
 `..` component are refused before cleaning, `~/` expanding without cleaning,
 and a `~` left quoted is refused. A redirect ahead of the verb, and one on a
 command word zsh cannot find, stay unsound. Credential
-paths, `.claude`, `.git`, `.githooks`, `.husky` and `.env*` components never
-qualify. Target and ancestor symlinks, nonregular targets and shell network pseudo-paths
+paths, `.env*` components, `.githooks`, and every path Claude Code never
+auto-approves a write to (`.git`, `.claude`, `.vscode`, `.cargo`, shell rc
+files, `.gitconfig`, `lefthook.yml`, `.mcp.json` and the rest of its protected
+list) never qualify, so a redirect cannot settle a write an Edit under the
+same rule would not. Target and ancestor symlinks, nonregular targets and shell network pseudo-paths
 are refused. On macOS, the system `/tmp`
 alias is checked as `/private/tmp`; the example config includes both scopes.
 Input redirects other than the existing `/dev/null` exception, here-strings,

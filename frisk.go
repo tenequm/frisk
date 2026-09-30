@@ -1480,6 +1480,27 @@ func allSegmentsAllowed(rules []string, cwd string, readings ...[][]string) (str
 	return matched, matched != ""
 }
 
+// protectedWriteDirs and protectedWriteFiles are the paths Claude Code never
+// auto-approves a write to, whatever the allow rules say, plus git's hook
+// directories: a redirect covered by an Edit rule must not settle what an Edit
+// covered by the same rule would not.
+var (
+	protectedWriteDirs = map[string]bool{
+		".git": true, ".githooks": true, ".vscode": true, ".idea": true, ".husky": true, ".cargo": true,
+		".devcontainer": true, ".yarn": true, ".mvn": true, ".claude": true,
+	}
+	protectedWriteFiles = map[string]bool{
+		".gitconfig": true, ".gitmodules": true,
+		".bashrc": true, ".bash_profile": true, ".bash_login": true, ".bash_aliases": true, ".bash_logout": true,
+		".zshrc": true, ".zprofile": true, ".zshenv": true, ".zlogin": true, ".zlogout": true, ".profile": true, ".envrc": true,
+		".npmrc": true, ".yarnrc": true, ".yarnrc.yml": true, ".pnp.cjs": true, ".pnp.loader.mjs": true, ".pnpmfile.cjs": true,
+		"bunfig.toml": true, ".bunfig.toml": true, ".bazelrc": true, ".bazelversion": true, ".bazeliskrc": true,
+		".pre-commit-config.yaml": true, "lefthook.yml": true, "lefthook.yaml": true, ".lefthook.yml": true, ".lefthook.yaml": true,
+		"gradle-wrapper.properties": true, "maven-wrapper.properties": true, ".devcontainer.json": true,
+		".ripgreprc": true, "pyrightconfig.json": true, ".mcp.json": true, ".claude.json": true,
+	}
+)
+
 func allowedWrite(rules []string, dir, target string) bool {
 	// A "~" left here is quoted or follows no verb staticSegments expands it
 	// for, so where it lands is not certain.
@@ -1503,9 +1524,12 @@ func allowedWrite(rules []string, dir, target string) bool {
 		target == gate || strings.HasPrefix(target, gate+string(filepath.Separator)) {
 		return false
 	}
-	for part := range strings.SplitSeq(target, string(filepath.Separator)) {
-		part = strings.ToLower(part)
-		if part == ".claude" || part == ".git" || part == ".githooks" || part == ".husky" || strings.HasPrefix(part, ".env") {
+	lower := strings.ToLower(target)
+	if strings.Contains(lower+"/", "/.config/git/") || protectedWriteFiles[filepath.Base(lower)] {
+		return false
+	}
+	for part := range strings.SplitSeq(lower, string(filepath.Separator)) {
+		if protectedWriteDirs[part] || strings.HasPrefix(part, ".env") {
 			return false
 		}
 	}
