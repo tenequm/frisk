@@ -586,7 +586,7 @@ func tokenize(command string) parsedCommand {
 	var docs []heredoc
 	var tok, exp strings.Builder
 	var quote byte
-	globbed, quoted, sep := false, false, ""
+	globbed, quoted, dollarQuote, sep := false, false, false, ""
 	flushToken := func() {
 		if tok.Len() > 0 {
 			if globbed && credentialGlob.MatchString(tok.String()) {
@@ -627,14 +627,26 @@ func tokenize(command string) parsedCommand {
 	for i := 0; i < len(command); i++ {
 		c := command[i]
 		switch {
+		case c == '\\' && i+1 < len(command) && command[i+1] == '\n' && quote != '\'':
+			i++ // line continuation: the shell drops both bytes
+		case c == '\\' && i+1 < len(command) &&
+			(quote == '"' && strings.IndexByte("\"\\$`", command[i+1]) >= 0 || quote == '\'' && dollarQuote):
+			// Read as the end of the string, an escaped quote would turn the
+			// commands after it into quoted text.
+			i++
+			write(command[i], false)
 		case quote != 0:
 			if c == quote {
 				quote = 0
 			} else {
 				p.unsound = p.unsound || c == '<' || c == '>'
-				write(c, quote == '"' && command[i-1] != '\\')
+				write(c, quote == '"')
 			}
 		case c == '\'' || c == '"':
+			// $'...' and $"..." are decoded by the shell in ways not followed
+			// here, beyond the backslash escapes that keep $'...' from ending early.
+			dollarQuote = strings.HasSuffix(exp.String(), "$")
+			p.unsound = p.unsound || dollarQuote
 			quote, quoted = c, true
 		case c == '\\' && i+1 < len(command):
 			i++
