@@ -26,9 +26,11 @@ parse into pipeline segments (|, &&, ||, ;, newline)
 2. permissions.ask   match -> "ask"
 3. permissions.allow: EVERY segment matches a rule
    and trips no screen (core ships no rules; bails on
-    $(), backticks, heredocs, &, # comments, variables
-    the command does not set to a literal, and redirects
-    other than 2>&1 and /dev/null) -> "allow"
+    $(), backticks, (), heredocs, &, # comments, brace
+    lists, variables the command does not set to a
+    literal, and redirects other than 2>&1 and
+    /dev/null; inside single quotes or escaped, all of
+    these are text) -> "allow"
 4. judge (needs jev.keyCmd): one Choice question
      allow + confidence >= 0.75 -> "allow"
      deny  + confidence >= 0.50 -> "deny" (below: "ask")
@@ -69,6 +71,26 @@ An unquoted `#` that starts a word is a comment: the rest of the line is
 dropped unread, so a quote inside it cannot hide the lines after it from the
 rules. A command with a comment is never allowed statically, because a shell
 that does not recognise comments would run that text.
+
+What defeats static reasoning is decided where the shell would act on it, and
+recorded on the statement it occurs in. A `<`, `>`, backtick or `$(` is a
+construct only where the shell reads it as one: `rg "=>" src` and
+`sed 's/<b>//g' f` are plain arguments, `echo "$(id)"` is not, because double
+quotes do not stop a substitution. A verb that takes program text reads those
+characters its own way, so its screen has to: awk's covers `>`, `>>`, `<` and
+`@load` besides `system`, pipes and `ENVIRON`; sed's script walker covers `w`
+and `e`; jq and yq have no file or command operators. Heredocs stay unsound
+whoever reads them.
+
+A statement that is only assignments (`S=/tmp/x; cat $S/f`) runs nothing and
+needs no rule, but some other statement must match one. It is refused when the
+value names a credential file or keeps an expansion, when the variable is
+secret-named, and when the name is one that makes the shell or a later command
+run or load something else: `PATH` and zsh's `path`, `HOME`, `BASH_ENV`,
+`ZDOTDIR`, `PS4`, `NULLCMD`, `ARGV0`, loader and interpreter variables, any
+`GIT_*`, anything shaped like `*_PAGER`, `*_EDITOR`, `*CONFIG*`, `*_OPTIONS` or
+`*FLAGS`, proxies and trust roots, `CLAUDE_*`. The same names are refused as a
+`NAME=value` prefix, and `printf -v` is screened as an assignment.
 
 `judge.decisions` lists which of `allow`, `ask`, `deny` the judge may issue;
 unset means all three. An empty list or any other value is a malformed config.

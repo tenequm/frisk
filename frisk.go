@@ -71,6 +71,7 @@ const (
 	verbAwk   = "awk"
 	verbEnv   = "env"
 	verbGit   = "git"
+	verbPrint = "printf"
 	verbSed   = "sed"
 	verbUVRun = "uv run"
 )
@@ -97,6 +98,9 @@ var denyFlags = map[string][]string{
 	"less":  lessDenyFlags,
 	"more":  lessDenyFlags,
 	"gh":    {"-t", "--show-token"},
+	// printf -v assigns a variable, which would carry a hijacking name past
+	// the assignment screen.
+	verbPrint: {"-v"},
 }
 
 // lessDenyFlags cover the log file and the lesskey options, which can set
@@ -110,7 +114,7 @@ var lessDenyFlags = []string{
 // "-i.bak", and "-oFILE" all carry the flag.
 var clusterVerbs = map[string]bool{
 	verbSed: true, "sort": true, "fd": true, "xxd": true, verbAwk: true, "yq": true,
-	"jq": true, "tree": true, "less": true, "more": true, "date": true,
+	"jq": true, "tree": true, "less": true, "more": true, "date": true, verbPrint: true,
 }
 
 // kubeSecret matches the secret resource in a kubectl get: bare, plural,
@@ -121,16 +125,34 @@ var kubeSecret = regexp.MustCompile(`(?i)(^|,)secrets?([./,]|$)`)
 // environment, which no flag screen sees. A jq module is program text from a
 // file, like -f.
 var programVerbs = map[string]*regexp.Regexp{
-	verbAwk: regexp.MustCompile(`(?i)system|\||environ`),
+	verbAwk: regexp.MustCompile(`(?i)system|\||environ|[<>@]`),
 	"jq":    regexp.MustCompile(`(^|[^.\w$])env\b|\$ENV\b|\b(import|include)\s*"`),
 	"yq":    regexp.MustCompile(`(^|[^.\w$])(str)?env\b|\$ENV\b`),
 }
 
-// hijackEnv names environment variables that make an allowed verb run
-// another program or load foreign code or config.
-var hijackEnv = regexp.MustCompile(
-	`^(PATH|PAGER|GIT_(SSH|SSH_COMMAND|PROXY_COMMAND|PAGER|EXTERNAL_DIFF|ASKPASS|EXEC_PATH|CONFIG[A-Z0-9_]*)|SSH_ASKPASS|LESS(OPEN|CLOSE)|LD_[A-Z_]+|DYLD_[A-Z_]+|BASH_ENV|RIPGREP_CONFIG_PATH|KUBECONFIG|GOFLAGS|GH_PAGER|GH_BROWSER|BROWSER)=`,
-)
+// hijackEnv names variables that make the shell or an allowed verb run
+// another program, or load foreign code, config or trust. One assigned as a
+// prefix or as a statement of its own keeps the command from settling.
+var hijackEnv = regexp.MustCompile(`^(` +
+	// What the shell looks up and reads: commands and functions, startup
+	// files, a child shell's options and trace prompt, and zsh's command for
+	// a bare redirect, its argv[0] override and its stty hook.
+	`PATH|path|FPATH|fpath|MODULE_PATH|module_path|EXECIGNORE|HOME|ENV|BASH_ENV|ZDOTDIR` +
+	`|SHELLOPTS|BASHOPTS|POSIXLY_CORRECT|PS4|PROMPT4|BASH_XTRACEFD|NULLCMD|READNULLCMD|ARGV0|STTY` +
+	// Code the dynamic loader or an interpreter pulls in.
+	`|LD_[A-Z0-9_]+|DYLD_[A-Z0-9_]+|PYTHON(STARTUP|PATH|HOME|INSPECT|USERBASE|BREAKPOINT)` +
+	`|NODE_(PATH|EXTRA_CA_CERTS|TLS_REJECT_UNAUTHORIZED)|PERL5?(LIB|DB)|RUBYLIB|LUA_(INIT|C?PATH)[0-9_]*|CLASSPATH` +
+	// Programs and settings a tool takes from its environment, by the shape
+	// of the name: GIT_PAGER, KUBE_EDITOR, SSH_ASKPASS, GIT_SSH_COMMAND,
+	// KUBECONFIG, NODE_OPTIONS, PERL5OPT, GOFLAGS.
+	`|[A-Z0-9_]*(PAGER|EDITOR|BROWSER|ASKPASS|_COMMAND|CONFIG[A-Z0-9_]*|_OPTIONS|OPTS?|FLAGS)|VISUAL|LESS[A-Z_]*|MORE` +
+	// Tools by name: every git variable, the go toolchain, compilers, and the
+	// proxies and trust roots that put a request in someone else's hands.
+	`|GIT_[A-Z0-9_]+|GH_PATH|GOENV|GOROOT|GOPATH|GOTOOLDIR|GOTOOLCHAIN|CC|CXX` +
+	`|(?i:https?_proxy|all_proxy|npm_config_[a-z0-9_]+)|SSL_CERT_(FILE|DIR)|(CURL|REQUESTS)_CA_BUNDLE` +
+	// The agent's own settings.
+	`|CLAUDE_[A-Z0-9_]+|ANTHROPIC_[A-Z0-9_]+` +
+	`)=`)
 
 var builtinJudge = judgeConfig{
 	Environment: []string{
@@ -507,6 +529,11 @@ type statement struct {
 	words []word
 	cmd   int  // index of the first word that is not a leading NAME=value
 	data  bool // a heredoc body line no shell reads: deny and ask rules match it, the probe skips it
+	// unsound marks a construct that defeats static reasoning about this
+	// statement: a substitution, a parenthesis, a redirect other than a stderr
+	// merge or /dev/null, a heredoc, backgrounding, $'...' quoting, or a
+	// hijacking assignment.
+	unsound bool
 }
 
 // heredocOp matches "<<" or "<<-" with its delimiter, quoted in part or whole.
@@ -533,9 +560,9 @@ func heredocAt(s string, i int) (heredoc, int) {
 
 type parsedCommand struct {
 	stmts []statement
-	// unsound reports constructs that defeat static reasoning: substitution,
-	// redirection (except stderr merges and /dev/null, which write nothing),
-	// heredocs, backgrounding, "#" comments, and hijacking env assignments.
+	// unsound reports what defeats static reasoning about the whole command
+	// and belongs to no statement: a "#" comment, an unclosed quote, a
+	// redirect or "&" with no command, a heredoc whose body never starts.
 	unsound bool
 	// opaque reports constructs whose variable flow is not followed:
 	// subshells, substitution, function bodies, heredocs.
@@ -543,16 +570,14 @@ type parsedCommand struct {
 }
 
 func tokenize(command string) parsedCommand {
-	p := parsedCommand{
-		unsound: strings.Contains(command, "`") || strings.Contains(command, "$("),
-		opaque:  strings.Contains(command, "`") || strings.Contains(command, "<<") || strings.Contains(command, "$("),
-	}
-
+	var p parsedCommand
 	var words []word
 	var docs []heredoc
 	var tok, exp strings.Builder
 	var quote byte
 	globbed, quoted, dollarQuote, sep := false, false, false, ""
+	// unsound and redirected describe the statement being read.
+	unsound, redirected := false, false
 	flushToken := func() {
 		if tok.Len() > 0 {
 			words = append(words, word{text: tok.String(), exp: exp.String(), quoted: quoted, glob: globbed})
@@ -566,6 +591,9 @@ func tokenize(command string) parsedCommand {
 	flushStatement := func(next string) {
 		flushToken()
 		if len(words) == 0 {
+			// zsh runs $NULLCMD for a redirect that has no command.
+			p.unsound = p.unsound || unsound || redirected
+			unsound, redirected = false, false
 			if sep == "" || sep == ";" {
 				sep = next
 			}
@@ -573,13 +601,18 @@ func tokenize(command string) parsedCommand {
 		}
 		cmd := 0
 		for cmd < len(words) && assignmentPattern.MatchString(words[cmd].text) {
-			p.unsound = p.unsound || hijackEnv.MatchString(words[cmd].text)
+			unsound = unsound || hijackEnv.MatchString(words[cmd].text)
 			cmd++
 		}
-		p.stmts = append(p.stmts, statement{sep: sep, words: words, cmd: cmd})
-		words, sep = nil, next
+		p.stmts = append(p.stmts, statement{sep: sep, words: words, cmd: cmd, unsound: unsound})
+		words, sep, unsound, redirected = nil, next, false, false
 	}
 	write := func(c byte, expands bool) {
+		// A backtick or "$(" runs a command wherever the shell expands, inside
+		// double quotes too; single-quoted or escaped it is text.
+		if expands && (c == '`' || c == '(' && strings.HasSuffix(exp.String(), "$")) {
+			p.opaque, unsound = true, true
+		}
 		tok.WriteByte(c)
 		if c == '$' && !expands {
 			c = 0
@@ -602,31 +635,30 @@ func tokenize(command string) parsedCommand {
 			if c == quote {
 				quote = 0
 			} else {
-				p.unsound = p.unsound || c == '<' || c == '>'
 				write(c, quote == '"')
 			}
 		case c == '\'' || c == '"':
 			// $'...' and $"..." are decoded by the shell in ways not followed
 			// here, beyond the backslash escapes that keep $'...' from ending early.
 			dollarQuote = strings.HasSuffix(exp.String(), "$")
-			p.unsound = p.unsound || dollarQuote
+			unsound = unsound || dollarQuote
 			quote, quoted = c, true
 		case c == '\\' && i+1 < len(command):
 			i++
 			quoted = true
-			p.unsound = p.unsound || command[i] == '<' || command[i] == '>'
 			write(command[i], false)
 		case c == '<' || c == '>':
 			if fd := tok.String(); !quoted && (fd == "" || fd == "0" || fd == "1" || fd == "2") {
 				if end := safeRedirect(command, i, fd); end > 0 {
 					tok.Reset()
 					exp.Reset()
-					globbed, i = false, end-1
+					globbed, redirected, i = false, true, end-1
 					continue
 				}
 			}
-			p.unsound = true
+			unsound = true
 			if d, n := heredocAt(command, i); n > 0 {
+				p.opaque = true
 				flushToken()
 				d.owner = len(p.stmts)
 				docs = append(docs, d)
@@ -651,7 +683,7 @@ func tokenize(command string) parsedCommand {
 		case c == '&':
 			if tok.Len() == 0 && !quoted && i+1 < len(command) && command[i+1] == '>' {
 				if end := safeRedirect(command, i+1, "&"); end > 0 {
-					i = end - 1
+					redirected, i = true, end-1
 					continue
 				}
 			}
@@ -660,7 +692,7 @@ func tokenize(command string) parsedCommand {
 				i++
 				next = "&&"
 			} else {
-				p.unsound = true // backgrounding
+				unsound = true // backgrounding
 			}
 			flushStatement(next)
 		case c == ' ' || c == '\t':
@@ -680,13 +712,13 @@ func tokenize(command string) parsedCommand {
 			// A parenthesis is a subshell, an array, or a zsh glob qualifier,
 			// which can run code: "*(e:'cmd':)".
 			if c == '(' || c == ')' {
-				p.opaque, p.unsound = true, true
+				p.opaque, unsound = true, true
 			}
 			write(c, true)
 		}
 	}
 	flushStatement("")
-	if quote != 0 {
+	if quote != 0 || len(docs) > 0 {
 		p.unsound = true
 	}
 	return p
@@ -837,13 +869,21 @@ func (p parsedCommand) staticSegments() ([][]string, bool) {
 	vars := p.literalVars()
 	segs, sound := p.segments(), !p.unsound
 	for j, st := range p.stmts {
+		sound = sound && !st.unsound
 		for k, w := range st.words {
 			text := p.substitute(vars, j, w)
 			sound = sound && !expansion.MatchString(text) &&
 				(!w.glob || !credentialGlob.MatchString(text) && !braceExpansion.MatchString(text))
 			if k >= st.cmd {
 				segs[j][k-st.cmd] = strings.ReplaceAll(text, "\x00", "$")
+				continue
 			}
+			// An assignment is matched against no rule, so the screens an
+			// argument would meet run here: a value naming a credential file,
+			// and a secret-named variable set as a statement of its own.
+			name, _, _ := strings.Cut(text, "=")
+			sound = sound && !credentialPath.MatchString(text) &&
+				(st.cmd < len(st.words) || !secretEnvName.MatchString(name))
 		}
 	}
 	return segs, sound
@@ -896,7 +936,7 @@ var (
 		"export": true, "readonly": true, "local": true, "declare": true,
 		"typeset": true, "integer": true, "float": true, "unset": true, "read": true,
 		"for": true, "select": true, "getopts": true, "mapfile": true,
-		"readarray": true, "let": true, "printf": true, "set": true,
+		"readarray": true, "let": true, verbPrint: true, "set": true,
 	}
 	// trap and alias can change a variable or a verb later on; setopt and
 	// emulate change how zsh expands every word.
@@ -1065,20 +1105,25 @@ func matchAny(rules []string, segments [][]string) string {
 	return ""
 }
 
-// allSegmentsAllowed needs a permissions.allow rule for every segment: core
-// ships none, and its screens only keep a rule from matching a form that is
-// not what the rule means.
+// allSegmentsAllowed needs a permissions.allow rule for every segment that
+// runs a command: core ships none, and its screens only keep a rule from
+// matching a form that is not what the rule means. An empty segment is a
+// statement of assignments, which staticSegments has screened and which runs
+// nothing; a command made of those alone has no rule behind it.
 func allSegmentsAllowed(rules []string, segments [][]string) (string, bool) {
 	var matched string
 	for _, seg := range segments {
-		if len(seg) == 0 || hasDeniedFlag(seg) || riskyArgs(seg) {
+		if len(seg) == 0 {
+			continue
+		}
+		if hasDeniedFlag(seg) || riskyArgs(seg) {
 			return "", false
 		}
 		if matched = matchAny(rules, [][]string{seg}); matched == "" {
 			return "", false
 		}
 	}
-	return matched, true
+	return matched, matched != ""
 }
 
 func hasDeniedFlag(seg []string) bool {
@@ -1845,14 +1890,14 @@ func probeFile(target string, direct bool, dir shellDir) (scriptProbe, string) {
 // readCapped reads one byte past the cap, and only from regular files, so a
 // FIFO or device named as a script cannot block or flood the hook.
 func readCapped(path string) ([]byte, error) {
-	info, err := os.Stat(path) //nolint:gosec // the command names this path; the probe only reads it
+	info, err := os.Stat(path) // the command names this path; the probe only reads it
 	if err != nil {
 		return nil, fmt.Errorf("stat script: %w", err)
 	}
 	if !info.Mode().IsRegular() {
 		return nil, errNotRegular
 	}
-	f, err := os.Open(path) //nolint:gosec // size-capped and credential-screened before leaving the machine
+	f, err := os.Open(path) // size-capped and credential-screened before leaving the machine
 	if err != nil {
 		return nil, fmt.Errorf("open script: %w", err)
 	}
