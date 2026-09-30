@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/tenequm/frisk/compare/v0.1.2...v0.1.3) - 2026-09-30
+
+### <!-- 2 -->🐛 Bug Fixes
+- **release:** cut a test release to exercise the cancel-and-retry path ([75b4f53](https://github.com/tenequm/frisk/commit/75b4f53cb7e103717d6cea4434cbff40e387ca32))
+
+**Full Changelog**: https://github.com/tenequm/frisk/compare/v0.1.2...v0.1.3
+
 ## [0.1.2](https://github.com/tenequm/frisk/compare/v0.1.1...v0.1.2) - 2026-09-30
 
 ### <!-- 2 -->🐛 Bug Fixes
