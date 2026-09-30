@@ -135,6 +135,47 @@ withheld script.
 userinfo), read in the directory the command runs in under one 200 ms
 deadline. A field that cannot be read is omitted, never guessed.
 
+`git.commands` adds one record per git segment, in order, five at most
+(`git.commands_truncated` marks a longer command): the [description](#git) of
+that segment plus what its repository says, read in the directory the segment
+runs in (`-C`, or the directory a literal `cd` led to).
+
+| field | when | value |
+|-------|------|-------|
+| `subcommand`, `class` | always | as described, or `unknown` |
+| `forced`, `deletes_ref` | class `remote` and every push; otherwise only when true | boolean |
+| `no_verify`, `amend`, `config_override` | only when true | `true` |
+| `remote` | push | host/owner/repo of the push URL, or `unknown` |
+| `destination` | push | the branch the arguments name; with no refspec the upstream branch, when the push goes to the upstream's remote; `HEAD` is the current branch; else `unknown` |
+| `destination_is_default` | push | `yes`, `no`, or `unknown` when the remote has no `HEAD` ref locally |
+| `uncommitted_files`, `untracked_files` | class `discard` | counts from one `git status --porcelain`, or `unknown` when it does not answer in time |
+| `state` | always | `current`, or `unknown` when what this record reads from the repository may not hold when the segment runs |
+
+`state` is `unknown` when the directory cannot be resolved or the command is
+aimed at another repository (`--git-dir`, `GIT_DIR`, ...). State is not
+followed across segments either, so an earlier git segment of the same command
+can make it `unknown`, by what the record depends on:
+
+- a push's fields depend on the checked-out branch, its upstream and the
+  remotes. An earlier `switch`, `checkout`, `branch`, `remote`, `worktree`,
+  `clone` or `bisect` that is not a read, a `-u` / `--set-upstream`, a
+  `stash branch`, a rebase given the branch to rebase, or any segment of class
+  `exec` or `unknown` invalidates them. `add`, `commit`, `merge`, `reset` and
+  the like do not: `git add -A && git commit -m x && git push` keeps its facts.
+- a discard's counts are invalidated by any earlier git segment that is not a
+  read. A non-git segment that writes files is not noticed.
+
+The repository fields are then `unknown` and the ones read from the words
+stay. A remote written as a URL is always read from the words. The record is
+description only; the instructions
+gain one sentence saying what it is, that it is trusted, that `unknown` means
+frisk could not determine the field and that an absent optional field is
+false. No allow or deny criterion in the builtin prose refers to it.
+
+The lookups change nothing: git runs with `--no-optional-locks` and
+`core.fsmonitor=false`, so reading a repository neither rewrites its index nor
+starts a program its config names.
+
 Every script the command runs rides along with its sha256: one as
 `untrusted.script`, several as `untrusted.scripts`, 32 KiB combined. The probe
 sees through wrappers (`time`, `timeout`, `env`, `nice`, `nohup`, `exec`,
@@ -240,7 +281,9 @@ not read), and repository state across the segments of one command.
 Every decision - silences included - is one `slog` JSON record in
 `$XDG_STATE_HOME/frisk/frisk.log`: decision, tier, rule, command, confidence,
 probabilities, model, script sha, probe status, script count, closest-rule
-answers. An auto-approver without a record is a rumour.
+answers, and for a judged git command `git`, its records as
+`subcommand:class` joined by commas (`switch:local,push:remote`). An
+auto-approver without a record is a rumour.
 
 The log is plaintext and lives for weeks, so text that comes from tool input -
 the command or file path, and a reason that quotes it - is redacted on the way

@@ -1388,10 +1388,10 @@ type jevQuestion struct {
 
 // jevState is the request state as the judge sees it.
 type jevState struct {
-	Cwd       string            `json:"cwd"`
-	Probe     *jevProbeState    `json:"probe"`
-	Git       map[string]string `json:"git"`
-	Untrusted jevUntrusted      `json:"untrusted"`
+	Cwd       string         `json:"cwd"`
+	Probe     *jevProbeState `json:"probe"`
+	Git       map[string]any `json:"git"`
+	Untrusted jevUntrusted   `json:"untrusted"`
 }
 
 type jevProbeState struct {
@@ -1840,7 +1840,13 @@ func TestGitFacts(t *testing.T) {
 			cfg, capture := fakeJevCapture(t, jevAnswer{Choice: "ask", Confidence: 0.90})
 			decide(cfg, strings.ReplaceAll(tt.command, "{root}", root), filepath.Join(root, tt.cwd), testLogger)
 			raw, req := capture.request()
-			if !maps.Equal(req.State.Git, tt.want) {
+			facts := map[string]string{}
+			for name, value := range req.State.Git {
+				if s, ok := value.(string); ok {
+					facts[name] = s
+				}
+			}
+			if !maps.Equal(facts, tt.want) {
 				t.Fatalf("git state = %v, want %v", req.State.Git, tt.want)
 			}
 			if strings.Contains(raw, "s3cretpass") || strings.Contains(raw, "deploy") {
@@ -1852,6 +1858,256 @@ func TestGitFacts(t *testing.T) {
 			}
 		})
 	}
+}
+
+// gitDo runs git in the hermetic environment gitRepo set up.
+func gitDo(t *testing.T, args ...string) {
+	t.Helper()
+	if out, err := exec.CommandContext(t.Context(), "git", args...).CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, out)
+	}
+}
+
+// gitRepos adds to gitRepo one staged and one untracked file in repo, and a
+// clean second repository "other" on its default branch trunk.
+func gitRepos(t *testing.T) string {
+	t.Helper()
+	root := gitRepo(t)
+	repo, other := filepath.Join(root, "repo"), filepath.Join(root, "other")
+	for _, name := range []string{"staged.txt", "untracked.txt"} {
+		if err := os.WriteFile(filepath.Join(repo, name), []byte("x\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, args := range [][]string{
+		{"-C", repo, "add", "staged.txt"},
+		{"init", "-q", "-b", "trunk", other},
+		{"-C", other, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "init"},
+		{"-C", other, "remote", "add", "origin", "git@git.example.com:team/other.git"},
+		{"-C", other, "update-ref", "refs/remotes/origin/trunk", "HEAD"},
+		{"-C", other, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk"},
+	} {
+		gitDo(t, args...)
+	}
+	return root
+}
+
+func TestGitRecords(t *testing.T) {
+	root := gitRepos(t)
+	prev := gitFactsTimeout
+	gitFactsTimeout = 10 * time.Second
+	t.Cleanup(func() { gitFactsTimeout = prev })
+
+	tests := []struct {
+		name    string
+		command string
+		want    string // state.git.commands as JSON, "" when the field is absent
+		logged  string
+	}{
+		{
+			"push to the default branch", "git push origin main",
+			`[{"class":"remote","deletes_ref":false,"destination":"main","destination_is_default":"yes","forced":false,"remote":"github.com/owner/repo","state":"current","subcommand":"push"}]`,
+			"push:remote",
+		},
+		{
+			"push of a topic branch", "git push -u origin feature",
+			`[{"class":"remote","deletes_ref":false,"destination":"feature","destination_is_default":"no","forced":false,"remote":"github.com/owner/repo","state":"current","subcommand":"push"}]`,
+			"push:remote",
+		},
+		{
+			"forced push", "git push --force origin feature",
+			`[{"class":"remote","deletes_ref":false,"destination":"feature","destination_is_default":"no","forced":true,"remote":"github.com/owner/repo","state":"current","subcommand":"push"}]`,
+			"push:remote",
+		},
+		{
+			"push with no arguments goes to the upstream", "git push",
+			`[{"class":"remote","deletes_ref":false,"destination":"main","destination_is_default":"yes","forced":false,"remote":"github.com/owner/repo","state":"current","subcommand":"push"}]`,
+			"push:remote",
+		},
+		{
+			"push of HEAD goes to the current branch", "git push origin HEAD",
+			`[{"class":"remote","deletes_ref":false,"destination":"feature","destination_is_default":"no","forced":false,"remote":"github.com/owner/repo","state":"current","subcommand":"push"}]`,
+			"push:remote",
+		},
+		{
+			"push to a remote without the upstream has no known destination", "git push elsewhere",
+			`[{"class":"remote","deletes_ref":false,"destination":"unknown","destination_is_default":"unknown","forced":false,"remote":"unknown","state":"current","subcommand":"push"}]`,
+			"push:remote",
+		},
+		{
+			"push to a URL names it from the words", "git push https://example.com/o/r.git main",
+			`[{"class":"remote","deletes_ref":false,"destination":"main","destination_is_default":"unknown","forced":false,"remote":"example.com/o/r","state":"current","subcommand":"push"}]`,
+			"push:remote",
+		},
+		{
+			"push deleting a ref", "git push origin :old",
+			`[{"class":"remote","deletes_ref":true,"destination":"old","destination_is_default":"no","forced":false,"remote":"github.com/owner/repo","state":"current","subcommand":"push"}]`,
+			"push:remote",
+		},
+		{
+			"push of every branch", "git push --all origin",
+			`[{"class":"remote","deletes_ref":false,"destination":"unknown","destination_is_default":"unknown","forced":false,"remote":"github.com/owner/repo","state":"current","subcommand":"push"}]`,
+			"push:remote",
+		},
+		{
+			"discard with a dirty tree", "git reset --hard",
+			`[{"class":"discard","state":"current","subcommand":"reset","uncommitted_files":1,"untracked_files":1}]`,
+			"reset:discard",
+		},
+		{
+			"discard with a clean tree", "git -C ../other clean -fd",
+			`[{"class":"discard","forced":true,"state":"current","subcommand":"clean","uncommitted_files":0,"untracked_files":0}]`,
+			"clean:discard",
+		},
+		{
+			"-C to another repository", "git -C ../other push origin trunk",
+			`[{"class":"remote","deletes_ref":false,"destination":"trunk","destination_is_default":"yes","forced":false,"remote":"git.example.com/team/other","state":"current","subcommand":"push"}]`,
+			"push:remote",
+		},
+		{
+			"state is unknown after a local change", "git switch -c x && git push -u origin x",
+			`[{"class":"local","state":"current","subcommand":"switch"},` +
+				`{"class":"remote","deletes_ref":false,"destination":"x","destination_is_default":"unknown","forced":false,"remote":"unknown","state":"unknown","subcommand":"push"}]`,
+			"switch:local,push:remote",
+		},
+		{
+			"a read leaves the state current", "git --no-pager log -1 && git push origin main",
+			`[{"class":"read","state":"current","subcommand":"log"},` +
+				`{"class":"remote","deletes_ref":false,"destination":"main","destination_is_default":"yes","forced":false,"remote":"github.com/owner/repo","state":"current","subcommand":"push"}]`,
+			"log:read,push:remote",
+		},
+		{
+			"state is unknown after a cd that cannot be followed", "cd $DIR && git reset --hard && git push origin main",
+			`[{"class":"discard","state":"unknown","subcommand":"reset","uncommitted_files":"unknown","untracked_files":"unknown"},` +
+				`{"class":"remote","deletes_ref":false,"destination":"main","destination_is_default":"unknown","forced":false,"remote":"unknown","state":"unknown","subcommand":"push"}]`,
+			"reset:discard,push:remote",
+		},
+		{
+			"--git-dir aims at another repository", "git --git-dir=../other/.git push origin trunk",
+			`[{"class":"remote","deletes_ref":false,"destination":"trunk","destination_is_default":"unknown","forced":false,"remote":"unknown","state":"unknown","subcommand":"push"}]`,
+			"push:remote",
+		},
+		{
+			"GIT_DIR aims at another repository", "GIT_DIR=../other/.git git reset --hard",
+			`[{"class":"discard","state":"unknown","subcommand":"reset","uncommitted_files":"unknown","untracked_files":"unknown"}]`,
+			"reset:discard",
+		},
+		{
+			"config override", "git -c core.hooksPath=/dev/null commit -m x",
+			`[{"class":"exec","config_override":true,"state":"current","subcommand":"commit"}]`,
+			"commit:exec",
+		},
+		{
+			"amend that skips hooks", "git commit --amend --no-verify -m x",
+			`[{"amend":true,"class":"local","no_verify":true,"state":"current","subcommand":"commit"}]`,
+			"commit:local",
+		},
+		{
+			"alias", "git co main",
+			`[{"class":"unknown","state":"current","subcommand":"co"}]`,
+			"co:unknown",
+		},
+		{
+			"more git commands than the cap", "git add a; git add b; git add c; git add d; git add e; git add f",
+			`[{"class":"local","state":"current","subcommand":"add"}` +
+				strings.Repeat(`,{"class":"local","state":"current","subcommand":"add"}`, maxGitCommands-1) + `]`,
+			"add:local,add:local,add:local,add:local,add:local",
+		},
+		{
+			"add and commit leave a push's facts current", "git add -A && git commit -m x && git push",
+			`[{"class":"local","state":"current","subcommand":"add"},{"class":"local","state":"current","subcommand":"commit"},` +
+				`{"class":"remote","deletes_ref":false,"destination":"main","destination_is_default":"yes","forced":false,"remote":"github.com/owner/repo","state":"current","subcommand":"push"}]`,
+			"add:local,commit:local,push:remote",
+		},
+		{
+			"commit leaves the current branch in place", "git commit -m x && git push origin HEAD",
+			`[{"class":"local","state":"current","subcommand":"commit"},` +
+				`{"class":"remote","deletes_ref":false,"destination":"feature","destination_is_default":"no","forced":false,"remote":"github.com/owner/repo","state":"current","subcommand":"push"}]`,
+			"commit:local,push:remote",
+		},
+		{
+			"a new upstream makes a push's facts unknown", "git branch -u origin/other && git push",
+			`[{"class":"local","state":"current","subcommand":"branch"},` +
+				`{"class":"remote","deletes_ref":false,"destination":"unknown","destination_is_default":"unknown","forced":false,"remote":"unknown","state":"unknown","subcommand":"push"}]`,
+			"branch:local,push:remote",
+		},
+		{
+			"an unknown command makes a push's facts unknown", "git co main && git push origin main",
+			`[{"class":"unknown","state":"current","subcommand":"co"},` +
+				`{"class":"remote","deletes_ref":false,"destination":"main","destination_is_default":"unknown","forced":false,"remote":"unknown","state":"unknown","subcommand":"push"}]`,
+			"co:unknown,push:remote",
+		},
+		{
+			"a stash makes a discard's counts unknown", "git stash && git reset --hard",
+			`[{"class":"local","state":"current","subcommand":"stash"},` +
+				`{"class":"discard","state":"unknown","subcommand":"reset","uncommitted_files":"unknown","untracked_files":"unknown"}]`,
+			"stash:local,reset:discard",
+		},
+		{
+			"a push's facts survive a discard, the counts do not survive a push", "git reset --hard && git push origin main && git clean -fd",
+			`[{"class":"discard","state":"current","subcommand":"reset","uncommitted_files":1,"untracked_files":1},` +
+				`{"class":"remote","deletes_ref":false,"destination":"main","destination_is_default":"yes","forced":false,"remote":"github.com/owner/repo","state":"current","subcommand":"push"},` +
+				`{"class":"discard","forced":true,"state":"unknown","subcommand":"clean","uncommitted_files":"unknown","untracked_files":"unknown"}]`,
+			"reset:discard,push:remote,clean:discard",
+		},
+		{"gh command gets facts and no record", "gh pr create --fill", "", ""},
+		{"non-git command", "terraform plan", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, capture := fakeJevCapture(t, jevAnswer{Choice: "ask", Confidence: 0.90})
+			v := decide(cfg, tt.command, filepath.Join(root, "repo"), testLogger)
+			raw, req := capture.request()
+
+			got := ""
+			if commands, ok := req.State.Git["commands"]; ok {
+				data, err := json.Marshal(commands)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got = string(data)
+			}
+			if got != tt.want {
+				t.Fatalf("git.commands =\n%s\nwant\n%s", got, tt.want)
+			}
+			instructions := req.Questions["decision"].Instructions
+			if strings.Contains(instructions, gitCommandsInstruction) != (tt.want != "") {
+				t.Fatalf("record instruction does not follow the record: %s", instructions)
+			}
+			capped := strings.Count(tt.command, "git add") > maxGitCommands
+			if _, ok := req.State.Git["commands_truncated"]; ok != capped || strings.Contains(instructions, gitTruncatedInstruction) != capped {
+				t.Fatalf("truncation marked = %v, want %v: %s", ok, capped, raw)
+			}
+
+			var buf strings.Builder
+			logVerdict(slog.New(slog.NewJSONHandler(&buf, nil)), v, tt.command)
+			var rec struct {
+				Git *string `json:"git"`
+			}
+			if err := json.Unmarshal([]byte(buf.String()), &rec); err != nil {
+				t.Fatalf("log not JSON: %v: %s", err, buf.String())
+			}
+			if (rec.Git == nil) != (tt.logged == "") || (rec.Git != nil && *rec.Git != tt.logged) {
+				t.Fatalf("log git field = %v, want %q: %s", rec.Git, tt.logged, buf.String())
+			}
+		})
+	}
+
+	t.Run("git status out of time leaves the counts unknown", func(t *testing.T) {
+		gitFactsTimeout = time.Nanosecond
+		t.Cleanup(func() { gitFactsTimeout = 10 * time.Second })
+		cfg, capture := fakeJevCapture(t, jevAnswer{Choice: "ask", Confidence: 0.90})
+		decide(cfg, "git reset --hard", filepath.Join(root, "repo"), testLogger)
+		_, req := capture.request()
+		data, err := json.Marshal(req.State.Git)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := `{"commands":[{"class":"discard","state":"current","subcommand":"reset","uncommitted_files":"unknown","untracked_files":"unknown"}]}`
+		if string(data) != want {
+			t.Fatalf("git state = %s, want %s", data, want)
+		}
+	})
 }
 
 func TestRemoteSlug(t *testing.T) {
@@ -1872,6 +2128,61 @@ func TestRemoteSlug(t *testing.T) {
 	for _, tt := range tests {
 		if got := remoteSlug(tt.raw); got != tt.want {
 			t.Errorf("remoteSlug(%q) = %q, want %q", tt.raw, got, tt.want)
+		}
+	}
+}
+
+func TestGitMoves(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		command string
+		moves   bool
+	}{
+		{"git switch main", true},
+		{"git switch -c feat/x", true},
+		{"git checkout main", true},
+		{"git checkout -b feat/x", true},
+		{"git checkout -- frisk.go", true},
+		{"git branch feat/x", true},
+		{"git branch -u origin/other", true},
+		{"git branch -D feat/x", true},
+		{"git remote set-url origin https://example.com/o/r.git", true},
+		{"git remote add up https://example.com/o/r.git", true},
+		{"git worktree add ../wt", true},
+		{"git clone https://example.com/o/r.git", true},
+		{"git bisect start", true},
+		{"git push -u origin feat/x", true},
+		{"git push --set-upstream origin feat/x", true},
+		{"git pull --set-upstream origin main", true},
+		{"git fetch --set-upstream origin main", true},
+		{"git stash branch feat/y", true},
+		{"git rebase main feat/x", true},
+
+		{"git branch", false},
+		{"git branch -avv", false},
+		{"git remote -v", false},
+		{"git worktree list", false},
+		{"git add -A", false},
+		{"git commit -m x", false},
+		{"git tag v1.0.0", false},
+		{"git stash", false},
+		{"git stash pop", false},
+		{"git merge feat/x", false},
+		{"git rebase main", false},
+		{"git reset --hard", false},
+		{"git restore frisk.go", false},
+		{"git rm -f frisk.go", false},
+		{"git cherry-pick abc123", false},
+		{"git revert HEAD", false},
+		{"git fetch origin", false},
+		{"git pull", false},
+		{"git push origin main", false},
+		{"git status", false},
+	}
+	for _, tt := range tests {
+		g, ok := describeGit(strings.Fields(tt.command))
+		if !ok || g.moves != tt.moves {
+			t.Errorf("describeGit(%q).moves = %v, want %v", tt.command, g.moves, tt.moves)
 		}
 	}
 }
