@@ -70,6 +70,7 @@ const (
 
 	verbAwk   = "awk"
 	verbEnv   = "env"
+	verbGH    = "gh"
 	verbGit   = "git"
 	verbPrint = "printf"
 	verbSed   = "sed"
@@ -97,7 +98,7 @@ var denyFlags = map[string][]string{
 	"tree":  {"-o", "-R"},
 	"less":  lessDenyFlags,
 	"more":  lessDenyFlags,
-	"gh":    {"-t", "--show-token"},
+	verbGH:  {"-t", "--show-token"},
 	// printf -v assigns a variable, which would carry a hijacking name past
 	// the assignment screen.
 	verbPrint: {"-v"},
@@ -121,12 +122,17 @@ var clusterVerbs = map[string]bool{
 // with a name or API group, or inside a comma list.
 var kubeSecret = regexp.MustCompile(`(?i)(^|,)secrets?([./,]|$)`)
 
+// jqProgram matches a jq program that reads the environment or pulls in a
+// module, which is program text from a file, like -f.
+var jqProgram = regexp.MustCompile(`(^|[^.\w$])env\b|\$ENV\b|\b(import|include)\s*"`)
+
 // programVerbs take a program text that can run commands or read the
-// environment, which no flag screen sees. A jq module is program text from a
-// file, like -f.
+// environment, which no flag screen sees. gh runs its --jq filter with the
+// environment loaded, token included.
 var programVerbs = map[string]*regexp.Regexp{
 	verbAwk: regexp.MustCompile(`(?i)system|\||environ|[<>@]`),
-	"jq":    regexp.MustCompile(`(^|[^.\w$])env\b|\$ENV\b|\b(import|include)\s*"`),
+	"jq":    jqProgram,
+	verbGH:  jqProgram,
 	"yq":    regexp.MustCompile(`(^|[^.\w$])(str)?env\b|\$ENV\b`),
 }
 
@@ -1175,9 +1181,39 @@ func riskyArgs(seg []string) bool {
 		return slices.ContainsFunc(sedScripts(args), sedScriptWrites)
 	case "kubectl":
 		return slices.Contains(args, "get") && slices.ContainsFunc(args, kubeSecret.MatchString)
+	case verbGH:
+		return len(args) > 0 && args[0] == "api" && !ghAPIReads(args[1:])
 	default:
 		return false
 	}
+}
+
+// ghAPIReads reports a gh api call that can only send a GET. gh switches to
+// POST as soon as a field or an input body is given, and GraphQL needs one.
+func ghAPIReads(args []string) bool {
+	for i, a := range args {
+		name, value, attached := strings.Cut(a, "=")
+		short := len(a) > 1 && a[0] == '-' && a[1] != '-'
+		switch {
+		case a == "graphql", abbreviates(name, "--field"), abbreviates(name, "--raw-field"),
+			abbreviates(name, "--input"), short && strings.ContainsAny(a, "fF"):
+			return false
+		case abbreviates(name, "--method"):
+		case short && strings.Contains(a, "X"):
+			// Bundled or attached: -iX GET, -XGET, -X=GET.
+			value = strings.TrimPrefix(a[strings.IndexByte(a, 'X')+1:], "=")
+			attached = value != ""
+		default:
+			continue
+		}
+		if !attached && i+1 < len(args) {
+			value = args[i+1]
+		}
+		if value != "GET" {
+			return false
+		}
+	}
+	return true
 }
 
 // sedScripts picks the script texts out of sed's arguments: every -e value,
@@ -1486,7 +1522,7 @@ func gitFacts(segments [][]string, cwd string) map[string]string {
 			continue
 		}
 		verb := filepath.Base(inner[0])
-		if verb != verbGit && verb != "gh" {
+		if verb != verbGit && verb != verbGH {
 			continue
 		}
 		if verb == verbGit && len(inner) > 2 && inner[1] == "-C" {

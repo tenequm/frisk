@@ -35,6 +35,7 @@
       "gh workflow view *", "gh workflow list *", "gh label list *", "gh cache list *",
       "gh ruleset view *", "gh ruleset list *", "gh auth status *",
       "gh gist view *", "gh gist list *", "gh search *",
+      "gh api *",
       "go env *", "go version", "go vet *",
       "kubectl get *", "kubectl describe *", "kubectl logs *", "kubectl top *",
       "kubectl version *", "kubectl config current-context",

@@ -58,6 +58,12 @@ A screen never decides anything: it only stops a rule such as `sed *` from
 matching `sed -i`, a form the rule does not mean, and that command passes
 through too.
 
+A `gh api *` rule is kept to GET requests. gh sends a POST as soon as a field
+(`-f`, `-F`, `--field`, `--raw-field`) or `--input` is given, so those, a
+method other than `GET`, and the `graphql` endpoint pass through. gh runs a
+`--jq` filter with the environment loaded, so on any gh command it is screened
+like a jq program.
+
 In the four `judge` lists `"$defaults"` splices the built-in prose,
 autoMode-style. The `permissions` lists have no built-in entries, so there the
 marker stands for nothing; it is accepted so that a config written for the
