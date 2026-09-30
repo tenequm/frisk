@@ -3177,7 +3177,7 @@ func TestCredentialShapedSkipsPaths(t *testing.T) {
 	}{
 		{"long path with high entropy", "cd /home/dev/pj/worktrees/.treehouse/projBX-38f3f2/1/projBX/internal/adapter/Xq7Zp/Kw9v\n", false},
 		{"high-entropy base64 run", "echo " + fakeSecret(alnumChars, 48) + "\n", true},
-		{"base64 with a slash", "echo " + fakeSecret(alnumChars, 24) + "/" + fakeSecret(alnumChars, 24) + "+Q=\n", true},
+		{"base64 with a slash", "echo " + fakeSecret(alnumChars, 23) + "/" + fakeSecret(alnumChars, 27) + "+Q=\n", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
