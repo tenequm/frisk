@@ -60,6 +60,10 @@ notarize:
 # --release-notes, so GoReleaser generates no changelog of its own.
 release:
   target_commitish: "{{ .Commit }}"
+  # A run that dies mid-upload leaves its draft behind. The retry takes that
+  # draft over and replaces what it holds, instead of adding a second one.
+  use_existing_draft: true
+  replace_existing_artifacts: true
 
 # A pre-compiled binary is a cask in modern Homebrew (the `brews` formula section
 # is deprecated). GH_RELEASE_TOKEN can push to the separate tap repo.
