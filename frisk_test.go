@@ -3214,6 +3214,8 @@ func TestGitRuleNormalization(t *testing.T) {
 		// A missing value leaves the old positional reading; git refuses the command itself.
 		{"git commit -m *", "git commit -m", true, true},
 		{"git status *", "git status -sb", true, true},
+		{"git status *", "git -C /x status -sb", true, true},
+		{"git status *", "git -c core.fsmonitor=/x status -sb", true, false},
 		{"git push *", "git push -xf origin main", true, false},
 		{"git commit -m *", "git commit -Snm x", true, false},
 		{"git commit -F *", "git commit --file f -q", true, true},
