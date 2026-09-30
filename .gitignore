@@ -4,4 +4,5 @@ coverage.out
 /dist/
 .claude/skills/
 .agents/skills/
+.agents/compact-handoff/
 /ops/classifier-data/classifier.duckdb
