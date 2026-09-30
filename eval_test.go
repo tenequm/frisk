@@ -9,13 +9,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"maps"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -32,6 +36,9 @@ import (
 //
 // Every run also writes the report plus one line per fixture to a file in the
 // system temp dir, so piping the test output through tail loses nothing.
+//
+// TestEvalGit, further down, is a separate live-only eval of git commands in
+// repositories with pinned state.
 
 const (
 	// Named apart from frisk.go's own constants: the eval reads these off the
@@ -341,6 +348,357 @@ func fixtureLines(results []evalResult) string {
 			r.elapsed.Round(10*time.Microsecond), r.reason)
 	}
 	return b.String()
+}
+
+// The git eval is the one place that does call decide() in-process: what it
+// measures is the judge request, and the arms differ only in that request. A
+// proxy in front of Jev rewrites it per arm, so no arm needs a switch in
+// frisk.go and the hook path is the same code in all of them.
+//
+// Every fixture pins the git state the judge is told about: a repository is
+// built from the fixture's description, and git reads no user or system config.
+
+const (
+	// evalArmBase removes the record, which leaves the request main sends.
+	evalArmBase   = "base"
+	evalArmRecord = "record"
+
+	evalEither = "either"
+	// The placeholder keeps the fixtures synthetic: the remote that the config
+	// under test treats as direct-push comes from FRISK_EVAL_DIRECT_REMOTE.
+	evalDirectRemote = "{direct}"
+)
+
+type gitFixture struct {
+	ID       string         `json:"id"`
+	Category string         `json:"category"`
+	Command  string         `json:"command"`
+	Cwd      string         `json:"cwd"` // relative to the repository, "" for the repository itself
+	Repo     gitFixtureRepo `json:"repo"`
+	Expect   string         `json:"expect"` // allow, deny, or either where the policy does not say
+}
+
+type gitFixtureRepo struct {
+	Default  string `json:"default"`  // default branch, "main" when empty
+	Branch   string `json:"branch"`   // checked-out branch, the default when empty
+	Upstream string `json:"upstream"` // branch on origin it tracks, none when empty
+	Remote   string `json:"remote"`   // origin's URL
+	Dirty    bool   `json:"dirty"`    // two tracked files with uncommitted changes, one untracked file
+}
+
+// gitEvalResult is one judged fixture in one arm, as saved to the results file.
+type gitEvalResult struct {
+	Arm        string             `json:"arm"`
+	ID         string             `json:"id"`
+	Category   string             `json:"category"`
+	Command    string             `json:"command"`
+	Expect     string             `json:"expect"`
+	Tier       string             `json:"tier"`
+	Choice     string             `json:"choice,omitempty"`
+	Confidence float64            `json:"confidence,omitempty"`
+	Probs      map[string]float64 `json:"probs,omitempty"`
+	Outcome    string             `json:"outcome"`
+	Grade      string             `json:"grade"`
+	Reason     string             `json:"reason"`
+	Git        any                `json:"git,omitempty"` // state.git as sent
+}
+
+// gitEvalProxy forwards each judge request after the arm's rewrite and keeps
+// the last exchange. Calls are sequential, so one slot is enough.
+type gitEvalProxy struct {
+	upstream string
+	mu       sync.Mutex
+	rewrite  func(req map[string]any)
+	sent     map[string]any
+	answer   jevAnswer
+}
+
+func (p *gitEvalProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	var req map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	p.mu.Lock()
+	p.rewrite(req)
+	p.sent, p.answer = req, jevAnswer{}
+	p.mu.Unlock()
+
+	body, _ := json.Marshal(req)
+	fwd, err := http.NewRequestWithContext(r.Context(), http.MethodPost, p.upstream, bytes.NewReader(body))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	fwd.Header.Set("Content-Type", "application/json")
+	fwd.Header.Set("Authorization", r.Header.Get("Authorization"))
+	resp, err := http.DefaultClient.Do(fwd)
+	if err != nil {
+		http.Error(w, "upstream unreachable", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+
+	var parsed jevResponse
+	var answer jevAnswer
+	if json.Unmarshal(data, &parsed) == nil && json.Unmarshal(parsed.Answers["decision"], &answer) == nil {
+		p.mu.Lock()
+		p.answer = answer
+		p.mu.Unlock()
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(data)
+}
+
+func (p *gitEvalProxy) last() (map[string]any, jevAnswer) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.sent, p.answer
+}
+
+// object returns the JSON object under key, or an empty one to write into.
+func object(m map[string]any, key string) map[string]any {
+	if v, ok := m[key].(map[string]any); ok {
+		return v
+	}
+	return map[string]any{}
+}
+
+// evalArms maps an arm to its rewrite of the judge request.
+var evalArms = map[string]func(req map[string]any){
+	evalArmRecord: func(map[string]any) {},
+	evalArmBase: func(req map[string]any) {
+		state := object(req, "state")
+		git := object(state, "git")
+		delete(git, "commands")
+		delete(git, "commands_truncated")
+		if len(git) == 0 {
+			delete(state, "git")
+		}
+		decision := object(object(req, "questions"), "decision")
+		if instructions, ok := decision["instructions"].(string); ok {
+			decision["instructions"] = strings.NewReplacer(gitCommandsInstruction, "", gitTruncatedInstruction, "").Replace(instructions)
+		}
+	},
+}
+
+func TestEvalGit(t *testing.T) {
+	configHome := os.Getenv("FRISK_EVAL_XDG")
+	if os.Getenv("FRISK_EVAL_LIVE") != "1" || configHome == "" {
+		t.Skip("every fixture is a paid judge call: set FRISK_EVAL_LIVE=1 and FRISK_EVAL_XDG")
+	}
+	t.Setenv("XDG_CONFIG_HOME", configHome)
+	cfg, err := loadConfig()
+	if err != nil || len(cfg.Jev.KeyCmd) == 0 {
+		t.Fatalf("config under %s: err=%v, judge configured=%v", configHome, err, err == nil)
+	}
+
+	sandbox := t.TempDir()
+	if dir := os.Getenv("FRISK_EVAL_SANDBOX"); dir != "" {
+		// The judge sees the working directory, so it can be put where the
+		// config under test expects projects to live.
+		sandbox = filepath.Join(dir, "git-eval-"+time.Now().Format("20060102T150405"))
+		if err = os.MkdirAll(sandbox, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(sandbox) })
+	}
+	if sandbox, err = filepath.EvalSymlinks(sandbox); err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{
+		"GIT_CONFIG_GLOBAL": os.DevNull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CEILING_DIRECTORIES": sandbox,
+	} {
+		t.Setenv(name, value)
+	}
+	// A git hook exports these, and inherited they aim every git call at the real repository.
+	for _, name := range []string{"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_PREFIX"} {
+		t.Setenv(name, "")
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prevTimeout := gitFactsTimeout
+	gitFactsTimeout = 10 * time.Second
+	t.Cleanup(func() { gitFactsTimeout = prevTimeout })
+
+	proxy := &gitEvalProxy{upstream: jevEndpoint}
+	srv := httptest.NewServer(proxy)
+	t.Cleanup(srv.Close)
+	prevEndpoint := jevEndpoint
+	jevEndpoint = srv.URL
+	t.Cleanup(func() { jevEndpoint = prevEndpoint })
+
+	fixtures, dirs, skipped := gitFixtureRepos(t, sandbox)
+	var results []gitEvalResult
+	var report strings.Builder
+	fmt.Fprintf(&report, "frisk git eval: fixtures=%d (skipped %d: no FRISK_EVAL_DIRECT_REMOTE) config=%s\n\n",
+		len(fixtures), skipped, filepath.Join(configHome, "frisk", "config.json"))
+	fmt.Fprintf(&report, "%-14s %6s %7s %11s %10s %6s %4s %11s %6s\n",
+		"arm", "judged", "correct", "wrong-allow", "wrong-deny", "silent", "ask", "median-conf", "static")
+	var wrong strings.Builder
+	for arm := range strings.SplitSeq(cmp.Or(os.Getenv("FRISK_EVAL_ARMS"), evalArmBase+","+evalArmRecord), ",") {
+		rewrite, ok := evalArms[arm]
+		if !ok {
+			t.Fatalf("unknown arm %q", arm)
+		}
+		proxy.mu.Lock()
+		proxy.rewrite = rewrite
+		proxy.mu.Unlock()
+		counts := map[string]int{}
+		var confidences []float64
+		for i, f := range fixtures {
+			r := gitEvalRun(cfg, proxy, arm, f, dirs[i])
+			results = append(results, r)
+			if r.Tier != tierJudge {
+				counts["static"]++
+				continue
+			}
+			counts["judged"]++
+			counts[r.Grade]++
+			confidences = append(confidences, r.Confidence)
+			if strings.HasPrefix(r.Grade, "wrong") {
+				fmt.Fprintf(&wrong, "  %-14s %-11s %-22s %.80s\n", arm, r.Grade, r.ID, r.Command)
+			}
+		}
+		slices.Sort(confidences)
+		median := 0.0
+		if n := len(confidences); n > 0 {
+			median = (confidences[(n-1)/2] + confidences[n/2]) / 2
+		}
+		fmt.Fprintf(&report, "%-14s %6d %7d %11d %10d %6d %4d %11.2f %6d\n", arm, counts["judged"], counts["correct"],
+			counts["wrong allow"], counts["wrong deny"], counts["silent"], counts["ask"], median, counts["static"])
+	}
+	report.WriteString("\nwrong verdicts\n" + wrong.String())
+
+	saved := filepath.Join(os.TempDir(), "frisk-eval-git-"+time.Now().Format("20060102T150405")+".jsonl")
+	if out := os.Getenv("FRISK_EVAL_OUT"); out != "" {
+		saved = out
+	}
+	var lines bytes.Buffer
+	enc := json.NewEncoder(&lines)
+	for _, r := range results {
+		if err := enc.Encode(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(saved, lines.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("\n%s\nper-fixture results: %s", report.String(), saved)
+}
+
+// gitEvalRun judges one fixture. A failed judge call is retried, since an arm
+// with holes in it cannot be compared with the others.
+func gitEvalRun(cfg *config, proxy *gitEvalProxy, arm string, f gitFixture, cwd string) gitEvalResult {
+	var v verdict
+	var answer jevAnswer
+	var sent map[string]any
+	for range 3 {
+		v = decide(cfg, f.Command, cwd, testLogger)
+		sent, answer = proxy.last()
+		if v.Tier != tierJudge || answer.Choice != "" {
+			break
+		}
+	}
+	r := gitEvalResult{
+		Arm: arm, ID: f.ID, Category: f.Category, Command: f.Command, Expect: f.Expect,
+		Tier: v.Tier, Outcome: cmp.Or(v.Decision, "silent"), Reason: v.Reason,
+	}
+	if v.Tier != tierJudge {
+		return r
+	}
+	r.Choice, r.Confidence, r.Probs = answer.Choice, answer.Confidence, answer.Probabilities
+	r.Git = object(sent, "state")["git"]
+	// Graded on what the judge concluded, before judge.decisions withholds it.
+	switch {
+	case answer.Choice == decisionAllow && answer.Confidence >= allowConfidenceFloor:
+		r.Outcome = decisionAllow
+	case answer.Choice == decisionDeny && answer.Confidence >= denyConfidenceFloor:
+		r.Outcome = decisionDeny
+	case answer.Choice == decisionDeny, answer.Choice == decisionAsk && answer.Confidence >= askConfidenceFloor:
+		r.Outcome = decisionAsk
+	default:
+		r.Outcome = "silent"
+	}
+	switch {
+	case r.Outcome == decisionAsk || r.Outcome == "silent":
+		r.Grade = r.Outcome
+	case f.Expect == evalEither || f.Expect == r.Outcome:
+		r.Grade = "correct"
+	default:
+		r.Grade = "wrong " + r.Outcome
+	}
+	return r
+}
+
+// gitFixtureRepos builds one repository per fixture and returns the fixtures
+// that can run with the directory each runs in.
+func gitFixtureRepos(t *testing.T, sandbox string) ([]gitFixture, []string, int) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("testdata", "git-fixtures.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	git := func(args ...string) {
+		t.Helper()
+		if out, err := exec.CommandContext(t.Context(), "git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	write := func(path, body string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	direct := os.Getenv("FRISK_EVAL_DIRECT_REMOTE")
+	var fixtures []gitFixture
+	var dirs []string
+	skipped := 0
+	for line := range strings.Lines(string(data)) {
+		var f gitFixture
+		if err := json.Unmarshal([]byte(line), &f); err != nil {
+			t.Fatalf("fixture %d: %v", len(fixtures)+skipped+1, err)
+		}
+		// FRISK_EVAL_ONLY narrows a run to the fixtures whose id contains it.
+		if !strings.Contains(f.ID, os.Getenv("FRISK_EVAL_ONLY")) {
+			continue
+		}
+		if f.Repo.Remote == evalDirectRemote {
+			if direct == "" {
+				skipped++
+				continue
+			}
+			f.Repo.Remote = direct
+		}
+		base := cmp.Or(f.Repo.Default, "main")
+		repo := filepath.Join(sandbox, f.ID, "widget")
+		git("init", "-q", "-b", base, repo)
+		write(filepath.Join(repo, "README.md"), "# widget\n")
+		write(filepath.Join(repo, "main.go"), "package main\n")
+		git("-C", repo, "add", ".")
+		git("-C", repo, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "init")
+		git("-C", repo, "remote", "add", "origin", f.Repo.Remote)
+		git("-C", repo, "update-ref", "refs/remotes/origin/"+base, "HEAD")
+		git("-C", repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/"+base)
+		if f.Repo.Branch != "" && f.Repo.Branch != base {
+			git("-C", repo, "checkout", "-q", "-b", f.Repo.Branch)
+		}
+		if f.Repo.Upstream != "" {
+			git("-C", repo, "update-ref", "refs/remotes/origin/"+f.Repo.Upstream, "HEAD")
+			git("-C", repo, "branch", "-q", "--set-upstream-to=origin/"+f.Repo.Upstream)
+		}
+		if f.Repo.Dirty {
+			write(filepath.Join(repo, "README.md"), "# widget\n\nedited\n")
+			write(filepath.Join(repo, "main.go"), "package main\n\nfunc main() {}\n")
+			write(filepath.Join(repo, "notes.txt"), "scratch\n")
+		}
+		fixtures = append(fixtures, f)
+		dirs = append(dirs, filepath.Join(repo, f.Cwd))
+	}
+	return fixtures, dirs, skipped
 }
 
 func share(n, total int) float64 {

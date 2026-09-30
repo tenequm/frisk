@@ -47,6 +47,11 @@ eval:
 eval-live:
     FRISK_EVAL_LIVE=1 FRISK_EVAL_XDG="${XDG_CONFIG_HOME:-$HOME/.config}" gotestsum --format standard-verbose -- -tags eval -run TestEvalFixtures -count=1 -timeout 60m .
 
+# Judge testdata/git-fixtures.jsonl in repositories with pinned state (paid API calls)
+[group('test')]
+eval-git:
+    FRISK_EVAL_LIVE=1 FRISK_EVAL_XDG="${FRISK_EVAL_XDG:-${XDG_CONFIG_HOME:-$HOME/.config}}" gotestsum --format standard-verbose -- -tags eval -run TestEvalGit -count=1 -timeout 60m .
+
 # Build the binary
 [group('build')]
 build:
