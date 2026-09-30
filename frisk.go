@@ -1487,6 +1487,13 @@ func allowedWrite(rules []string, dir, target string) bool {
 	if credentialPath.MatchString(target) || strings.HasPrefix(target, "/dev/tcp/") || strings.HasPrefix(target, "/dev/udp/") {
 		return false
 	}
+	// This gate's own config and the binary running it are never written
+	// through a rule, however broad: that would let a command rewrite the gate.
+	gate := filepath.Join(configDir(), "frisk")
+	if self, err := os.Executable(); err == nil && target == filepath.Clean(self) ||
+		target == gate || strings.HasPrefix(target, gate+string(filepath.Separator)) {
+		return false
+	}
 	for part := range strings.SplitSeq(target, string(filepath.Separator)) {
 		part = strings.ToLower(part)
 		if part == ".claude" || part == ".git" || part == ".githooks" || part == ".husky" || strings.HasPrefix(part, ".env") {

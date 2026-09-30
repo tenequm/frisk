@@ -3418,6 +3418,14 @@ func TestStaticLoopsAndWrites(t *testing.T) {
 			t.Fatal("allowed protected target with", rule)
 		}
 	}
+	gate := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", gate)
+	broad := &config{Permissions: permissionsConfig{Allow: append(slices.Clone(cfg.Permissions.Allow), "Edit("+gate+"/**)")}}
+	for _, command := range []string{"echo {} > " + gate + "/frisk/config.json", "echo x | tee -a " + gate + "/frisk/config.json"} {
+		if got := decide(broad, command, t.TempDir(), nil); got.Decision == decisionAllow {
+			t.Fatal("allowed a write to the gate's own config:", command)
+		}
+	}
 	dir := t.TempDir()
 	target := filepath.Join(dir, "link")
 	if err := os.Symlink(t.TempDir(), target); err != nil {
