@@ -20,6 +20,38 @@ import (
 
 var testLogger = slog.New(slog.NewJSONHandler(io.Discard, nil))
 
+// exampleAllow is the permissions.allow list config.example.json ships. Core
+// has no allow rules, so tests take theirs from the file users copy.
+func exampleAllow(t *testing.T) []string {
+	t.Helper()
+	return configFileAllow(t, "config.example.json")
+}
+
+func configFileAllow(t *testing.T, path string) []string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg config
+	if err := json.Unmarshal(data, &cfg); err != nil || len(cfg.Permissions.Allow) == 0 {
+		t.Fatalf("%s: no permissions.allow (%v)", path, err)
+	}
+	return cfg.Permissions.Allow
+}
+
+// The eval replays fixtures under testdata/eval-config.json, so its numbers
+// describe the example list only while it carries every rule of it.
+func TestEvalConfigCarriesExampleAllow(t *testing.T) {
+	t.Parallel()
+	eval := configFileAllow(t, filepath.Join("testdata", "eval-config.json"))
+	for _, rule := range exampleAllow(t) {
+		if !slices.Contains(eval, rule) {
+			t.Errorf("testdata/eval-config.json lacks %q", rule)
+		}
+	}
+}
+
 func TestParseCommand(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -76,14 +108,51 @@ func TestParseCommand(t *testing.T) {
 		{"unsafe redirect null then file", "ls 2>/dev/null >f", nil, true},
 		{"heredoc with null redirect", "cat <<EOF >/dev/null\nhi\nEOF", nil, true},
 		{"heredoc body stays in the static view", "cat <<-'EOF' | wc -l\nit's here\n\tEOF\nls", [][]string{{"cat"}, {"wc", "-l"}, {"its here\n"}, {"ls"}}, true},
-		{"quoted redirect stays unsound", `awk '{print > "/dev/null"}'`, nil, true},
-		{"double quoted redirect stays unsound", `echo "a>/dev/null"`, nil, true},
-		{"escaped redirect stays unsound", `echo a\>/dev/null`, nil, true},
+		{"quoted redirect is text", `awk '{print > "/dev/null"}'`, [][]string{{"awk", `{print > "/dev/null"}`}}, false},
+		{"double quoted redirect is text", `echo "a>/dev/null"`, [][]string{{"echo", "a>/dev/null"}}, false},
+		{"escaped redirect is text", `echo a\>/dev/null`, [][]string{{"echo", "a>/dev/null"}}, false},
+		{"quoted heredoc operator is text", "rg '<<EOF' f", [][]string{{"rg", "<<EOF", "f"}}, false},
+		{"single-quoted substitution is text", "rg '$(foo)' f", [][]string{{"rg", "$(foo)", "f"}}, false},
+		{"single-quoted backtick is text", "rg '`id`' f", [][]string{{"rg", "`id`", "f"}}, false},
+		{"escaped backtick is text", "echo \\`id\\`", [][]string{{"echo", "`id`"}}, false},
+		{"escaped substitution in double quotes is text", `echo "\$(id)"`, [][]string{{"echo", "$(id)"}}, false},
+		{"escaped backtick in double quotes is text", "echo \"\\`id\\`\"", [][]string{{"echo", "`id`"}}, false},
+		{"double-quoted substitution is complex", `echo "$(id)"`, nil, true},
+		{"double-quoted backtick is complex", "echo \"`id`\"", nil, true},
+		{"substitution after a quoted one is complex", "rg '$(foo)' $(id)", nil, true},
+		{"assignment statement is plain", "X=1; ls", [][]string{{}, {"ls"}}, false},
+		{"hijacking assignment statement is complex", "PATH=/tmp/x; ls", [][]string{{}, {"ls"}}, true},
+		{"secret-named assignment statement is complex", "GH_TOKEN=abc; ls", [][]string{{}, {"ls"}}, true},
+		{"credential path in an assignment is complex", "F=~/.ssh/id_rsa; ls", [][]string{{}, {"ls"}}, true},
+		{"substitution in an assignment is complex", "X=$(id); ls", nil, true},
+		{"redirect with no command is complex", "ls; 2>/dev/null", [][]string{{"ls"}}, true},
+		{"background with no command is complex", "ls; &", [][]string{{"ls"}}, true},
+		{"heredoc operator with no body is complex", "cat <<EOF", nil, true},
 		{"quoted fd stays unsound", `ls "2">/dev/null`, nil, true},
 		{"background after null redirect", "sleep 5 >/dev/null &", [][]string{{"sleep", "5"}}, true},
 		{"unclosed quote is complex", `echo "oops`, [][]string{{"echo", "oops"}}, true},
 		{"hijacking assignment is complex", "GIT_PAGER=x git log", [][]string{{"git", "log"}}, true},
-		{"variables are never substituted here", "S=/x; cat $S/f", [][]string{{}, {"cat", "$S/f"}}, false},
+		{"literal variable is substituted", "S=/x; cat $S/f", [][]string{{}, {"cat", "/x/f"}}, false},
+		{"substituted flag is what the screens see", `A=-x; fd . "$A" rm`, [][]string{{}, {"fd", ".", "-x", "rm"}}, false},
+		{"substituted glob is screened", `S=~/.s; cat "$S"*/config`, nil, true},
+		{"unresolved variable is complex", "cat $F", [][]string{{"cat", "$F"}}, true},
+		{"quoted unresolved variable is complex", `cat "$F"`, [][]string{{"cat", "$F"}}, true},
+		{"braced unresolved variable is complex", "cat ${F}", [][]string{{"cat", "${F}"}}, true},
+		{"variable assigned twice is complex", "S=/x; S=/y; cat $S", nil, true},
+		{"variable used before its assignment is complex", "cat $S; S=/x", nil, true},
+		{"variable in an assignment prefix is complex", "A=$B ls", [][]string{{"ls"}}, true},
+		{"path variable is complex", `ls "$HOME/x"`, [][]string{{"ls", "$HOME/x"}}, true},
+		{"positional parameter is complex", "echo $1", [][]string{{"echo", "$1"}}, true},
+		{"all parameters are complex", `echo "$@"`, [][]string{{"echo", "$@"}}, true},
+		{"zsh split flag is complex", "fd $=ARGS", [][]string{{"fd", "$=ARGS"}}, true},
+		{"zsh glob flag is complex", "fd $~ARGS", [][]string{{"fd", "$~ARGS"}}, true},
+		{"old arithmetic is complex", "echo $[1+2]", nil, true},
+		{"numeric parameters are plain", `echo "rc=$?" $$ $# $!`, [][]string{{"echo", "rc=$?", "$$", "$#", "$!"}}, false},
+		{"dollar ending a pattern is literal", `rg "foo$" f`, [][]string{{"rg", "foo$", "f"}}, false},
+		{"dollar before an alternation is literal", `rg "^a$|^b$" f`, [][]string{{"rg", "^a$|^b$", "f"}}, false},
+		{"single-quoted dollar is literal", "rg 'a$b' f", [][]string{{"rg", "a$b", "f"}}, false},
+		{"escaped dollar is literal", `echo \$HOME "\$HOME"`, [][]string{{"echo", "$HOME", "$HOME"}}, false},
+		{"escaped backslash leaves the dollar live", `echo "\\$HOME"`, [][]string{{"echo", `\$HOME`}}, true},
 		{"credential glob is complex", "cat ~/.s*/id_*", [][]string{{"cat", "~/.s*/id_*"}}, true},
 		{"quoted glob is not expanded", "jq '.items[]' f.json", [][]string{{"jq", ".items[]", "f.json"}}, false},
 		{"comment with a single quote", "echo hi # it's\nrm -rf /tmp/x # '", [][]string{{"echo", "hi"}, {"rm", "-rf", "/tmp/x"}}, true},
@@ -99,9 +168,29 @@ func TestParseCommand(t *testing.T) {
 		{"escaped hash is not a comment", `echo \#x`, [][]string{{"echo", "#x"}}, false},
 		{"hash inside a word is not a comment", "echo a#b", [][]string{{"echo", "a#b"}}, false},
 		{"hash after a dollar is not a comment", "echo $#", [][]string{{"echo", "$#"}}, false},
-		{"hash in a parameter length is not a comment", "echo ${#x}", [][]string{{"echo", "${#x}"}}, false},
+		{"hash in a parameter length is not a comment", "echo ${#x}", [][]string{{"echo", "${#x}"}}, true},
 		{"hash in an assignment value is not a comment", "a=b#c true", [][]string{{"true"}}, false},
 		{"hash after an empty quoted string is not a comment", "echo ''#x", [][]string{{"echo", "#x"}}, false},
+		{"brace expansion into flags is complex", "find . {-delete,-print}", nil, true},
+		{"brace expansion after a dash is complex", "find . -{delete,print}", nil, true},
+		{"brace expansion onto a dotfile is complex", "cat {a,.env}", nil, true},
+		{"nested brace expansion is complex", "cat {a,{b,.env}}", nil, true},
+		{"brace sequence is complex", "cat f{1..3}", nil, true},
+		{"quoted braces are text", "find . -name '*.{go,md}'", [][]string{{"find", ".", "-name", "*.{go,md}"}}, false},
+		{"braces without a list are text", "git stash show stash@{0}", [][]string{{"git", "stash", "show", "stash@{0}"}}, false},
+		{"glob qualifier is complex", "ls *(e:'id':)", nil, true},
+		{"subshell is complex", "(cd x && ls)", nil, true},
+		{"escaped parentheses are text", `find . \( -name a -o -name b \)`, [][]string{{"find", ".", "(", "-name", "a", "-o", "-name", "b", ")"}}, false},
+		{"escaped quote stays inside the string", `echo "a\"b\"c" ; rm -rf ~/x ; echo \"`, [][]string{{"echo", `a"b"c`}, {"rm", "-rf", "~/x"}, {"echo", `"`}}, false},
+		{"escaped backslash ends no string early", `echo "a\\" ; ls`, [][]string{{"echo", `a\`}, {"ls"}}, false},
+		{"other backslashes stay in a double-quoted string", `grep "a\.b\n" f`, [][]string{{"grep", `a\.b\n`, "f"}}, false},
+		{"line continuation joins the lines", "fd . \\\n-x rm", [][]string{{"fd", ".", "-x", "rm"}}, false},
+		{"line continuation inside a word", "cat a\\\nb", [][]string{{"cat", "ab"}}, false},
+		{"line continuation inside double quotes", "echo \"a\\\nb\"", [][]string{{"echo", "ab"}}, false},
+		{"single quotes keep a backslash and newline", "echo 'a\\\nb'", [][]string{{"echo", "a\\\nb"}}, false},
+		{"ansi-c quoting is complex", "fd . $'-x' rm", nil, true},
+		{"locale quoting is complex", `fd . $"-x" rm`, nil, true},
+		{"escaped dollar before a quote is plain quoting", `echo \$'x'`, [][]string{{"echo", "$x"}}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -370,7 +459,7 @@ func TestLogVerdictRedacts(t *testing.T) {
 // The decision is made on the raw command; redaction only changes what is
 // written down afterwards.
 func TestRedactionLeavesDecisionsAlone(t *testing.T) {
-	const cfg = `{"permissions": {"deny": ["psql *"], "ask": ["deploy *"]}}`
+	const cfg = `{"permissions": {"allow": ["rg *"], "deny": ["psql *"], "ask": ["deploy *"]}}`
 	newHookEnv(t, cfg)
 	token := "gh" + "p_" + fakeSecret(alnumChars, 36)
 	tests := []struct {
@@ -703,13 +792,31 @@ func validateOutput(t *testing.T, cfg string, args ...string) (string, int) {
 
 func TestValidateMissingConfig(t *testing.T) {
 	out, code := validateOutput(t, "")
-	if code != 0 || !strings.Contains(out, "does not exist: defaults apply and the judge is off") {
+	if code != 0 || !strings.Contains(out, "does not exist: nothing is allowed statically and the judge is off") {
 		t.Fatalf("code = %d, out = %s", code, out)
 	}
 }
 
+// An allow list written for the builtins frisk once had still loads; validate
+// says the marker no longer brings any rules.
+func TestValidateDefaultsInAllowWarns(t *testing.T) {
+	out, code := validateOutput(t, `{"permissions":{"allow":["$defaults","just check"]}}`)
+	want := `warning: permissions.allow[0]: "$defaults" adds nothing: frisk has no default allow list`
+	if code != 0 || strings.Contains(out, "error:") || !strings.Contains(out, want) || !strings.Contains(out, "config.example.json") {
+		t.Fatalf("code = %d, out = %s", code, out)
+	}
+	if strings.Contains(out, "permissions.allow has no rules") {
+		t.Fatalf("a list with a rule reported as empty: %s", out)
+	}
+
+	out, code = validateOutput(t, `{"permissions":{"allow":["$defaults"]}}`)
+	if code != 0 || !strings.Contains(out, want) || !strings.Contains(out, "info: permissions.allow has no rules: nothing is allowed statically") {
+		t.Fatalf("marker only: code = %d, out = %s", code, out)
+	}
+}
+
 func TestValidateValidConfig(t *testing.T) {
-	cfg := `{"permissions":{"deny":["rm -rf *","Edit(~/.ssh/**)"],"allow":["$defaults","just check"]}}`
+	cfg := `{"permissions":{"deny":["rm -rf *","Edit(~/.ssh/**)"],"allow":["ls *","just check"]}}`
 	out, code := validateOutput(t, cfg)
 	if code != 0 || strings.Contains(out, "error:") || strings.Contains(out, "warning:") {
 		t.Fatalf("code = %d, out = %s", code, out)
@@ -841,7 +948,7 @@ func TestDecideStaticTiers(t *testing.T) {
 	t.Parallel()
 	cfg := &config{
 		Permissions: permissionsConfig{
-			Allow: []string{defaultsMarker, "just check"},
+			Allow: exampleAllow(t),
 			Deny:  []string{"gopass show -o *"},
 			Ask:   []string{"ssh prod *"},
 		},
@@ -874,6 +981,25 @@ func TestDecideStaticTiers(t *testing.T) {
 		{"double quote in a comment hides no command", "echo hi # say \"\nrm -rf /tmp/x # \"", "", "no-judge"},
 		{"deny still sees past a comment with a quote", "echo hi # it's\ngopass show -o k # '", decisionDeny, "deny-rule"},
 		{"ask still sees past a comment with a quote", "echo hi # say \"\nssh prod uptime # \"", decisionAsk, "ask-rule"},
+		{"escaped quote hides no command", `echo "a\"b\"c" ; rm -rf ~/x ; echo \"`, "", "no-judge"},
+		{"deny still sees past an escaped quote", `echo "a\"b\"c" ; gopass show -o k ; echo \"`, decisionDeny, "deny-rule"},
+		{"escaped quotes stay static", `echo "a\"b\"c" ; ls ; echo \"`, decisionAllow, "static"},
+		{"ansi-c escaped quote hides no command", `echo $'a\'' ; rm -rf ~/x ; echo \'`, "", "no-judge"},
+		{"deny still sees past an ansi-c escaped quote", `echo $'a\'' ; gopass show -o k ; echo \'`, decisionDeny, "deny-rule"},
+		{"ansi-c quoting hides no flag", "fd . $'-x' rm", "", "no-judge"},
+		{"locale quoting hides no flag", `fd . $"-x" rm`, "", "no-judge"},
+		{"line continuation hides no flag", "fd . \\\n-x rm", "", "no-judge"},
+		{"line continuation hides no credential path", "cat \\\n.netrc", "", "no-judge"},
+		{"continued command stays static", "ls \\\n  -la", decisionAllow, "static"},
+		{"brace expansion hides no flag", "find . {-delete,-print}", "", "no-judge"},
+		{"brace expansion after a dash hides no flag", "find . -{delete,print}", "", "no-judge"},
+		{"brace expansion hides no exec", "fd . {-x,rm}", "", "no-judge"},
+		{"brace expansion hides no dotenv", "cat {README.md,.env}", "", "no-judge"},
+		{"brace list never static", "cat src/{a,b}.go", "", "no-judge"},
+		{"glob qualifier never static", "ls *(e:'id':)", "", "no-judge"},
+		{"glob qualifier without code never static", "ls *(om[1])", "", "no-judge"},
+		{"stash ref braces stay static", "git stash show stash@{0}", decisionAllow, "static"},
+		{"escaped parentheses stay static", `find . \( -name a -o -name b \)`, decisionAllow, "static"},
 		{"quoted hash stays static", "echo '#not a comment'", decisionAllow, "static"},
 		{"hash inside a word stays static", "echo a#b", decisionAllow, "static"},
 		{"ask still sees a heredoc owner", "ssh prod bash <<EOF\nuptime\nEOF", decisionAsk, "ask-rule"},
@@ -936,7 +1062,17 @@ func TestDecideStaticTiers(t *testing.T) {
 		{"echo braced secret ref never static", "echo ${API_KEY}", "", "no-judge"},
 		{"gopass find never static", "gopass find foo", "", "no-judge"},
 		{"printenv name stays static", "printenv HOME", decisionAllow, "static"},
-		{"echo plain var stays static", "echo $HOME", decisionAllow, "static"},
+		{"echo plain var never static", "echo $HOME", "", "no-judge"},
+		{"variable as arguments never static", "fd $ARGS", "", "no-judge"},
+		{"variable as a path never static", "cat $F", "", "no-judge"},
+		{"quoted variable never static", `cat "$F"`, "", "no-judge"},
+		{"variable as a pattern never static", "rg $PAT .", "", "no-judge"},
+		{"zsh split flag never static", "fd $=ARGS", "", "no-judge"},
+		{"positional parameter never static", "cat $1", "", "no-judge"},
+		{"exit status stays static", `ls; echo "rc=$?"`, decisionAllow, "static"},
+		{"pattern ending in a dollar stays static", `rg "foo$" f.txt`, decisionAllow, "static"},
+		{"deny sees through a literal variable", "X=show; gopass $X -o k", decisionDeny, "deny-rule"},
+		{"ask sees through a literal variable", "H=prod; ssh $H uptime", decisionAsk, "ask-rule"},
 		{"gopass ls stays static", "gopass ls", decisionAllow, "static"},
 		{"awk print stays static", "awk '{print $1}' f.txt", decisionAllow, "static"},
 		{"awk field separator stays static", "awk -F: '{print $1}' /etc/passwd", decisionAllow, "static"},
@@ -944,12 +1080,100 @@ func TestDecideStaticTiers(t *testing.T) {
 		{"awk pipe never static", `awk '{print | "sh"}' f.txt`, "", "no-judge"},
 		{"awk program file never static", "awk -f prog.awk f.txt", "", "no-judge"},
 		{"awk environ never static", `awk 'BEGIN{print ENVIRON["HOME"]}'`, "", "no-judge"},
+		{"awk redirect never static", `awk '{print > "out.txt"}' f.txt`, "", "no-judge"},
+		{"awk append never static", `awk '{print >> "out.txt"}' f.txt`, "", "no-judge"},
+		{"awk printf redirect never static", `awk '{printf "%s\n", $1 > "/tmp/out"}' f.txt`, "", "no-judge"},
+		{"awk getline from a file never static", `awk 'BEGIN{while ((getline l < "/etc/hosts") > 0) print l}'`, "", "no-judge"},
+		{"awk comparison stays with the judge", "awk '$3 > 10' f.txt", "", "no-judge"},
+		{"gawk extension load never static", `awk '@load "filefuncs"; BEGIN{print 1}'`, "", "no-judge"},
+		{"gawk include never static", `awk '@include "lib.awk"; BEGIN{f()}'`, "", "no-judge"},
+		{"awk field expression stays static", "awk '{print $(NF-1)}' f.txt", decisionAllow, "static"},
+		{"quoted arrow stays static", `rg "=>" src`, decisionAllow, "static"},
+		{"quoted tag stays static", "rg '<div>' src", decisionAllow, "static"},
+		{"escaped angle bracket stays static", `rg a\>b src`, decisionAllow, "static"},
+		{"sed with angle brackets stays static", "sed 's/<b>//g' f.html", decisionAllow, "static"},
+		{"jq comparison stays static", "jq '.[] | select(.n > 3)' f.json", decisionAllow, "static"},
+		{"yq comparison stays static", "yq '.a > 1' f.yaml", decisionAllow, "static"},
+		{"quoted redirect-looking text stays static", `echo "a > b"`, decisionAllow, "static"},
+		{"single-quoted substitution stays static", `rg '\$\(' src`, decisionAllow, "static"},
+		{"single-quoted backtick stays static", "rg '`' README.md", decisionAllow, "static"},
+		{"double-quoted substitution never static", `echo "$(rm -rf x)"`, "", "no-judge"},
+		{"double-quoted backtick never static", "echo \"`rm -rf x`\"", "", "no-judge"},
+		{"sed w behind a quoted bracket never static", "sed -n 's/<a>/x/w out.txt' f", "", "no-judge"},
+		{"sed e with a quoted redirect never static", "sed '1e echo hi > /tmp/x' f", "", "no-judge"},
+		{"sed r stays static", "sed '1r notes.txt' f", decisionAllow, "static"},
+		{"sed r of a credential file never static", "sed '1r /home/me/.netrc' f", "", "no-judge"},
+		{"find exec with a quoted redirect never static", `find . -exec sh -c 'echo > x' \;`, "", "no-judge"},
+		{"jq env behind a comparison never static", "jq -n 'env | length > 0'", "", "no-judge"},
+		{"real redirect after a quoted one never static", `echo "a > b" > c`, "", "no-judge"},
+		{"assignment then read stays static", "S=/tmp/x; cat $S/f", decisionAllow, "static"},
+		{"assignment in a chain stays static", `D=src && ls "$D" | head`, decisionAllow, "static"},
+		{"two assignments stay static", "A=src B=docs; ls $A $B", decisionAllow, "static"},
+		{"assignment on its own line stays static", "F=README.md\nwc -l $F", decisionAllow, "static"},
+		{"assignment alone has no rule", "X=1", "", "no-judge"},
+		{"assignments alone have no rule", "X=1; Y=2", "", "no-judge"},
+		{"flag through a variable never static", "A=-x; fd . $A rm", "", "no-judge"},
+		{"long flag through a variable never static", "A=--pre=sh; rg $A foo", "", "no-judge"},
+		{"sed script through a variable never static", "S=w/tmp/out.txt; sed -n \"$S\" f", "", "no-judge"},
+		{"verb through a variable needs a rule", "V=rm; $V -rf x", "", "no-judge"},
+		{"credential path through a variable never static", "F=~/.ssh/id_rsa; cat $F", "", "no-judge"},
+		{"credential path assigned never static", "F=~/.netrc; ls", "", "no-judge"},
+		{"credential glob assigned never static", "F=~/.ssh/*; ls", "", "no-judge"},
+		{"secret-named assignment never static", "GH_TOKEN=abc; gh pr list", "", "no-judge"},
+		{"secret value copied never static", "X=$GH_TOKEN; ls", "", "no-judge"},
+		{"substitution in an assignment never static", "X=$(rm -rf x); ls", "", "no-judge"},
+		{"backtick in an assignment never static", "X=`rm -rf x`; ls", "", "no-judge"},
+		{"variable assigned twice never static", "S=/tmp/x; S=~/.ssh; ls $S", "", "no-judge"},
+		{"variable reassigned in a prefix never static", "S=/tmp/x; S=/y cat $S", "", "no-judge"},
+		{"PATH assignment never static", "PATH=/tmp/evil; ls", "", "no-judge"},
+		{"zsh path array never static", "path=/tmp/evil; ls", "", "no-judge"},
+		{"function path never static", "FPATH=/tmp/evil; ls", "", "no-judge"},
+		{"trace prompt never static", "PS4='$(id)'; ls", "", "no-judge"},
+		{"child shell options never static", "SHELLOPTS=xtrace ls", "", "no-judge"},
+		{"startup file never static", "ZDOTDIR=/tmp/evil ls", "", "no-judge"},
+		{"ENV never static", "ENV=/tmp/evil ls", "", "no-judge"},
+		{"zsh null command never static", "NULLCMD=/tmp/evil; ls", "", "no-judge"},
+		{"redirect with no command never static", "ls; >/dev/null", "", "no-judge"},
+		{"zsh argv0 never static", "ARGV0=rm ls x", "", "no-judge"},
+		{"home never static", "HOME=. git status", "", "no-judge"},
+		{"xdg config home never static", "XDG_CONFIG_HOME=/tmp/x git status", "", "no-judge"},
+		{"git dir never static", "GIT_DIR=/tmp/evil/.git git status", "", "no-judge"},
+		{"git trace never static", "GIT_TRACE=/tmp/out git status", "", "no-judge"},
+		{"less options never static", "LESS=-o/tmp/x less f", "", "no-judge"},
+		{"editor never static", "EDITOR=/tmp/evil ls", "", "no-judge"},
+		{"tool editor never static", "KUBE_EDITOR=/tmp/evil kubectl get pods", "", "no-judge"},
+		{"tool config never static", "AWS_CONFIG_FILE=/tmp/x ls", "", "no-judge"},
+		{"python startup never static", "PYTHONSTARTUP=/tmp/x ls", "", "no-judge"},
+		{"node options never static", "NODE_OPTIONS=--require=/tmp/x ls", "", "no-judge"},
+		{"perl options never static", "PERL5OPT=-Mevil ls", "", "no-judge"},
+		{"claude config dir never static", "CLAUDE_CONFIG_DIR=/tmp/x; ls", "", "no-judge"},
+		{"proxy never static", "HTTPS_PROXY=http://evil:8080 gh pr list", "", "no-judge"},
+		{"lowercase proxy never static", "https_proxy=http://evil:8080 gh pr list", "", "no-judge"},
+		{"trust root never static", "SSL_CERT_FILE=/tmp/ca.pem gh pr list", "", "no-judge"},
+		{"npm config never static", "npm_config_script_shell=/tmp/x ls", "", "no-judge"},
+		{"printf into a variable never static", "printf -v PATH %s /tmp/evil; ls", "", "no-judge"},
+		{"printf attached variable never static", "printf -vPATH %s /tmp/evil; ls", "", "no-judge"},
+		{"printf stays static", `printf '%s\n' hi`, decisionAllow, "static"},
+		{"node env stays static", "NODE_ENV=test ls", decisionAllow, "static"},
+		{"python unbuffered stays static", "PYTHONUNBUFFERED=1 ls", decisionAllow, "static"},
+		{"term stays static", "TERM=dumb ls", decisionAllow, "static"},
 		{"yq read stays static", "yq .a f.yaml", decisionAllow, "static"},
 		{"yq in-place never static", "yq -i .a=1 f.yaml", "", "no-judge"},
 		{"yq env never static", "yq '.a = strenv(X)' f.yaml", "", "no-judge"},
 		{"jq env field stays static", "jq .spec.env f.json", decisionAllow, "static"},
 		{"jq env dump never static", "jq -n env", "", "no-judge"},
 		{"jq ENV never static", "jq -n '$ENV.HOME'", "", "no-judge"},
+		{"jq program file never static", "jq -f prog.jq f.json", "", "no-judge"},
+		{"jq bundled program file never static", "jq -rf prog.jq f.json", "", "no-judge"},
+		{"jq long program file never static", "jq --from-file prog.jq f.json", "", "no-judge"},
+		{"jq attached program file never static", "jq --from-file=prog.jq f.json", "", "no-judge"},
+		{"jq module include never static", `jq 'include "./m"; f' f.json`, "", "no-judge"},
+		{"jq module import never static", `jq -L . 'import "m" as m; m::f' f.json`, "", "no-judge"},
+		{"jq raw output stays static", "jq -r .f f.json", decisionAllow, "static"},
+		{"jq long flags stay static", "jq --arg f x --raw-output '.[$f]' f.json", decisionAllow, "static"},
+		{"jq include field stays static", "jq .include f.json", decisionAllow, "static"},
+		{"yq program file never static", "yq --from-file prog.yq f.yaml", "", "no-judge"},
+		{"yq short program file never static", "yq -f prog.jq f.yaml", "", "no-judge"},
 		{"tree depth stays static", "tree -L 2", decisionAllow, "static"},
 		{"tree output file never static", "tree -o out.txt", "", "no-judge"},
 		{"od stays static", "od -c f.bin", decisionAllow, "static"},
@@ -985,11 +1209,55 @@ func TestDecideStaticTiers(t *testing.T) {
 		{"gh run watch stays static", "gh run watch 1", decisionAllow, "static"},
 		{"gh search stays static", "gh search repos frisk", decisionAllow, "static"},
 		{"gh pr merge never static", "gh pr merge 12", "", "no-judge"},
-		{"gh api never static", "gh api repos/x/y", "", "no-judge"},
+		{"gh api get stays static", "gh api repos/x/y", decisionAllow, "static"},
+		{"gh api placeholders stay static", "gh api repos/{owner}/{repo}/pulls --paginate --jq '.[].number'", decisionAllow, "static"},
+		{"gh api explicit get stays static", "gh api -X GET repos/x/y/issues", decisionAllow, "static"},
+		{"gh api attached get stays static", "gh api -XGET /user", decisionAllow, "static"},
+		{"gh api long get stays static", "gh api --method GET /user", decisionAllow, "static"},
+		{"gh api long attached get stays static", "gh api /user --method=GET -i", decisionAllow, "static"},
+		{"gh api header stays static", `gh api -H "Accept: application/vnd.github+json" /user`, decisionAllow, "static"},
+		{"gh api post never static", "gh api -X POST repos/x/y/issues", "", "no-judge"},
+		{"gh api attached delete never static", "gh api -XDELETE repos/x/y", "", "no-judge"},
+		{"gh api long patch never static", "gh api --method=PATCH repos/x/y", "", "no-judge"},
+		{"gh api long delete never static", "gh api repos/x/y --method DELETE", "", "no-judge"},
+		{"gh api bundled post never static", "gh api -iX POST repos/x/y/issues", "", "no-judge"},
+		{"gh api second method never static", "gh api -X GET -X DELETE repos/x/y", "", "no-judge"},
+		{"gh api dangling method never static", "gh api repos/x/y -X", "", "no-judge"},
+		{"gh api lowercase method never static", "gh api -X delete repos/x/y", "", "no-judge"},
+		{"gh api raw field never static", "gh api repos/x/y/issues -f title=x", "", "no-judge"},
+		{"gh api typed field never static", "gh api repos/x/y/issues -F n=1", "", "no-judge"},
+		{"gh api bundled field never static", "gh api -if title=x repos/x/y/issues", "", "no-judge"},
+		{"gh api long field never static", "gh api repos/x/y/issues --field title=x", "", "no-judge"},
+		{"gh api long raw field never static", "gh api repos/x/y/issues --raw-field=title=x", "", "no-judge"},
+		{"gh api input never static", "gh api repos/x/y/issues --input body.json", "", "no-judge"},
+		{"gh api field under explicit get never static", "gh api -X GET search/issues -f q=frisk", "", "no-judge"},
+		{"gh api graphql mutation never static", `gh api graphql -f query='mutation { addStar(input: {}) { clientMutationId } }'`, "", "no-judge"},
+		{"gh api bare graphql never static", "gh api graphql", "", "no-judge"},
+		{"gh api jq env never static", "gh api user --jq env", "", "no-judge"},
+		{"gh api jq ENV never static", "gh api user -q '$ENV.GH_TOKEN'", "", "no-judge"},
+		{"gh jq env never static", "gh pr list --json number --jq env", "", "no-judge"},
+		{"gh api credential file never static", "gh api /user -H @/home/me/.netrc", "", "no-judge"},
 		{"gh release create never static", "gh release create v1", "", "no-judge"},
 		{"gh auth token never static", "gh auth token", "", "no-judge"},
 		{"gh show-token never static", "gh auth status --show-token", "", "no-judge"},
 		{"gh browser env never static", "GH_BROWSER=evil gh pr view --web", "", "no-judge"},
+		{"ps stays static", "ps", decisionAllow, "static"},
+		{"ps aux stays static", "ps aux | head -5", decisionAllow, "static"},
+		{"ps all processes stays static", "ps -ef", decisionAllow, "static"},
+		{"ps every process stays static", "ps -e", decisionAllow, "static"},
+		{"ps format stays static", "ps -eo pid,ppid,etime,command", decisionAllow, "static"},
+		{"ps by pid stays static", "ps -p 123 -o etime", decisionAllow, "static"},
+		{"ps sorted stays static", "ps aux --sort=-rss", decisionAllow, "static"},
+		{"ps macos environment never static", "ps -E", "", "no-judge"},
+		{"ps bundled macos environment never static", "ps -axE", "", "no-judge"},
+		{"ps by pid with environment never static", "ps -p 123 -wwE", "", "no-judge"},
+		{"ps bsd environment never static", "ps eww", "", "no-judge"},
+		{"ps aux with environment never static", "ps auxe", "", "no-judge"},
+		{"ps environment after a flag never static", "ps -A e", "", "no-judge"},
+		{"ps environment after a pid never static", "ps -p 123 eww", "", "no-judge"},
+		{"ps environment after a format never static", "ps -o pid,args e", "", "no-judge"},
+		{"ps environ column never static", "ps -eo pid,environ", "", "no-judge"},
+		{"ps legacy mode never static", "COMMAND_MODE=legacy ps -e", "", "no-judge"},
 		{"sed w command never static", "sed -n 'w /tmp/copy.txt' README.md", "", "no-judge"},
 		{"sed addressed w command never static", "sed -n '/err/w out.txt' app.log", "", "no-judge"},
 		{"sed s w flag never static", "sed 's/a/b/w /tmp/out.txt' README.md", "", "no-judge"},
@@ -1020,6 +1288,30 @@ func TestDecideStaticTiers(t *testing.T) {
 		{"my.cnf never static", "cat ~/.my.cnf", "", "no-judge"},
 		{"cargo credentials never static", "cat ~/.cargo/credentials.toml", "", "no-judge"},
 		{"kube glob never static", "head ~/.kube/conf*", "", "no-judge"},
+		{"ssh dir glob never static", "cat ~/.ssh/*", "", "no-judge"},
+		{"aws dir glob never static", "cat ~/.aws/*", "", "no-judge"},
+		{"gopass store glob never static", "cat ~/.config/gopass/*", "", "no-judge"},
+		{"gopass store deep glob never static", "cat ~/.config/gopass/stores/*/age/*", "", "no-judge"},
+		{"gnupg dir glob never static", "ls ~/.gnupg/*", "", "no-judge"},
+		{"kube dir glob never static", "cat ~/.kube/*", "", "no-judge"},
+		{"docker dir glob never static", "cat ~/.docker/*", "", "no-judge"},
+		{"gh config glob never static", "cat ~/.config/gh/*", "", "no-judge"},
+		{"pem glob never static", "cat certs/*.pem", "", "no-judge"},
+		{"key glob never static", "cat certs/*.key", "", "no-judge"},
+		{"cargo dir glob never static", "cat ~/.cargo/*", "", "no-judge"},
+		{"cargo credentials glob never static", "cat ~/.cargo/cred*", "", "no-judge"},
+		{"cargo credentials question mark never static", "cat ~/.cargo/c?edentials.toml", "", "no-judge"},
+		{"cargo credentials bracket never static", "cat ~/.cargo/[c]redentials.toml", "", "no-judge"},
+		{"cargo credentials brace never static", "cat ~/.cargo/{registry,credentials.toml}", "", "no-judge"},
+		{"cargo as a brace alternative never static", "cat ~/{.cargo,x}/c*", "", "no-judge"},
+		{"cargo hidden-name glob never static", "cat ~/.carg*/registry/src/x", "", "no-judge"},
+		{"cargo glob behind dotdot never static", "cat ~/.cargo/registry/../cred*", "", "no-judge"},
+		{"cargo glob behind a deep dotdot never static", "cat ~/.cargo/registry/src/*/../../../c*", "", "no-judge"},
+		{"cargo recursive glob never static", "cat ~/.cargo/**/credentials.toml", "", "no-judge"},
+		{"cargo registry sources stay static", "ls ~/.cargo/registry/src/*", decisionAllow, "static"},
+		{"cargo crate glob stays static", "ls -d ~/.cargo/registry/src/*/serde-1.*", decisionAllow, "static"},
+		{"cargo crate file stays static", "cat ~/.cargo/registry/src/*/tokio-1.40.0/Cargo.toml", decisionAllow, "static"},
+		{"cargo bin glob stays static", "ls ~/.cargo/bin/*", decisionAllow, "static"},
 		{"cargo manifest stays static", "cat Cargo.toml", decisionAllow, "static"},
 		{"project config stays static", "cat config/app.json", decisionAllow, "static"},
 		{"date set never static", "date -s '2020-01-01'", "", "no-judge"},
@@ -1046,14 +1338,33 @@ func TestDecideStaticTiers(t *testing.T) {
 	}
 }
 
-func TestAllowListWithoutDefaultsReplacesBuiltins(t *testing.T) {
+// Core ships no allow rules: what settles statically is what the config lists.
+func TestOnlyConfigRulesAllow(t *testing.T) {
 	t.Parallel()
-	cfg := &config{Permissions: permissionsConfig{Allow: []string{"just check"}}}
+	commands := []string{"ls", "pwd", "true", "cat README.md", "git status", "echo hi", "cd /tmp", "just check"}
+	for name, cfg := range map[string]*config{
+		"no config":      {},
+		"empty list":     {Permissions: permissionsConfig{Allow: []string{}}},
+		"marker only":    {Permissions: permissionsConfig{Allow: []string{defaultsMarker}}},
+		"deny rule only": {Permissions: permissionsConfig{Deny: []string{"rm *"}}},
+	} {
+		for _, command := range commands {
+			if v := decide(cfg, command, t.TempDir(), testLogger); v.Decision != "" || v.Tier != "no-judge" {
+				t.Errorf("%s: decide(%q) = (%q, %q), want silence", name, command, v.Decision, v.Tier)
+			}
+		}
+	}
+
+	cfg := &config{Permissions: permissionsConfig{Allow: []string{defaultsMarker, "just check"}}}
 	if v := decide(cfg, "ls", t.TempDir(), testLogger); v.Decision != "" {
-		t.Fatalf("ls should not be statically allowed when builtins are replaced, got %q", v.Decision)
+		t.Fatalf("ls has no rule and the marker brings none, got %q", v.Decision)
 	}
 	if v := decide(cfg, "just check", t.TempDir(), testLogger); v.Decision != decisionAllow {
 		t.Fatalf("just check should be allowed, got %q", v.Decision)
+	}
+	// The marker is not a rule: a command spelled like it matches nothing.
+	if v := decide(cfg, `'$defaults'`, t.TempDir(), testLogger); v.Decision != "" {
+		t.Fatalf("the marker matched a command, got %q", v.Decision)
 	}
 }
 
@@ -1401,7 +1712,7 @@ func TestJudgeDecisions(t *testing.T) {
 // Rules from config are not the judge's decisions, so judge.decisions leaves
 // them alone; an invalid list silences the hook like any malformed config.
 func TestJudgeDecisionsLeaveRulesAlone(t *testing.T) {
-	newHookEnv(t, `{"permissions":{"ask":["ssh prod *"],"deny":["gopass show -o *"]},"judge":{"decisions":["allow"]}}`)
+	newHookEnv(t, `{"permissions":{"allow":["git status *"],"ask":["ssh prod *"],"deny":["gopass show -o *"]},"judge":{"decisions":["allow"]}}`)
 	for command, want := range map[string]string{
 		"ssh prod uptime": decisionAsk, "gopass show -o k": decisionDeny, "git status": decisionAllow,
 	} {
@@ -1910,8 +2221,7 @@ func TestJudgeState(t *testing.T) {
 }
 
 func TestRunHookEndToEnd(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	newHookEnv(t, `{"permissions":{"allow":["git status *","head *"]}}`)
 
 	input := `{"tool_name":"Bash","tool_input":{"command":"git status | head"},"cwd":"/tmp"}`
 	var out strings.Builder

@@ -24,10 +24,13 @@ parse into pipeline segments (|, &&, ||, ;, newline)
   |
 1. permissions.deny  match -> "deny"
 2. permissions.ask   match -> "ask"
-3. static allow: EVERY segment provably read-only
-   (builtin verb table + config allow; bails on
-    $(), backticks, heredocs, &, # comments, and redirects
-    other than 2>&1 and /dev/null) -> "allow"
+3. permissions.allow: EVERY segment matches a rule
+   and trips no screen (core ships no rules; bails on
+    $(), backticks, (), heredocs, &, # comments, brace
+    lists, variables the command does not set to a
+    literal, and redirects other than 2>&1 and
+    /dev/null; inside single quotes or escaped, all of
+    these are text) -> "allow"
 4. judge (needs jev.keyCmd): one Choice question
      allow + confidence >= 0.75 -> "allow"
      deny  + confidence >= 0.50 -> "deny" (below: "ask")
@@ -42,8 +45,31 @@ silence -> Claude Code native flow (rules -> classifier -> prompt)
 
 `$XDG_CONFIG_HOME/frisk/config.json` - see [config.example.json](config.example.json).
 Never read from the project directory, so a cloned repo cannot retarget the
-gate. Missing file = defaults with the judge off; malformed file = silent for
-the session (logged). `"$defaults"` splices the built-in entries, autoMode-style.
+gate. Missing file = no rules and the judge off, so every command passes
+through; malformed file = silent for the session (logged).
+
+Core understands commands and config decides about them. Core ships no allow
+list: the static tier allows only what `permissions.allow` lists, and with no
+rule a command passes through to the judge or to silence.
+[config.example.json](config.example.json) carries a read-only starting list.
+What core keeps is the parser and the screens - denied flags, risky arguments,
+program text, credential paths and globs, hijacking environment variables.
+A screen never decides anything: it only stops a rule such as `sed *` from
+matching `sed -i`, a form the rule does not mean, and that command passes
+through too.
+
+A `gh api *` rule is kept to GET requests. gh sends a POST as soon as a field
+(`-f`, `-F`, `--field`, `--raw-field`) or `--input` is given, so those, a
+method other than `GET`, and the `graphql` endpoint pass through. gh runs a
+`--jq` filter with the environment loaded, so on any gh command it is screened
+like a jq program. A `ps *` rule does not cover a call that prints the
+environment of other processes: `-E` on macOS, a BSD-style `e` as in `ps eww`
+on Linux, or an `environ` column.
+
+In the four `judge` lists `"$defaults"` splices the built-in prose,
+autoMode-style. The `permissions` lists have no built-in entries, so there the
+marker stands for nothing; it is accepted so that a config written for the
+default allow list frisk once had still loads.
 
 Rules use Claude Code's `Bash(...)` rule-content syntax, matched against
 parsed segments - so `cd x && git push` still matches `git push *`. Trailing
@@ -53,6 +79,26 @@ An unquoted `#` that starts a word is a comment: the rest of the line is
 dropped unread, so a quote inside it cannot hide the lines after it from the
 rules. A command with a comment is never allowed statically, because a shell
 that does not recognise comments would run that text.
+
+What defeats static reasoning is decided where the shell would act on it, and
+recorded on the statement it occurs in. A `<`, `>`, backtick or `$(` is a
+construct only where the shell reads it as one: `rg "=>" src` and
+`sed 's/<b>//g' f` are plain arguments, `echo "$(id)"` is not, because double
+quotes do not stop a substitution. A verb that takes program text reads those
+characters its own way, so its screen has to: awk's covers `>`, `>>`, `<` and
+`@load` besides `system`, pipes and `ENVIRON`; sed's script walker covers `w`
+and `e`; jq and yq have no file or command operators. Heredocs stay unsound
+whoever reads them.
+
+A statement that is only assignments (`S=/tmp/x; cat $S/f`) runs nothing and
+needs no rule, but some other statement must match one. It is refused when the
+value names a credential file or keeps an expansion, when the variable is
+secret-named, and when the name is one that makes the shell or a later command
+run or load something else: `PATH` and zsh's `path`, `HOME`, `BASH_ENV`,
+`ZDOTDIR`, `PS4`, `NULLCMD`, `ARGV0`, loader and interpreter variables, any
+`GIT_*`, anything shaped like `*_PAGER`, `*_EDITOR`, `*CONFIG*`, `*_OPTIONS` or
+`*FLAGS`, proxies and trust roots, `CLAUDE_*`. The same names are refused as a
+`NAME=value` prefix, and `printf -v` is screened as an assignment.
 
 `judge.decisions` lists which of `allow`, `ask`, `deny` the judge may issue;
 unset means all three. An empty list or any other value is a malformed config.
@@ -110,7 +156,15 @@ less certain, and any command with a subshell, substitution, heredoc, `eval`,
 `source`, `trap` or `alias`, stays `unresolvable`. Names the shell rewrites
 itself (`PWD`, `OLDPWD`, `RANDOM`, `BASH*`, `ZSH*`, ...) never resolve, nor
 does a bare `$NAME` followed by `:` or `[`, which zsh reads as a modifier or
-subscript. The static tier never sees the substitution.
+subscript.
+
+The static tier and the `permissions.deny` / `permissions.ask` rules read the
+same substitution, so every screen runs on the word the shell will see:
+`A=-x; fd . "$A" rm` is screened as `fd . -x rm`, and a deny rule for
+`gopass show *` matches `X=show; gopass $X k`. A word that keeps any expansion
+after that - `$NAME`, `${...}`, a positional parameter, zsh's `$=NAME` - is
+never allowed statically, because its value could be a flag, a credential path
+or several words. `$?`, `$$`, `$#` and `$!` are numbers and pass.
 
 `probe.status` tells the judge why a body is absent: `attached`, `missing`,
 `unresolvable`, `oversize`, `non-utf8`, `multiple-truncated`. A script whose
@@ -187,15 +241,16 @@ everything under it, otherwise `filepath.Match` on the cleaned absolute path.
 Builtin guardrail paths (frisk's own config dir, the frisk binary,
 `~/.claude/settings*.json`, `~/.claude/hooks`) ask, checked raw and
 symlink-resolved. Precedence: config deny > config ask > guardrail ask > config
-allow > silence; there are no builtin allows for file tools.
+allow > silence; as for Bash, the only allows are the config's.
 
 ## Validate
 
 A malformed config makes the hook stay silent for the whole session, so
 `frisk validate` loads it with the hook's own loader and prints `error:`,
 `warning:` and `info:` lines (exit 1 only on errors): parse failures, empty or
-bad-glob rules, empty `Edit()` patterns, bare `*` in deny/ask, whether each
-judge list is unset, extends (`$defaults`) or replaces the builtins, the
+bad-glob rules, empty `Edit()` patterns, bare `*` in deny/ask, `$defaults` in
+`permissions.allow` (a warning: it adds no rules), an allow list with no rules,
+whether each judge list is unset, extends (`$defaults`) or replaces the builtins, the
 effective `judge.decisions`, and whether `jev.keyCmd` runs - never printing any
 part of the key. No network unless `--live`, which makes one real judge call
 for `true`.

@@ -70,55 +70,17 @@ const (
 
 	verbAwk   = "awk"
 	verbEnv   = "env"
+	verbGH    = "gh"
 	verbGit   = "git"
+	verbPrint = "printf"
 	verbSed   = "sed"
 	verbUVRun = "uv run"
 )
 
-// defaultsMarker splices builtins into a config list; a list without it
-// replaces them, mirroring autoMode semantics.
+// defaultsMarker splices builtins into a judge list; a list without it
+// replaces them, mirroring autoMode semantics. The permissions lists have no
+// builtins, so there it stands for nothing.
 const defaultsMarker = "$defaults"
-
-var builtinAllow = []string{
-	"awk *", "basename *", "cat *", "cd *", "cloc *", "column *", "comm *", "cut *",
-	"date *", "df *", "diff *", "dig *", "dirname *", "du *", "dust *",
-	"echo *", "false", "fd *", "file *", "find *", "grep *", "head *",
-	"hostname", "id", "jq *", "less *", "ls *", "md5 *", "more *", "nl *", "od *",
-	"paste *", "printenv [A-Za-z_]*", "printf *", "pwd", "readlink *", "realpath *",
-	"rg *", "sed *", "shasum *", "sleep *", "sort *", "stat *", "strings *",
-	"sw_vers *", "tail *", "tee", "test *", "tokei *", "tr *", "tree *", "true",
-	"type *", "uname *", "uniq *", "uptime", "wc *", "which *", "whoami", "xxd *",
-	"yq *",
-	"git blame *", "git branch", "git branch --list *", "git diff *",
-	"git fetch *", "git log *", "git ls-files *", "git ls-tree *",
-	"git remote", "git remote -v", "git remote get-url *", "git remote show *",
-	"git rev-list *", "git rev-parse *", "git show *", "git show-ref *",
-	"git status *", "git stash list", "git stash show *", "git worktree list",
-	"git config --get *", "git config --get-all *", "git config --get-regexp *",
-	"git config --list", "git config -l", "git tag", "git tag -l *",
-	"git tag --list *", "git reflog", "git reflog show *", "git notes list *",
-	"git -C * blame *", "git -C * branch", "git -C * diff *", "git -C * log *",
-	"git -C * ls-files *", "git -C * ls-tree *", "git -C * remote",
-	"git -C * remote -v", "git -C * remote get-url *", "git -C * remote show *",
-	"git -C * rev-list *", "git -C * rev-parse *", "git -C * show *",
-	"git -C * show-ref *", "git -C * status *", "git -C * stash list",
-	"git -C * stash show *", "git -C * worktree list", "git -C * config --get *",
-	"git -C * config --get-all *", "git -C * config --get-regexp *",
-	"git -C * config --list", "git -C * config -l", "git -C * tag",
-	"git -C * tag -l *", "git -C * tag --list *", "git -C * reflog",
-	"git -C * reflog show *", "git -C * notes list *",
-	"gh pr view *", "gh pr list *", "gh pr diff *", "gh pr checks *", "gh pr status *",
-	"gh issue view *", "gh issue list *", "gh issue status *",
-	"gh run view *", "gh run list *", "gh run watch *",
-	"gh repo view *", "gh repo list *", "gh release view *", "gh release list *",
-	"gh workflow view *", "gh workflow list *", "gh label list *", "gh cache list *",
-	"gh ruleset view *", "gh ruleset list *", "gh auth status *",
-	"gh gist view *", "gh gist list *", "gh search *",
-	"go env *", "go version", "go vet *",
-	"kubectl get *", "kubectl describe *", "kubectl logs *", "kubectl top *",
-	"kubectl version *", "kubectl config current-context",
-	"gopass ls *", "gopass mounts",
-}
 
 // denyFlags turn an otherwise read-only verb into a writer or executor.
 var denyFlags = map[string][]string{
@@ -131,11 +93,15 @@ var denyFlags = map[string][]string{
 	"rg":    {"--pre", "--hostname-bin"},
 	"xxd":   {"-r"},
 	verbAwk: {"-f", "--file", "-i", "--include", "-l", "--load", "-E", "--exec"},
-	"yq":    {"-i", "--inplace"},
+	"yq":    {"-i", "--inplace", "-f", "--from-file"},
+	"jq":    {"-f", "--from-file"},
 	"tree":  {"-o", "-R"},
 	"less":  lessDenyFlags,
 	"more":  lessDenyFlags,
-	"gh":    {"-t", "--show-token"},
+	verbGH:  {"-t", "--show-token"},
+	// printf -v assigns a variable, which would carry a hijacking name past
+	// the assignment screen.
+	verbPrint: {"-v"},
 }
 
 // lessDenyFlags cover the log file and the lesskey options, which can set
@@ -149,26 +115,51 @@ var lessDenyFlags = []string{
 // "-i.bak", and "-oFILE" all carry the flag.
 var clusterVerbs = map[string]bool{
 	verbSed: true, "sort": true, "fd": true, "xxd": true, verbAwk: true, "yq": true,
-	"tree": true, "less": true, "more": true, "date": true,
+	"jq": true, "tree": true, "less": true, "more": true, "date": true, verbPrint: true,
 }
 
 // kubeSecret matches the secret resource in a kubectl get: bare, plural,
 // with a name or API group, or inside a comma list.
 var kubeSecret = regexp.MustCompile(`(?i)(^|,)secrets?([./,]|$)`)
 
+// jqProgram matches a jq program that reads the environment or pulls in a
+// module, which is program text from a file, like -f.
+var jqProgram = regexp.MustCompile(`(^|[^.\w$])env\b|\$ENV\b|\b(import|include)\s*"`)
+
 // programVerbs take a program text that can run commands or read the
-// environment, which no flag screen sees.
+// environment, which no flag screen sees. gh runs its --jq filter with the
+// environment loaded, token included.
 var programVerbs = map[string]*regexp.Regexp{
-	verbAwk: regexp.MustCompile(`(?i)system|\||environ`),
-	"jq":    regexp.MustCompile(`(^|[^.\w$])env\b|\$ENV\b`),
+	verbAwk: regexp.MustCompile(`(?i)system|\||environ|[<>@]`),
+	"jq":    jqProgram,
+	verbGH:  jqProgram,
 	"yq":    regexp.MustCompile(`(^|[^.\w$])(str)?env\b|\$ENV\b`),
 }
 
-// hijackEnv names environment variables that make an allowed verb run
-// another program or load foreign code or config.
-var hijackEnv = regexp.MustCompile(
-	`^(PATH|PAGER|GIT_(SSH|SSH_COMMAND|PROXY_COMMAND|PAGER|EXTERNAL_DIFF|ASKPASS|EXEC_PATH|CONFIG[A-Z0-9_]*)|SSH_ASKPASS|LESS(OPEN|CLOSE)|LD_[A-Z_]+|DYLD_[A-Z_]+|BASH_ENV|RIPGREP_CONFIG_PATH|KUBECONFIG|GOFLAGS|GH_PAGER|GH_BROWSER|BROWSER)=`,
-)
+// hijackEnv names variables that make the shell or an allowed verb run
+// another program, or load foreign code, config or trust. One assigned as a
+// prefix or as a statement of its own keeps the command from settling.
+var hijackEnv = regexp.MustCompile(`^(` +
+	// What the shell looks up and reads: commands and functions, startup
+	// files, a child shell's options and trace prompt, and zsh's command for
+	// a bare redirect, its argv[0] override and its stty hook. COMMAND_MODE
+	// switches macOS utilities to legacy option meanings.
+	`PATH|path|FPATH|fpath|MODULE_PATH|module_path|EXECIGNORE|HOME|ENV|BASH_ENV|ZDOTDIR|COMMAND_MODE` +
+	`|SHELLOPTS|BASHOPTS|POSIXLY_CORRECT|PS4|PROMPT4|BASH_XTRACEFD|NULLCMD|READNULLCMD|ARGV0|STTY` +
+	// Code the dynamic loader or an interpreter pulls in.
+	`|LD_[A-Z0-9_]+|DYLD_[A-Z0-9_]+|PYTHON(STARTUP|PATH|HOME|INSPECT|USERBASE|BREAKPOINT)` +
+	`|NODE_(PATH|EXTRA_CA_CERTS|TLS_REJECT_UNAUTHORIZED)|PERL5?(LIB|DB)|RUBYLIB|LUA_(INIT|C?PATH)[0-9_]*|CLASSPATH` +
+	// Programs and settings a tool takes from its environment, by the shape
+	// of the name: GIT_PAGER, KUBE_EDITOR, SSH_ASKPASS, GIT_SSH_COMMAND,
+	// KUBECONFIG, NODE_OPTIONS, PERL5OPT, GOFLAGS.
+	`|[A-Z0-9_]*(PAGER|EDITOR|BROWSER|ASKPASS|_COMMAND|CONFIG[A-Z0-9_]*|_OPTIONS|OPTS?|FLAGS)|VISUAL|LESS[A-Z_]*|MORE` +
+	// Tools by name: every git variable, the go toolchain, compilers, and the
+	// proxies and trust roots that put a request in someone else's hands.
+	`|GIT_[A-Z0-9_]+|GH_PATH|GOENV|GOROOT|GOPATH|GOTOOLDIR|GOTOOLCHAIN|CC|CXX` +
+	`|(?i:https?_proxy|all_proxy|npm_config_[a-z0-9_]+)|SSL_CERT_(FILE|DIR)|(CURL|REQUESTS)_CA_BUNDLE` +
+	// The agent's own settings.
+	`|CLAUDE_[A-Z0-9_]+|ANTHROPIC_[A-Z0-9_]+` +
+	`)=`)
 
 var builtinJudge = judgeConfig{
 	Environment: []string{
@@ -238,8 +229,11 @@ var credentialPath = regexp.MustCompile(
 // credentialGlob screens unquoted glob and brace tokens, which credentialPath
 // sees unexpanded. Globs skip dotfiles unless a component starts with a
 // literal ".", so that shape covers every hidden credential directory.
+// ~/.cargo is mostly crate sources: only a glob in the entry right under it, a
+// brace alternative or a ".." can land on its credentials file.
 var credentialGlob = regexp.MustCompile(
-	`(?i)(^|/)\.[^/]*[*?[{]|\.ss|id_|\.aws|\.gnupg|gopass|\.pem|\.key|netrc|keychain|\.kube|\.docker|\.cargo|\.config/gh|credentials`,
+	`(?i)(^|/)\.[^/]*[*?[{]|\.ss|id_|\.aws|\.gnupg|gopass|\.pem|\.key|netrc|keychain|\.kube|\.docker|\.config/gh|credentials` +
+		`|\.cargo(/[^/]*[*?[{]|/(.*/)?\.\.(/|$)|[,}])`,
 )
 
 const secretWords = `SECRET|TOKEN|KEY|PASS|AUTH|CRED|COOKIE|SESSION|DSN|DATABASE_URL`
@@ -506,7 +500,10 @@ func runCheck(cfg *config, cfgErr error, command string, stdout io.Writer, lg *s
 
 func decide(cfg *config, command, cwd string, lg *slog.Logger) verdict {
 	parsed := tokenize(command)
-	segments, unsound := parsed.segments(), parsed.unsound
+	static, sound := parsed.staticSegments()
+	// Deny and ask rules see the words both as written and as the static tier
+	// reads them, so a literal variable cannot carry a command past one.
+	segments := slices.Concat(parsed.segments(), static)
 
 	if rule := matchAny(cfg.Permissions.Deny, segments); rule != "" {
 		return verdict{Decision: decisionDeny, Tier: "deny-rule", Reason: "matches deny rule: " + rule}
@@ -514,8 +511,8 @@ func decide(cfg *config, command, cwd string, lg *slog.Logger) verdict {
 	if rule := matchAny(cfg.Permissions.Ask, segments); rule != "" {
 		return verdict{Decision: decisionAsk, Tier: "ask-rule", Reason: "matches ask rule: " + rule}
 	}
-	if !unsound && len(segments) > 0 {
-		if rule, ok := allSegmentsAllowed(cfg.Permissions.Allow, segments); ok {
+	if sound && len(static) > 0 {
+		if rule, ok := allSegmentsAllowed(cfg.Permissions.Allow, static); ok {
 			return verdict{Decision: decisionAllow, Tier: "static", Reason: "every segment is read-only: " + rule}
 		}
 	}
@@ -531,6 +528,7 @@ func decide(cfg *config, command, cwd string, lg *slog.Logger) verdict {
 type word struct {
 	text, exp string
 	quoted    bool // any quoting or escaping, which stops tilde expansion
+	glob      bool // an unquoted "*", "?", "[" or "{", which the shell may expand into paths
 }
 
 type statement struct {
@@ -538,6 +536,11 @@ type statement struct {
 	words []word
 	cmd   int  // index of the first word that is not a leading NAME=value
 	data  bool // a heredoc body line no shell reads: deny and ask rules match it, the probe skips it
+	// unsound marks a construct that defeats static reasoning about this
+	// statement: a substitution, a parenthesis, a redirect other than a stderr
+	// merge or /dev/null, a heredoc, backgrounding, $'...' quoting, or a
+	// hijacking assignment.
+	unsound bool
 }
 
 // heredocOp matches "<<" or "<<-" with its delimiter, quoted in part or whole.
@@ -564,10 +567,9 @@ func heredocAt(s string, i int) (heredoc, int) {
 
 type parsedCommand struct {
 	stmts []statement
-	// unsound reports constructs that defeat static reasoning: substitution,
-	// redirection (except stderr merges and /dev/null, which write nothing),
-	// heredocs, backgrounding, "#" comments, hijacking env assignments, and
-	// unquoted globs that could expand onto credential paths.
+	// unsound reports what defeats static reasoning about the whole command
+	// and belongs to no statement: a "#" comment, an unclosed quote, a
+	// redirect or "&" with no command, a heredoc whose body never starts.
 	unsound bool
 	// opaque reports constructs whose variable flow is not followed:
 	// subshells, substitution, function bodies, heredocs.
@@ -575,22 +577,17 @@ type parsedCommand struct {
 }
 
 func tokenize(command string) parsedCommand {
-	p := parsedCommand{
-		unsound: strings.Contains(command, "`") || strings.Contains(command, "$("),
-		opaque:  strings.Contains(command, "`") || strings.Contains(command, "<<") || strings.Contains(command, "$("),
-	}
-
+	var p parsedCommand
 	var words []word
 	var docs []heredoc
 	var tok, exp strings.Builder
 	var quote byte
-	globbed, quoted, sep := false, false, ""
+	globbed, quoted, dollarQuote, sep := false, false, false, ""
+	// unsound and redirected describe the statement being read.
+	unsound, redirected := false, false
 	flushToken := func() {
 		if tok.Len() > 0 {
-			if globbed && credentialGlob.MatchString(tok.String()) {
-				p.unsound = true
-			}
-			words = append(words, word{text: tok.String(), exp: exp.String(), quoted: quoted})
+			words = append(words, word{text: tok.String(), exp: exp.String(), quoted: quoted, glob: globbed})
 			tok.Reset()
 			exp.Reset()
 		}
@@ -601,6 +598,9 @@ func tokenize(command string) parsedCommand {
 	flushStatement := func(next string) {
 		flushToken()
 		if len(words) == 0 {
+			// zsh runs $NULLCMD for a redirect that has no command.
+			p.unsound = p.unsound || unsound || redirected
+			unsound, redirected = false, false
 			if sep == "" || sep == ";" {
 				sep = next
 			}
@@ -608,13 +608,18 @@ func tokenize(command string) parsedCommand {
 		}
 		cmd := 0
 		for cmd < len(words) && assignmentPattern.MatchString(words[cmd].text) {
-			p.unsound = p.unsound || hijackEnv.MatchString(words[cmd].text)
+			unsound = unsound || hijackEnv.MatchString(words[cmd].text)
 			cmd++
 		}
-		p.stmts = append(p.stmts, statement{sep: sep, words: words, cmd: cmd})
-		words, sep = nil, next
+		p.stmts = append(p.stmts, statement{sep: sep, words: words, cmd: cmd, unsound: unsound})
+		words, sep, unsound, redirected = nil, next, false, false
 	}
 	write := func(c byte, expands bool) {
+		// A backtick or "$(" runs a command wherever the shell expands, inside
+		// double quotes too; single-quoted or escaped it is text.
+		if expands && (c == '`' || c == '(' && strings.HasSuffix(exp.String(), "$")) {
+			p.opaque, unsound = true, true
+		}
 		tok.WriteByte(c)
 		if c == '$' && !expands {
 			c = 0
@@ -625,31 +630,42 @@ func tokenize(command string) parsedCommand {
 	for i := 0; i < len(command); i++ {
 		c := command[i]
 		switch {
+		case c == '\\' && i+1 < len(command) && command[i+1] == '\n' && quote != '\'':
+			i++ // line continuation: the shell drops both bytes
+		case c == '\\' && i+1 < len(command) &&
+			(quote == '"' && strings.IndexByte("\"\\$`", command[i+1]) >= 0 || quote == '\'' && dollarQuote):
+			// Read as the end of the string, an escaped quote would turn the
+			// commands after it into quoted text.
+			i++
+			write(command[i], false)
 		case quote != 0:
 			if c == quote {
 				quote = 0
 			} else {
-				p.unsound = p.unsound || c == '<' || c == '>'
-				write(c, quote == '"' && command[i-1] != '\\')
+				write(c, quote == '"')
 			}
 		case c == '\'' || c == '"':
+			// $'...' and $"..." are decoded by the shell in ways not followed
+			// here, beyond the backslash escapes that keep $'...' from ending early.
+			dollarQuote = strings.HasSuffix(exp.String(), "$")
+			unsound = unsound || dollarQuote
 			quote, quoted = c, true
 		case c == '\\' && i+1 < len(command):
 			i++
 			quoted = true
-			p.unsound = p.unsound || command[i] == '<' || command[i] == '>'
 			write(command[i], false)
 		case c == '<' || c == '>':
 			if fd := tok.String(); !quoted && (fd == "" || fd == "0" || fd == "1" || fd == "2") {
 				if end := safeRedirect(command, i, fd); end > 0 {
 					tok.Reset()
 					exp.Reset()
-					globbed, i = false, end-1
+					globbed, redirected, i = false, true, end-1
 					continue
 				}
 			}
-			p.unsound = true
+			unsound = true
 			if d, n := heredocAt(command, i); n > 0 {
+				p.opaque = true
 				flushToken()
 				d.owner = len(p.stmts)
 				docs = append(docs, d)
@@ -674,7 +690,7 @@ func tokenize(command string) parsedCommand {
 		case c == '&':
 			if tok.Len() == 0 && !quoted && i+1 < len(command) && command[i+1] == '>' {
 				if end := safeRedirect(command, i+1, "&"); end > 0 {
-					i = end - 1
+					redirected, i = true, end-1
 					continue
 				}
 			}
@@ -683,7 +699,7 @@ func tokenize(command string) parsedCommand {
 				i++
 				next = "&&"
 			} else {
-				p.unsound = true // backgrounding
+				unsound = true // backgrounding
 			}
 			flushStatement(next)
 		case c == ' ' || c == '\t':
@@ -700,12 +716,16 @@ func tokenize(command string) parsedCommand {
 			}
 		default:
 			globbed = globbed || strings.IndexByte("*?[{", c) >= 0
-			p.opaque = p.opaque || c == '(' || c == ')'
+			// A parenthesis is a subshell, an array, or a zsh glob qualifier,
+			// which can run code: "*(e:'cmd':)".
+			if c == '(' || c == ')' {
+				p.opaque, unsound = true, true
+			}
 			write(c, true)
 		}
 	}
 	flushStatement("")
-	if quote != 0 {
+	if quote != 0 || len(docs) > 0 {
 		p.unsound = true
 	}
 	return p
@@ -829,7 +849,7 @@ func (st statement) tokens() []string {
 	return seg
 }
 
-// segments is the static tier's view: every statement's tokens, heredoc
+// segments is the command as written: every statement's tokens, heredoc
 // bodies included.
 func (p parsedCommand) segments() [][]string {
 	segs := make([][]string, 0, len(p.stmts))
@@ -839,9 +859,46 @@ func (p parsedCommand) segments() [][]string {
 	return segs
 }
 
+// expansion matches a "$" the shell substitutes: a parameter in any bash or
+// zsh form, arithmetic or a command. "$?", "$$", "$#" and "$!" are numbers, and
+// a "$" that ends the word or precedes plain punctuation, as in "a$|b$", is literal.
+var expansion = regexp.MustCompile(`\$[^\s|)\]}/.,;:%\\?$#!]`)
+
+// braceExpansion turns one word into several before any screen sees them:
+// "{-delete,-print}" becomes two flags and "{a,.env}" a credential path.
+var braceExpansion = regexp.MustCompile(`\{[^{}]*(,|\.\.)[^{}]*\}`)
+
+// staticSegments is the static tier's view: segments with literal variables
+// substituted, so every screen runs on the word the shell will see. It reports
+// false when the command is unsound or a word keeps an expansion, whose value
+// could be a flag, a credential path or several words.
+func (p parsedCommand) staticSegments() ([][]string, bool) {
+	vars := p.literalVars()
+	segs, sound := p.segments(), !p.unsound
+	for j, st := range p.stmts {
+		sound = sound && !st.unsound
+		for k, w := range st.words {
+			text := p.substitute(vars, j, w)
+			sound = sound && !expansion.MatchString(text) &&
+				(!w.glob || !credentialGlob.MatchString(text) && !braceExpansion.MatchString(text))
+			if k >= st.cmd {
+				segs[j][k-st.cmd] = strings.ReplaceAll(text, "\x00", "$")
+				continue
+			}
+			// An assignment is matched against no rule, so the screens an
+			// argument would meet run here: a value naming a credential file,
+			// and a secret-named variable set as a statement of its own.
+			name, _, _ := strings.Cut(text, "=")
+			sound = sound && !credentialPath.MatchString(text) &&
+				(st.cmd < len(st.words) || !secretEnvName.MatchString(name))
+		}
+	}
+	return segs, sound
+}
+
 func parseCommand(command string) ([][]string, bool) {
-	p := tokenize(command)
-	return p.segments(), p.unsound
+	segs, sound := tokenize(command).staticSegments()
+	return segs, !sound
 }
 
 var (
@@ -886,7 +943,7 @@ var (
 		"export": true, "readonly": true, "local": true, "declare": true,
 		"typeset": true, "integer": true, "float": true, "unset": true, "read": true,
 		"for": true, "select": true, "getopts": true, "mapfile": true,
-		"readarray": true, "let": true, "printf": true, "set": true,
+		"readarray": true, "let": true, verbPrint: true, "set": true,
 	}
 	// trap and alias can change a variable or a verb later on; setopt and
 	// emulate change how zsh expands every word.
@@ -904,7 +961,8 @@ type literalVar struct {
 // literalVars finds shell variables whose value is certain at every later
 // use: a plain literal, assigned exactly once as its own statement before any
 // control flow, and never written in any other way. Anything less certain is
-// left out, and the probe then reports the path as unresolvable.
+// left out: the probe then reports the path as unresolvable, and the static
+// tier leaves the command to the judge.
 func (p parsedCommand) literalVars() map[string]literalVar {
 	if p.opaque {
 		return nil
@@ -988,24 +1046,7 @@ func (p parsedCommand) probeSegments() [][]string {
 	segs := p.segments()
 	for j, st := range p.stmts {
 		for k, w := range st.words[st.cmd:] {
-			if len(vars) == 0 || !strings.Contains(w.exp, "$") {
-				continue
-			}
-			expanded := variableRef.ReplaceAllStringFunc(w.exp, func(ref string) string {
-				tail := ""
-				if last := ref[len(ref)-1]; last == ':' || last == '[' {
-					if ref[1] != '{' {
-						return ref
-					}
-					ref, tail = ref[:len(ref)-1], ref[len(ref)-1:]
-				}
-				v, ok := vars[strings.Trim(ref, "${}")]
-				if !ok || !p.reaches(v.at, j) {
-					return ref + tail
-				}
-				return v.value + tail
-			})
-			segs[j][k] = strings.ReplaceAll(expanded, "\x00", "$")
+			segs[j][k] = strings.ReplaceAll(p.substitute(vars, j, w), "\x00", "$")
 		}
 	}
 	// Heredoc text is not commands: probed as such, its tokens became scripts
@@ -1017,6 +1058,26 @@ func (p parsedCommand) probeSegments() [][]string {
 		}
 	}
 	return kept
+}
+
+// substitute expands the literal variables in word w of statement j. A
+// reference that is not certain keeps its "$"; a "$" the shell would not
+// expand stays NUL.
+func (p parsedCommand) substitute(vars map[string]literalVar, j int, w word) string {
+	return variableRef.ReplaceAllStringFunc(w.exp, func(ref string) string {
+		tail := ""
+		if last := ref[len(ref)-1]; last == ':' || last == '[' {
+			if ref[1] != '{' {
+				return ref
+			}
+			ref, tail = ref[:len(ref)-1], ref[len(ref)-1:]
+		}
+		v, ok := vars[strings.Trim(ref, "${}")]
+		if !ok || !p.reaches(v.at, j) {
+			return ref + tail
+		}
+		return v.value + tail
+	})
 }
 
 // reaches reports whether the assignment in statement at has certainly run
@@ -1051,29 +1112,25 @@ func matchAny(rules []string, segments [][]string) string {
 	return ""
 }
 
-func allSegmentsAllowed(allowRules []string, segments [][]string) (string, bool) {
-	rules := spliceDefaults(allowRules, builtinAllow)
+// allSegmentsAllowed needs a permissions.allow rule for every segment that
+// runs a command: core ships none, and its screens only keep a rule from
+// matching a form that is not what the rule means. An empty segment is a
+// statement of assignments, which staticSegments has screened and which runs
+// nothing; a command made of those alone has no rule behind it.
+func allSegmentsAllowed(rules []string, segments [][]string) (string, bool) {
 	var matched string
 	for _, seg := range segments {
 		if len(seg) == 0 {
-			return "", false
+			continue
 		}
 		if hasDeniedFlag(seg) || riskyArgs(seg) {
 			return "", false
 		}
-		rule := ""
-		for _, r := range rules {
-			if matchRule(r, seg) {
-				rule = r
-				break
-			}
-		}
-		if rule == "" {
+		if matched = matchAny(rules, [][]string{seg}); matched == "" {
 			return "", false
 		}
-		matched = rule
 	}
-	return matched, true
+	return matched, matched != ""
 }
 
 func hasDeniedFlag(seg []string) bool {
@@ -1125,9 +1182,61 @@ func riskyArgs(seg []string) bool {
 		return slices.ContainsFunc(sedScripts(args), sedScriptWrites)
 	case "kubectl":
 		return slices.Contains(args, "get") && slices.ContainsFunc(args, kubeSecret.MatchString)
+	case verbGH:
+		return len(args) > 0 && args[0] == "api" && !ghAPIReads(args[1:])
+	case "ps":
+		return psShowsEnv(args)
 	default:
 		return false
 	}
+}
+
+var (
+	psOptions   = regexp.MustCompile(`^[A-Za-z]+$`)
+	psValueFlag = regexp.MustCompile(`^-[A-Za-z]*[oOptuUG]$`)
+)
+
+// psShowsEnv reports a ps call that prints the environment of other
+// processes: -E on macOS, a BSD-style "e" as in "ps eww" on Linux, or an
+// environ column.
+func psShowsEnv(args []string) bool {
+	for i, a := range args {
+		short := strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--")
+		// The value of -o, -p, -t, -u, -U or -G is not a set of options.
+		options := psOptions.MatchString(a) && (i == 0 || !psValueFlag.MatchString(args[i-1]))
+		if strings.Contains(a, "environ") || short && strings.Contains(a, "E") || options && strings.Contains(a, "e") {
+			return true
+		}
+	}
+	return false
+}
+
+// ghAPIReads reports a gh api call that can only send a GET. gh switches to
+// POST as soon as a field or an input body is given, and GraphQL needs one.
+func ghAPIReads(args []string) bool {
+	for i, a := range args {
+		name, value, attached := strings.Cut(a, "=")
+		short := len(a) > 1 && a[0] == '-' && a[1] != '-'
+		switch {
+		case a == "graphql", abbreviates(name, "--field"), abbreviates(name, "--raw-field"),
+			abbreviates(name, "--input"), short && strings.ContainsAny(a, "fF"):
+			return false
+		case abbreviates(name, "--method"):
+		case short && strings.Contains(a, "X"):
+			// Bundled or attached: -iX GET, -XGET, -X=GET.
+			value = strings.TrimPrefix(a[strings.IndexByte(a, 'X')+1:], "=")
+			attached = value != ""
+		default:
+			continue
+		}
+		if !attached && i+1 < len(args) {
+			value = args[i+1]
+		}
+		if value != "GET" {
+			return false
+		}
+	}
+	return true
 }
 
 // sedScripts picks the script texts out of sed's arguments: every -e value,
@@ -1436,7 +1545,7 @@ func gitFacts(segments [][]string, cwd string) map[string]string {
 			continue
 		}
 		verb := filepath.Base(inner[0])
-		if verb != verbGit && verb != "gh" {
+		if verb != verbGit && verb != verbGH {
 			continue
 		}
 		if verb == verbGit && len(inner) > 2 && inner[1] == "-C" {
@@ -1840,14 +1949,14 @@ func probeFile(target string, direct bool, dir shellDir) (scriptProbe, string) {
 // readCapped reads one byte past the cap, and only from regular files, so a
 // FIFO or device named as a script cannot block or flood the hook.
 func readCapped(path string) ([]byte, error) {
-	info, err := os.Stat(path) //nolint:gosec // the command names this path; the probe only reads it
+	info, err := os.Stat(path) // the command names this path; the probe only reads it
 	if err != nil {
 		return nil, fmt.Errorf("stat script: %w", err)
 	}
 	if !info.Mode().IsRegular() {
 		return nil, errNotRegular
 	}
-	f, err := os.Open(path) //nolint:gosec // size-capped and credential-screened before leaving the machine
+	f, err := os.Open(path) // size-capped and credential-screened before leaving the machine
 	if err != nil {
 		return nil, fmt.Errorf("open script: %w", err)
 	}
@@ -2351,7 +2460,7 @@ func runValidate(cfg *config, cfgErr error, args []string, stdout io.Writer, lg 
 
 	path := configPath()
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-		report("info", "config %s does not exist: defaults apply and the judge is off", path)
+		report("info", "config %s does not exist: nothing is allowed statically and the judge is off", path)
 	} else {
 		report("info", "config %s exists", path)
 	}
@@ -2363,6 +2472,9 @@ func runValidate(cfg *config, cfgErr error, args []string, stdout io.Writer, lg 
 	checkRules(report, "deny", cfg.Permissions.Deny)
 	checkRules(report, "ask", cfg.Permissions.Ask)
 	checkRules(report, "allow", cfg.Permissions.Allow)
+	if !slices.ContainsFunc(cfg.Permissions.Allow, func(rule string) bool { return rule != defaultsMarker }) {
+		report("info", "permissions.allow has no rules: nothing is allowed statically")
+	}
 
 	for _, l := range []struct {
 		name  string
@@ -2405,6 +2517,9 @@ func checkRules(report func(level, format string, a ...any), list string, rules 
 			continue
 		}
 		if rule == defaultsMarker {
+			if list == decisionAllow {
+				report("warning", "%s: %q adds nothing: frisk has no default allow list, copy the rules you want from config.example.json", where, rule)
+			}
 			continue
 		}
 		if pattern, isFile := fileRulePattern(rule); isFile {
