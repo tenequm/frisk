@@ -41,6 +41,7 @@ func TestParseCommand(t *testing.T) {
 		{"background is complex", "sleep 5 &", [][]string{{"sleep", "5"}}, true},
 		{"unclosed quote is complex", `echo "oops`, [][]string{{"echo", "oops"}}, true},
 		{"hijacking assignment is complex", "GIT_PAGER=x git log", [][]string{{"git", "log"}}, true},
+		{"variables are never substituted here", "S=/x; cat $S/f", [][]string{{}, {"cat", "$S/f"}}, false},
 		{"credential glob is complex", "cat ~/.s*/id_*", [][]string{{"cat", "~/.s*/id_*"}}, true},
 		{"quoted glob is not expanded", "jq '.items[]' f.json", [][]string{{"jq", ".items[]", "f.json"}}, false},
 	}
@@ -898,6 +899,9 @@ func TestGitFacts(t *testing.T) {
 		{"wrapped git command", "repo", "time git push", facts},
 		{"literal cd target", ".", "cd repo && git push", facts},
 		{"git -C target", ".", "git -C repo push", facts},
+		{"git -C variable", ".", `R={root}/repo; git -C "$R" push`, facts},
+		{"cd variable then git", ".", "R={root}/repo; cd $R && git push", facts},
+		{"git -C reassigned variable", ".", "R={root}/repo; R=/elsewhere; git -C $R push", nil},
 		{"non-git command", "repo", "terraform plan", nil},
 		{"outside a repo", ".", "git push", nil},
 		{"unknown directory", "repo", "cd $DIR && git push", nil},
@@ -905,7 +909,7 @@ func TestGitFacts(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg, capture := fakeJevCapture(t, jevAnswer{Choice: "ask", Confidence: 0.90})
-			decide(cfg, tt.command, filepath.Join(root, tt.cwd), testLogger)
+			decide(cfg, strings.ReplaceAll(tt.command, "{root}", root), filepath.Join(root, tt.cwd), testLogger)
 			raw, req := capture.request()
 			if !maps.Equal(req.State.Git, tt.want) {
 				t.Fatalf("git state = %v, want %v", req.State.Git, tt.want)
@@ -971,6 +975,8 @@ func probeFixture(t *testing.T) string {
 		"proj/blob":         "\x7fELF\x02\x01\x01",
 		"proj/decoy.py":     "print('decoy')\n",
 		"proj/sub/stats.py": "print('sub')\n",
+		"proj/sub/build.py": "print('build')\n",
+		"proj/run.py":       "print('run')\n",
 		"proj/big.py":       strings.Repeat("x = 1\n", maxScriptBytes/6+1),
 		"proj/half1.py":     filler,
 		"proj/half2.py":     filler + "y = 2\n",
@@ -1063,11 +1069,72 @@ func TestProbeScripts(t *testing.T) {
 		{"long hex withheld", "proj", "python3 hex.py", probeWithheld, nil},
 		{"long base64 withheld", "proj", "python3 b64.py", probeWithheld, nil},
 		{"long path is not a secret", "proj", "python3 paths.py", probeAttached, []string{"proj/paths.py"}},
+		{"variable cd after copy", ".", "B={root}/proj/sub; cp x $B/y; cd $B && python3 build.py", probeAttached, []string{"proj/sub/build.py"}},
+		{"variable in quoted script path", ".", `S={root}/proj; python3 "$S/run.py"`, probeAttached, []string{"proj/run.py"}},
+		{"braced variable", ".", "S={root}/proj; python3 ${S}/run.py", probeAttached, []string{"proj/run.py"}},
+		{"quoted cd variable", ".", `D={root}/proj/sub; cd "$D" && python3 build.py`, probeAttached, []string{"proj/sub/build.py"}},
+		{"double-quoted value", ".", `S="{root}/proj"; python3 $S/run.py`, probeAttached, []string{"proj/run.py"}},
+		{"single-quoted value", ".", "S='{root}/proj'; python3 $S/run.py", probeAttached, []string{"proj/run.py"}},
+		{"relative value follows cwd", "proj", "D=sub; cd $D && python3 build.py", probeAttached, []string{"proj/sub/build.py"}},
+		{"assignment on its own line", ".", "S={root}/proj\npython3 $S/run.py", probeAttached, []string{"proj/run.py"}},
+		{"assignment in the same && chain", ".", "S={root}/proj && python3 $S/run.py", probeAttached, []string{"proj/run.py"}},
+		{"variable directly executed", ".", "S={root}/proj; $S/smoke.sh", probeAttached, []string{"proj/smoke.sh"}},
+		{"use inside a later if", ".", "S={root}/proj; if true; then python3 $S/run.py; fi", probeAttached, []string{"proj/run.py"}},
+		{"tilde value resolves against home", ".", "S=~/frisk-test-no-such-dir; python3 $S/run.py", probeMissing, nil},
+		{"quoted tilde value stays literal", ".", `S="~/frisk-test-no-such-dir"; python3 $S/run.py`, probeUnresolvable, nil},
+		{"single-quoted reference is not expanded", ".", "S={root}/proj; python3 '$S/run.py'", probeUnresolvable, nil},
+		{"escaped reference is not expanded", ".", `S={root}/proj; python3 \$S/run.py`, probeUnresolvable, nil},
+		{"reassigned name", ".", "S={root}/proj/sub; S={root}/proj; python3 $S/run.py", probeUnresolvable, nil},
+		{"appended name", ".", "S={root}/proj; S+=/sub; python3 $S/run.py", probeUnresolvable, nil},
+		{"script inside then is probed", "proj", "if true; then python3 stats.py; fi", probeAttached, []string{"proj/stats.py"}},
+		{"script inside loop body is probed", "proj", "for n in 1 2; do python3 stats.py; done", probeAttached, []string{"proj/stats.py"}},
+		{"loop variable script is unresolvable", "proj", "for f in a b; do python3 $f; done", probeUnresolvable, nil},
+		{"cd inside if never resolves later scripts", "proj", "if true; then cd sub; fi; python3 stats.py", probeUnresolvable, nil},
+		{"cd inside loop never resolves later scripts", "proj", "for d in sub; do cd sub; python3 stats.py; done", probeUnresolvable, nil},
+		{"value from substitution", ".", "S=$(pwd); python3 $S/run.py", probeUnresolvable, nil},
+		{"value from another variable", ".", "R={root}; S=$R/proj; python3 $S/run.py", probeUnresolvable, nil},
+		{"value with a glob", ".", "S={root}/pro?; python3 $S/run.py", probeUnresolvable, nil},
+		{"value with a space", ".", `S="{root}/pr oj"; python3 "$S/run.py"`, probeUnresolvable, nil},
+		{"env prefix is not an assignment", ".", "S={root}/proj python3 $S/run.py", probeUnresolvable, nil},
+		{"use before assignment", ".", "python3 $S/run.py; S={root}/proj", probeUnresolvable, nil},
+		{"assignment after ||", ".", "false || S={root}/proj; python3 $S/run.py", probeUnresolvable, nil},
+		{"&& chain broken before use", ".", "true && S={root}/proj; python3 $S/run.py", probeUnresolvable, nil},
+		{"piped assignment", ".", "S={root}/proj | cat; python3 $S/run.py", probeUnresolvable, nil},
+		{"assignment inside if", ".", "if true; then S={root}/proj; fi; python3 $S/run.py", probeUnresolvable, nil},
+		{"exported later", ".", "S={root}/proj; export S=/elsewhere; python3 $S/run.py", probeUnresolvable, nil},
+		{"read later", ".", "S={root}/proj; read S; python3 $S/run.py", probeUnresolvable, nil},
+		{"loop variable", ".", "S={root}/proj; for S in a b; do python3 $S/run.py; done", probeUnresolvable, nil},
+		{"unset later", ".", "S={root}/proj; unset S; python3 $S/run.py", probeUnresolvable, nil},
+		{"subshell resolves nothing", ".", "S={root}/proj; (cd /tmp); python3 $S/run.py", probeUnresolvable, nil},
+		{"heredoc resolves nothing", ".", "cat <<EOF\nS={root}/proj\nEOF\npython3 $S/run.py", probeUnresolvable, nil},
+		{"eval resolves nothing", ".", "S={root}/proj; eval x; python3 $S/run.py", probeUnresolvable, nil},
+		{"source resolves nothing", ".", "S={root}/proj; . ./env.sh; python3 $S/run.py", probeUnresolvable, nil},
+		{"IFS change resolves nothing", ".", "IFS=/; S={root}/proj; python3 $S/run.py", probeUnresolvable, nil},
+		{"unknown variable beside a known one", ".", "S={root}/proj; python3 $S/$NAME.py", probeUnresolvable, nil},
+		{"cd to unknown variable never falls back", "proj", "cd $NOPE && python3 run.py", probeUnresolvable, nil},
+		{"zsh modifier after bare reference", ".", "S={root}/proj/sub; python3 $S:h/run.py", probeUnresolvable, nil},
+		{"zsh subscript after bare reference", ".", "S={root}/proj; python3 $S[1]/run.py", probeUnresolvable, nil},
+		{"braced reference before a colon is literal", ".", "S={root}/proj; python3 ${S}:h/run.py", probeMissing, nil},
+		{"PWD is rewritten by cd", ".", "PWD={root}/proj; cd {root}/proj/sub; python3 $PWD/run.py", probeUnresolvable, nil},
+		{"OLDPWD is shell-maintained", ".", "OLDPWD={root}/proj; python3 $OLDPWD/run.py", probeUnresolvable, nil},
+		{"REPLY is shell-maintained", ".", "REPLY={root}/proj; python3 $REPLY/run.py", probeUnresolvable, nil},
+		{"BASH-prefixed name is shell-maintained", ".", "BASH_X={root}/proj; python3 $BASH_X/run.py", probeUnresolvable, nil},
+		{"ZSH-prefixed name is shell-maintained", ".", "ZSH_X={root}/proj; python3 $ZSH_X/run.py", probeUnresolvable, nil},
+		{"trap resolves nothing", ".", "S={root}/proj; trap 'S=/b' DEBUG; python3 $S/run.py", probeUnresolvable, nil},
+		{"alias resolves nothing", ".", "S={root}/proj; alias python3=true; python3 $S/run.py", probeUnresolvable, nil},
+		{"setopt resolves nothing", ".", "S={root}/proj; setopt sh_word_split; python3 $S/run.py", probeUnresolvable, nil},
+		{"fd redirection assigns the name", ".", "S={root}/proj; exec {S}>/dev/null; python3 $S/run.py", probeUnresolvable, nil},
+		{"set -A assigns the name", ".", "S={root}/proj; set -A S a b; python3 $S/run.py", probeUnresolvable, nil},
+		{"set options keep resolution", ".", "set -euo pipefail; S={root}/proj; python3 $S/run.py", probeAttached, []string{"proj/run.py"}},
+		{"tilde after a colon in the value", ".", "S={root}/proj:~/x; python3 $S/run.py", probeUnresolvable, nil},
+		{"zsh equals expansion in the value", ".", "S==ls; python3 $S/run.py", probeUnresolvable, nil},
+		{"cdpath change resolves nothing", ".", "cdpath={root}/proj; D=sub; cd $D && python3 build.py", probeUnresolvable, nil},
+		{"cd to a directory stack entry is unknown", "proj", "cd +1 && python3 stats.py", probeUnresolvable, nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			segments, _ := parseCommand(strings.ReplaceAll(tt.command, "{root}", root))
+			segments := tokenize(strings.ReplaceAll(tt.command, "{root}", root)).probeSegments()
 			res := probeScripts(segments, filepath.Join(root, tt.cwd))
 			if res.Status != tt.status {
 				t.Fatalf("status = %q, want %q", res.Status, tt.status)
@@ -1084,6 +1151,34 @@ func TestProbeScripts(t *testing.T) {
 				t.Fatalf("scripts = %v, want %v", got, tt.paths)
 			}
 		})
+	}
+}
+
+func TestProbeSegments(t *testing.T) {
+	t.Parallel()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no home directory")
+	}
+	tests := []struct {
+		name    string
+		command string
+		want    []string // the last segment
+	}{
+		{"tilde value expands at assignment", "S=~/x; python3 $S/run.py", []string{"python3", filepath.Join(home, "x") + "/run.py"}},
+		{"braced and bare forms", `S=/a; T=/b; diff ${S}/f "$T/f"`, []string{"diff", "/a/f", "/b/f"}},
+		{"longest name wins", "S=/a; echo $S_dir", []string{"echo", "$S_dir"}},
+		{"single quotes keep the dollar", "S=/a; echo '$S' $S", []string{"echo", "$S", "/a"}},
+		{"unknown names keep the dollar", "S=/a; echo $S/$T", []string{"echo", "/a/$T"}},
+		{"nothing to substitute", "git status", []string{"git", "status"}},
+		{"bare reference before a modifier or subscript", `S=/a; echo $S:h "$S:t" $S[1] $S:$S`, []string{"echo", "$S:h", "$S:t", "$S[1]", "$S:/a"}},
+		{"braced reference before a modifier or subscript", "S=/a; echo ${S}:h ${S}[1]", []string{"echo", "/a:h", "/a[1]"}},
+	}
+	for _, tt := range tests {
+		segs := tokenize(tt.command).probeSegments()
+		if got := segs[len(segs)-1]; !slices.Equal(got, tt.want) {
+			t.Errorf("%s: probeSegments(%q) = %q, want %q", tt.name, tt.command, got, tt.want)
+		}
 	}
 }
 

@@ -472,7 +472,8 @@ func runCheck(cfg *config, cfgErr error, command string, stdout io.Writer, lg *s
 }
 
 func decide(cfg *config, command, cwd string, lg *slog.Logger) verdict {
-	segments, unsound := parseCommand(command)
+	parsed := tokenize(command)
+	segments, unsound := parsed.segments(), parsed.unsound
 
 	if rule := matchAny(cfg.Permissions.Deny, segments); rule != "" {
 		return verdict{Decision: decisionDeny, Tier: "deny-rule", Reason: "matches deny rule: " + rule}
@@ -488,38 +489,79 @@ func decide(cfg *config, command, cwd string, lg *slog.Logger) verdict {
 	if len(cfg.Jev.KeyCmd) == 0 {
 		return verdict{Tier: "no-judge", Reason: "no jev key configured"}
 	}
-	return judge(cfg, command, cwd, segments, lg)
+	return judge(cfg, command, cwd, parsed.probeSegments(), lg)
 }
 
-// The bool reports constructs that defeat static reasoning: substitution,
-// redirection, heredocs, backgrounding, hijacking env assignments, and
-// unquoted globs that could expand onto credential paths.
-func parseCommand(command string) ([][]string, bool) {
-	var segments [][]string
-	unsound := strings.ContainsAny(command, "`<>") || strings.Contains(command, "$(")
+// word is one shell token. text has quotes removed, as the static tier
+// matches it. exp is the same bytes with every "$" the shell would not expand
+// (single-quoted or escaped) replaced by NUL, so variable substitution skips it.
+type word struct {
+	text, exp string
+	quoted    bool // any quoting or escaping, which stops tilde expansion
+}
 
-	var tokens []string
-	var tok strings.Builder
+type statement struct {
+	sep   string // operator before it: "" for the first, else ";", "&&", "||", "|" or "&"
+	words []word
+	cmd   int // index of the first word that is not a leading NAME=value
+}
+
+type parsedCommand struct {
+	stmts []statement
+	// unsound reports constructs that defeat static reasoning: substitution,
+	// redirection, heredocs, backgrounding, hijacking env assignments, and
+	// unquoted globs that could expand onto credential paths.
+	unsound bool
+	// opaque reports constructs whose variable flow is not followed:
+	// subshells, substitution, function bodies, heredocs.
+	opaque bool
+}
+
+func tokenize(command string) parsedCommand {
+	p := parsedCommand{
+		unsound: strings.ContainsAny(command, "`<>") || strings.Contains(command, "$("),
+		opaque:  strings.Contains(command, "`") || strings.Contains(command, "<<") || strings.Contains(command, "$("),
+	}
+
+	var words []word
+	var tok, exp strings.Builder
 	var quote byte
-	globbed := false
+	globbed, quoted, sep := false, false, ""
 	flushToken := func() {
 		if tok.Len() > 0 {
 			if globbed && credentialGlob.MatchString(tok.String()) {
-				unsound = true
+				p.unsound = true
 			}
-			tokens = append(tokens, tok.String())
+			words = append(words, word{text: tok.String(), exp: exp.String(), quoted: quoted})
 			tok.Reset()
+			exp.Reset()
 		}
-		globbed = false
+		globbed, quoted = false, false
 	}
-	flushSegment := func() {
+	// A blank statement keeps a pending "&&", "||" or "|": a newline after the
+	// operator continues the chain rather than ending it.
+	flushStatement := func(next string) {
 		flushToken()
-		if len(tokens) > 0 {
-			seg, hijacked := stripAssignments(tokens)
-			unsound = unsound || hijacked
-			segments = append(segments, seg)
-			tokens = nil
+		if len(words) == 0 {
+			if sep == "" || sep == ";" {
+				sep = next
+			}
+			return
 		}
+		cmd := 0
+		for cmd < len(words) && assignmentPattern.MatchString(words[cmd].text) {
+			p.unsound = p.unsound || hijackEnv.MatchString(words[cmd].text)
+			cmd++
+		}
+		p.stmts = append(p.stmts, statement{sep: sep, words: words, cmd: cmd})
+		words, sep = nil, next
+	}
+	write := func(c byte, expands bool) {
+		tok.WriteByte(c)
+		if c == '$' && !expands {
+			c = 0
+		}
+		exp.WriteByte(c)
 	}
 
 	for i := 0; i < len(command); i++ {
@@ -529,48 +571,250 @@ func parseCommand(command string) ([][]string, bool) {
 			if c == quote {
 				quote = 0
 			} else {
-				tok.WriteByte(c)
+				write(c, quote == '"' && command[i-1] != '\\')
 			}
 		case c == '\'' || c == '"':
-			quote = c
+			quote, quoted = c, true
 		case c == '\\' && i+1 < len(command):
 			i++
-			tok.WriteByte(command[i])
+			quoted = true
+			write(command[i], false)
 		case c == '|' || c == ';' || c == '\n':
-			if c == '|' && i+1 < len(command) && command[i+1] == '|' {
-				i++
+			next := ";"
+			if c == '|' {
+				next = "|"
+				if i+1 < len(command) && command[i+1] == '|' {
+					i++
+					next = "||"
+				}
 			}
-			flushSegment()
+			flushStatement(next)
 		case c == '&':
+			next := "&"
 			if i+1 < len(command) && command[i+1] == '&' {
 				i++
+				next = "&&"
 			} else {
-				unsound = true // backgrounding
+				p.unsound = true // backgrounding
 			}
-			flushSegment()
+			flushStatement(next)
 		case c == ' ' || c == '\t':
 			flushToken()
 		default:
 			globbed = globbed || strings.IndexByte("*?[{", c) >= 0
-			tok.WriteByte(c)
+			p.opaque = p.opaque || c == '(' || c == ')'
+			write(c, true)
 		}
 	}
-	flushSegment()
+	flushStatement("")
 	if quote != 0 {
-		unsound = true
+		p.unsound = true
 	}
-	return segments, unsound
+	return p
 }
 
-var assignmentPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
-
-func stripAssignments(tokens []string) ([]string, bool) {
-	hijacked := false
-	for len(tokens) > 0 && assignmentPattern.MatchString(tokens[0]) {
-		hijacked = hijacked || hijackEnv.MatchString(tokens[0])
-		tokens = tokens[1:]
+// segments is the static tier's view: each statement's tokens with leading
+// assignments stripped and nothing substituted.
+func (p parsedCommand) segments() [][]string {
+	segs := make([][]string, 0, len(p.stmts))
+	for _, st := range p.stmts {
+		seg := make([]string, 0, len(st.words)-st.cmd)
+		for _, w := range st.words[st.cmd:] {
+			seg = append(seg, w.text)
+		}
+		segs = append(segs, seg)
 	}
-	return tokens, hijacked
+	return segs
+}
+
+func parseCommand(command string) ([][]string, bool) {
+	p := tokenize(command)
+	return p.segments(), p.unsound
+}
+
+var (
+	assignmentPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
+	// variableWrite covers NAME=, NAME+=, NAME[i]=, the assigning expansions
+	// ${NAME=x}, ${NAME:=x}, ${NAME::=x}, and the {NAME}> redirection that
+	// stores a file descriptor number.
+	variableWrite = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)(\[[^\]]*\])?\+?=|\$\{([A-Za-z_][A-Za-z0-9_]*):{0,2}=|\{([A-Za-z_][A-Za-z0-9_]*)\}[<>]`)
+	// variableRef also takes a following ":" or "[": zsh reads those after a
+	// bare $NAME as a modifier ($S:h) or subscript ($S[1]), so that reference
+	// is left alone. After ${NAME} they are literal in bash and zsh alike.
+	variableRef = regexp.MustCompile(`\$([A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})[:\[]?`)
+	identifier  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*`)
+	// shellOwned names are rewritten by bash or zsh themselves (cd updates
+	// PWD, every command updates _), so one literal write proves nothing.
+	shellOwned = regexp.MustCompile(`^(_|PWD|OLDPWD|DIRSTACK|RANDOM|SRANDOM|SECONDS|EPOCHSECONDS|EPOCHREALTIME|LINENO|REPLY|reply|OPTARG|OPTIND|OPTERR|PPID|UID|EUID|GID|EGID|GROUPS|USERNAME|HISTCMD|PIPESTATUS|pipestatus|status|ERRNO|FUNCNAME|funcstack|COLUMNS|LINES|SHLVL|MAPFILE|COPROC|TTYIDLE|ARGC|argv|MATCH|MBEGIN|MEND|match|mbegin|mend|signals)$|^(BASH|ZSH|zsh|COMP_|READLINE_|TRY_BLOCK_)`)
+)
+
+// Writing any of these changes how every other word expands or where cd
+// lands, so a command that touches one gets no variable resolution at all.
+// zsh ties lowercase cdpath to CDPATH.
+var expansionVars = []string{"IFS", "HOME", "CDPATH", "cdpath"}
+
+// Shell words that start or continue a compound command. After the first
+// one, an assignment may be conditional or repeated, so none is collected.
+var controlWords = map[string]bool{
+	"if": true, "then": true, "else": true, "elif": true, "fi": true, "for": true,
+	"while": true, "until": true, "do": true, "done": true, "case": true,
+	"esac": true, "select": true, "function": true, "{": true, "}": true,
+}
+
+// prefixWords can stand in front of a command without being its verb.
+var prefixWords = map[string]bool{
+	"if": true, "then": true, "else": true, "elif": true, "do": true,
+	"while": true, "until": true, "!": true, "time": true, "{": true,
+}
+
+// writerVerbs set the variables they name; opaqueVerbs run code this parser
+// cannot see, which may set any variable.
+var (
+	writerVerbs = map[string]bool{
+		"export": true, "readonly": true, "local": true, "declare": true,
+		"typeset": true, "integer": true, "float": true, "unset": true, "read": true,
+		"for": true, "select": true, "getopts": true, "mapfile": true,
+		"readarray": true, "let": true, "printf": true, "set": true,
+	}
+	// trap and alias can change a variable or a verb later on; setopt and
+	// emulate change how zsh expands every word.
+	opaqueVerbs = map[string]bool{
+		"eval": true, "source": true, "function": true, "trap": true, "alias": true,
+		"setopt": true, "unsetopt": true, "emulate": true,
+	}
+)
+
+type literalVar struct {
+	value string
+	at    int // index of the assigning statement
+}
+
+// literalVars finds shell variables whose value is certain at every later
+// use: a plain literal, assigned exactly once as its own statement before any
+// control flow, and never written in any other way. Anything less certain is
+// left out, and the probe then reports the path as unresolvable.
+func (p parsedCommand) literalVars() map[string]literalVar {
+	if p.opaque {
+		return nil
+	}
+	vars := map[string]literalVar{}
+	writes := map[string]int{}
+	topLevel := true
+	for i, st := range p.stmts {
+		rest := st.words[st.cmd:]
+		topLevel = topLevel && (len(rest) == 0 || !controlWords[rest[0].text])
+		for len(rest) > 0 && prefixWords[rest[0].text] {
+			rest = rest[1:]
+		}
+		// "." sources a file only as the verb; the other words are matched
+		// anywhere, which errs toward resolving nothing.
+		if len(rest) > 0 && rest[0].text == "." {
+			return nil
+		}
+		writer := false
+		for _, w := range st.words {
+			if opaqueVerbs[w.text] {
+				return nil
+			}
+			writer = writer || writerVerbs[w.text]
+			for _, m := range variableWrite.FindAllStringSubmatch(w.exp, -1) {
+				writes[m[1]+m[3]+m[4]]++
+			}
+		}
+		for _, w := range st.words {
+			if writer {
+				writes[identifier.FindString(w.text)] += 2
+			}
+		}
+
+		// Piped or backgrounded, the assignment runs in a subshell and is lost.
+		lost := i+1 < len(p.stmts) && (p.stmts[i+1].sep == "|" || p.stmts[i+1].sep == "&")
+		unconditional := st.sep == "" || st.sep == ";" || st.sep == "&&"
+		if !topLevel || st.cmd != len(st.words) || lost || !unconditional {
+			continue
+		}
+		for _, w := range st.words {
+			if value, ok := w.literalValue(); ok {
+				vars[identifier.FindString(w.text)] = literalVar{value: value, at: i}
+			}
+		}
+	}
+	if slices.ContainsFunc(expansionVars, func(name string) bool { return writes[name] > 0 }) {
+		return nil
+	}
+	maps.DeleteFunc(vars, func(name string, _ literalVar) bool {
+		return writes[name] != 1 || shellOwned.MatchString(name)
+	})
+	return vars
+}
+
+// literalValue returns the value of a NAME=value word when the shell stores
+// it verbatim. Whitespace is refused because an unquoted use would split it
+// into several words; a quoted "~" because it does not expand; a later "~"
+// because the shell expands it after ":"; a leading "=" because zsh expands
+// "=cmd" to that command's path.
+func (w word) literalValue() (string, bool) {
+	_, value, _ := strings.Cut(w.text, "=")
+	if value == "" || value[0] == '=' || strings.ContainsAny(value, "$`*?[{ \t\n") || strings.Contains(value[1:], "~") {
+		return "", false
+	}
+	if !strings.HasPrefix(value, "~") {
+		return value, true
+	}
+	home, err := os.UserHomeDir()
+	if w.quoted || err != nil || (value != "~" && !strings.HasPrefix(value, "~/")) {
+		return "", false
+	}
+	return filepath.Join(home, value[1:]), true
+}
+
+// probeSegments is the probe's view: segments() with literal variables
+// substituted where the shell would expand them. A reference that is not
+// certain keeps its "$", which the path resolver refuses.
+func (p parsedCommand) probeSegments() [][]string {
+	vars := p.literalVars()
+	segs := p.segments()
+	for j, st := range p.stmts {
+		for k, w := range st.words[st.cmd:] {
+			if len(vars) == 0 || !strings.Contains(w.exp, "$") {
+				continue
+			}
+			expanded := variableRef.ReplaceAllStringFunc(w.exp, func(ref string) string {
+				tail := ""
+				if last := ref[len(ref)-1]; last == ':' || last == '[' {
+					if ref[1] != '{' {
+						return ref
+					}
+					ref, tail = ref[:len(ref)-1], ref[len(ref)-1:]
+				}
+				v, ok := vars[strings.Trim(ref, "${}")]
+				if !ok || !p.reaches(v.at, j) {
+					return ref + tail
+				}
+				return v.value + tail
+			})
+			segs[j][k] = strings.ReplaceAll(expanded, "\x00", "$")
+		}
+	}
+	return segs
+}
+
+// reaches reports whether the assignment in statement at has certainly run
+// by statement use: it comes first, and if it sits in an && chain the use is
+// in that same chain.
+func (p parsedCommand) reaches(at, use int) bool {
+	if use <= at {
+		return false
+	}
+	if p.stmts[at].sep != "&&" {
+		return true
+	}
+	for _, st := range p.stmts[at+1 : use+1] {
+		if st.sep != "&&" {
+			return false
+		}
+	}
+	return true
 }
 
 func matchAny(rules []string, segments [][]string) string {
@@ -1043,23 +1287,31 @@ func (r *probeResult) miss(target, why string) {
 // shellDir tracks the directory a command's segments run in. known goes false
 // on anything but a literal cd, and relative paths then stop resolving.
 type shellDir struct {
-	path  string
-	known bool
-	lost  bool // a directory change, not a missing cwd, made it unknown
+	path   string
+	known  bool
+	lost   bool // a directory change, not a missing cwd, made it unknown
+	nested bool // control flow has started, so a cd may be skipped or repeated
 }
 
 // step follows a directory change and reports whether seg was only that.
 func (d *shellDir) step(seg []string) bool {
+	d.nested = d.nested || controlWords[seg[0]]
+	for len(seg) > 1 && prefixWords[seg[0]] {
+		seg = seg[1:]
+	}
 	switch {
 	case seg[0] != "cd":
 		if seg[0] == "pushd" || seg[0] == "popd" || strings.HasPrefix(seg[0], "(") {
 			d.known, d.lost = false, true
 		}
 		return false
+	case d.nested:
+		d.known = false
 	case len(seg) == 1:
 		home, err := os.UserHomeDir()
 		d.path, d.known = home, err == nil
-	case len(seg) == 2 && seg[1] != "-":
+	case len(seg) == 2 && !strings.HasPrefix(seg[1], "-") && !strings.HasPrefix(seg[1], "+"):
+		// "-", and zsh's "-2" and "+1", name earlier directories, not paths.
 		d.path, d.known = d.resolve(seg[1])
 	default:
 		d.known = false
@@ -1209,6 +1461,12 @@ func unwrap(seg []string) ([]string, bool, error) {
 			name, rest = verbUVRun, rest[1:]
 		}
 		spec, wrapped := wrappers[name]
+		// "then python3 x.py" runs the script just as plainly, and an
+		// assignment after the keyword is no more a verb than a leading one.
+		if at := variableWrite.FindStringIndex(seg[0]); !wrapped && (prefixWords[seg[0]] || (at != nil && at[0] == 0 && seg[0][0] != '$')) {
+			seg = rest
+			continue
+		}
 		if !wrapped {
 			break
 		}
