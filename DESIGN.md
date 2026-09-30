@@ -26,8 +26,8 @@ parse into pipeline segments (|, &&, ||, ;, newline)
 2. permissions.ask   match -> "ask"
 3. static allow: EVERY segment provably read-only
    (builtin verb table + config allow; bails on
-    $(), backticks, redirects, heredocs, &; except 2>&1 and
-    /dev/null redirects)      -> "allow"
+    $(), backticks, heredocs, &, # comments, and redirects
+    other than 2>&1 and /dev/null) -> "allow"
 4. judge (needs jev.keyCmd): one Choice question
      allow + confidence >= 0.75 -> "allow"
      deny  + confidence >= 0.50 -> "deny" (below: "ask")
@@ -48,6 +48,11 @@ the session (logged). `"$defaults"` splices the built-in entries, autoMode-style
 Rules use Claude Code's `Bash(...)` rule-content syntax, matched against
 parsed segments - so `cd x && git push` still matches `git push *`. Trailing
 `*` matches the rest; a standalone mid-pattern `*` matches one token.
+
+An unquoted `#` that starts a word is a comment: the rest of the line is
+dropped unread, so a quote inside it cannot hide the lines after it from the
+rules. A command with a comment is never allowed statically, because a shell
+that does not recognise comments would run that text.
 
 `judge.decisions` lists which of `allow`, `ask`, `deny` the judge may issue;
 unset means all three. An empty list or any other value is a malformed config.

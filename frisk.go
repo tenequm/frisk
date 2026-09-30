@@ -566,7 +566,7 @@ type parsedCommand struct {
 	stmts []statement
 	// unsound reports constructs that defeat static reasoning: substitution,
 	// redirection (except stderr merges and /dev/null, which write nothing),
-	// heredocs, backgrounding, hijacking env assignments, and
+	// heredocs, backgrounding, "#" comments, hijacking env assignments, and
 	// unquoted globs that could expand onto credential paths.
 	unsound bool
 	// opaque reports constructs whose variable flow is not followed:
@@ -688,6 +688,16 @@ func tokenize(command string) parsedCommand {
 			flushStatement(next)
 		case c == ' ' || c == '\t':
 			flushToken()
+		case c == '#' && tok.Len() == 0 && !quoted:
+			// The shell drops the rest of the line unread, so a quote in the
+			// comment must not hide the lines after it. A shell without comments
+			// runs that text instead, so the command never settles statically.
+			p.unsound = true
+			if end := strings.IndexByte(command[i:], '\n'); end >= 0 {
+				i += end - 1
+			} else {
+				i = len(command)
+			}
 		default:
 			globbed = globbed || strings.IndexByte("*?[{", c) >= 0
 			p.opaque = p.opaque || c == '(' || c == ')'
