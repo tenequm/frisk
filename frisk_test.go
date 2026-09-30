@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -297,6 +298,9 @@ func TestValidateFindings(t *testing.T) {
 		{"bare star in deny warns", `{"permissions":{"deny":["*"]}}`, "warning: permissions.deny[0]: \"*\" matches every command", 0},
 		{"bare star in ask warns", `{"permissions":{"ask":["*"]}}`, "warning: permissions.ask[0]", 0},
 		{"defaults marker is fine", `{"permissions":{"deny":["$defaults"]}}`, "", 0},
+		{"unknown judge decision", `{"judge":{"decisions":["allow","defer"]}}`, `judge.decisions ["allow" "defer"]: want a non-empty list`, 1},
+		{"empty judge decisions", `{"judge":{"decisions":[]}}`, "judge.decisions []: want a non-empty list", 1},
+		{"narrowed judge decisions", `{"judge":{"decisions":["deny","allow"]}}`, "info: judge.decisions: deny, allow\n", 0},
 	}
 	for _, tt := range tests {
 		out, code := validateOutput(t, tt.cfg)
@@ -320,6 +324,7 @@ func TestValidateJudgeListStates(t *testing.T) {
 		"info: judge.allow: extends the builtins",
 		"info: judge.soft_deny: extends the builtins",
 		"info: judge.hard_deny: unset, builtins apply",
+		"info: judge.decisions: allow, ask, deny\n",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q in %s", want, out)
@@ -858,6 +863,115 @@ func TestJudgeReasons(t *testing.T) {
 				t.Fatalf("rule questions = %+v", req.Questions)
 			}
 		})
+	}
+}
+
+func TestJudgeDecisions(t *testing.T) {
+	softClosest := `closest rule: soft_deny "` + builtinJudge.SoftDeny[0][:maxRuleChars] + `..." (0.71)`
+	const hardClosest = `closest rule: hard_deny "Reading, printing, or transmitting credentials or secret material. Mod..." (0.80)`
+	noAsk, noAllow := []string{decisionAllow, decisionDeny}, []string{decisionAsk, decisionDeny}
+	r1 := jevAnswer{Choice: "r1", Confidence: 0.80}
+	tests := []struct {
+		name      string
+		decisions []string
+		command   string
+		answers   map[string]any
+		decision  string
+		reason    string
+	}{
+		{
+			"ask is withheld", noAsk, "terraform apply",
+			map[string]any{
+				"decision": jevAnswer{Choice: "ask", Confidence: 0.62, Probabilities: map[string]float64{"allow": 0.30, "ask": 0.62, "deny": 0.08}},
+				"ask_rule": jevAnswer{Choice: "r1", Confidence: 0.71},
+			},
+			"", "jev ask (allow 0.30 / ask 0.62 / deny 0.08); ask withheld by judge.decisions; " + softClosest,
+		},
+		{
+			"downgraded deny is withheld", noAsk, "terraform apply",
+			map[string]any{"decision": jevAnswer{Choice: "deny", Confidence: 0.40}, "deny_rule": r1},
+			"", "jev deny below confidence floor (0.40), asking; ask withheld by judge.decisions; " + hardClosest,
+		},
+		{
+			"withheld ask keeps the probe note", noAsk, "python3 nope.py",
+			map[string]any{"decision": jevAnswer{Choice: "ask", Confidence: 0.62}},
+			"", "jev ask (0.62); ask withheld by judge.decisions; script nope.py not attached: missing",
+		},
+		{
+			"confident deny still denies", noAsk, "terraform apply",
+			map[string]any{"decision": jevAnswer{Choice: "deny", Confidence: 0.90}, "deny_rule": r1},
+			decisionDeny, "jev deny (0.90); " + hardClosest,
+		},
+		{
+			"confident allow still allows", noAsk, "terraform apply",
+			map[string]any{"decision": jevAnswer{Choice: "allow", Confidence: 0.98}},
+			decisionAllow, "jev allow (0.98)",
+		},
+		{
+			"ask below the floor was silence already", noAsk, "terraform apply",
+			map[string]any{"decision": jevAnswer{Choice: "ask", Confidence: 0.49}},
+			"", "jev ask below confidence floor (0.49)",
+		},
+		{
+			"allow can be withheld too", noAllow, "terraform apply",
+			map[string]any{"decision": jevAnswer{Choice: "allow", Confidence: 0.98}},
+			"", "jev allow (0.98); allow withheld by judge.decisions",
+		},
+		{
+			"deny can be withheld too", noAsk[:1], "terraform apply",
+			map[string]any{"decision": jevAnswer{Choice: "deny", Confidence: 0.90}},
+			"", "jev deny (0.90); deny withheld by judge.decisions",
+		},
+		{
+			"unset key issues all three", nil, "terraform apply",
+			map[string]any{"decision": jevAnswer{Choice: "deny", Confidence: 0.40}},
+			decisionAsk, "jev deny below confidence floor (0.40), asking",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, _ := fakeJevAnswers(t, tt.answers)
+			cfg.Judge.Decisions = tt.decisions
+			v := decide(cfg, tt.command, t.TempDir(), testLogger)
+			if v.Decision != tt.decision || v.Reason != tt.reason || v.Tier != tierJudge {
+				t.Fatalf("verdict = (%q, %q, %q), want (%q, %q)", v.Decision, v.Tier, v.Reason, tt.decision, tt.reason)
+			}
+			var buf strings.Builder
+			logVerdict(slog.New(slog.NewJSONHandler(&buf, nil)), v, tt.command)
+			var rec struct {
+				Decision string `json:"decision"`
+				Reason   string `json:"reason"`
+			}
+			if err := json.Unmarshal([]byte(buf.String()), &rec); err != nil {
+				t.Fatalf("log not JSON: %v: %s", err, buf.String())
+			}
+			if rec.Decision != cmp.Or(tt.decision, "silent") || rec.Reason != tt.reason {
+				t.Fatalf("log record = %s", buf.String())
+			}
+		})
+	}
+}
+
+// Rules from config are not the judge's decisions, so judge.decisions leaves
+// them alone; an invalid list silences the hook like any malformed config.
+func TestJudgeDecisionsLeaveRulesAlone(t *testing.T) {
+	newHookEnv(t, `{"permissions":{"ask":["ssh prod *"],"deny":["gopass show -o *"]},"judge":{"decisions":["allow"]}}`)
+	for command, want := range map[string]string{
+		"ssh prod uptime": decisionAsk, "gopass show -o k": decisionDeny, "git status": decisionAllow,
+	} {
+		if got := hookDecision(t, "Bash", "command", command, "/"); got != want {
+			t.Errorf("%s: decision = %q, want %q", command, got, want)
+		}
+	}
+	if got := hookDecision(t, "Edit", "file_path", configPath(), "/"); got != decisionAsk {
+		t.Errorf("guardrail path: decision = %q, want ask", got)
+	}
+
+	newHookEnv(t, `{"permissions":{"deny":["gopass show -o *"]},"judge":{"decisions":["allow","prompt"]}}`)
+	for _, command := range []string{"git status", "gopass show -o k"} {
+		if got := hookDecision(t, "Bash", "command", command, "/"); got != "" {
+			t.Errorf("invalid judge.decisions: %s: decision = %q, want silence", command, got)
+		}
 	}
 }
 

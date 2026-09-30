@@ -33,6 +33,7 @@ parse into pipeline segments (|, &&, ||, ;, newline)
      deny  + confidence >= 0.50 -> "deny" (below: "ask")
      ask   + confidence >= 0.50 -> "ask"  (below: silence)
      anything else              -> silence
+     a decision missing from judge.decisions -> silence
   |
 silence -> Claude Code native flow (rules -> classifier -> prompt)
 ```
@@ -47,6 +48,9 @@ the session (logged). `"$defaults"` splices the built-in entries, autoMode-style
 Rules use Claude Code's `Bash(...)` rule-content syntax, matched against
 parsed segments - so `cd x && git push` still matches `git push *`. Trailing
 `*` matches the rest; a standalone mid-pattern `*` matches one token.
+
+`judge.decisions` lists which of `allow`, `ask`, `deny` the judge may issue;
+unset means all three. An empty list or any other value is a malformed config.
 
 ## The judge
 
@@ -99,6 +103,15 @@ The closest rule comes from two more Choice questions in the same request
 separate answer that can disagree with the verdict, so it only annotates the
 reason and never changes the decision.
 
+`judge.decisions` applies after the floors: an outcome it does not list becomes
+silence, and Claude Code's own flow decides. With `["allow", "deny"]` the judge
+never prompts: an `ask`, and a `deny` below its floor, are both withheld. The
+reason and the log row keep what the judge concluded, with the decision logged
+as `silent`: `jev ask (allow 0.30 / ask 0.62 / deny 0.08); ask withheld by
+judge.decisions; closest rule: soft_deny "..." (0.71)`. It covers the judge
+tier only: `permissions.deny` / `permissions.ask` rules, the static tier and the
+file-tool guardrails are untouched.
+
 Hardcoded on purpose: the 0.75 confidence floor on `allow` (measured
 authority-claim injections drag confidence to ~0.68), the 0.50 floor under
 `deny` (an uncertain deny costs one prompt, not a hard block), the 0.50 floor
@@ -148,9 +161,10 @@ A malformed config makes the hook stay silent for the whole session, so
 `frisk validate` loads it with the hook's own loader and prints `error:`,
 `warning:` and `info:` lines (exit 1 only on errors): parse failures, empty or
 bad-glob rules, empty `Edit()` patterns, bare `*` in deny/ask, whether each
-judge list is unset, extends (`$defaults`) or replaces the builtins, and
-whether `jev.keyCmd` runs - never printing any part of the key. No network
-unless `--live`, which makes one real judge call for `true`.
+judge list is unset, extends (`$defaults`) or replaces the builtins, the
+effective `judge.decisions`, and whether `jev.keyCmd` runs - never printing any
+part of the key. No network unless `--live`, which makes one real judge call
+for `true`.
 
 ## Provenance
 

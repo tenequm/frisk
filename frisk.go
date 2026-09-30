@@ -326,6 +326,17 @@ type judgeConfig struct {
 	Allow       []string `json:"allow"`
 	SoftDeny    []string `json:"soft_deny"`
 	HardDeny    []string `json:"hard_deny"`
+	Decisions   []string `json:"decisions"`
+}
+
+// judgeDecisions is what the judge may issue when judge.decisions is unset.
+var judgeDecisions = []string{decisionAllow, decisionAsk, decisionDeny}
+
+func (j judgeConfig) decisions() []string {
+	if j.Decisions == nil {
+		return judgeDecisions
+	}
+	return j.Decisions
 }
 
 type jevConfig struct {
@@ -1214,7 +1225,13 @@ func judge(cfg *config, command, cwd string, segments [][]string, lg *slog.Logge
 		}
 	default:
 	}
-	v.Reason = joinReason(head, rule, probe.Missed)
+	// A decision judge.decisions leaves out is silence, so Claude Code's own
+	// flow decides; the reason keeps it so the log can still count them.
+	withheld := ""
+	if v.Decision != "" && !slices.Contains(cfg.Judge.decisions(), v.Decision) {
+		v.Decision, withheld = "", v.Decision+" withheld by judge.decisions"
+	}
+	v.Reason = joinReason(head, withheld, rule, probe.Missed)
 	return v
 }
 
@@ -1868,8 +1885,14 @@ func loadConfig() (*config, error) {
 	if err := dec.Decode(cfg); err != nil {
 		return cfg, fmt.Errorf("parsing %s: %w", path, err)
 	}
+	unknown := func(d string) bool { return !slices.Contains(judgeDecisions, d) }
+	if d := cfg.Judge.Decisions; d != nil && (len(d) == 0 || slices.ContainsFunc(d, unknown)) {
+		return cfg, fmt.Errorf("%s: judge.decisions %q: %w", path, d, errJudgeDecisions)
+	}
 	return cfg, nil
 }
+
+var errJudgeDecisions = errors.New("want a non-empty list drawn from allow, ask, deny")
 
 func configPath() string {
 	return filepath.Join(configDir(), "frisk", "config.json")
@@ -2069,6 +2092,7 @@ func runValidate(cfg *config, cfgErr error, args []string, stdout io.Writer, lg 
 	} {
 		report("info", "judge.%s: %s", l.name, listState(l.items))
 	}
+	report("info", "judge.decisions: %s", strings.Join(cfg.Judge.decisions(), ", "))
 
 	if keyOK := checkJev(report, cfg); keyOK && live {
 		liveJudge(report, cfg, lg)

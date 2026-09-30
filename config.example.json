@@ -8,7 +8,8 @@
     "environment": ["$defaults", "Hosts under *.internal.example.com are the user's own machines"],
     "allow": ["$defaults"],
     "soft_deny": ["$defaults", "Modifying local tool state outside the project"],
-    "hard_deny": ["$defaults"]
+    "hard_deny": ["$defaults"],
+    "decisions": ["allow", "ask", "deny"]
   },
   "jev": {
     "model": "jev-1.13.0",
