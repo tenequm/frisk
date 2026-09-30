@@ -1,6 +1,7 @@
 {
   "permissions": {
     "allow": [
+      "Edit(/tmp/**)", "Edit(/private/tmp/**)",
       "awk *", "basename *", "cat *", "cd *", "cloc *", "column *", "comm *", "cut *",
       "date *", "df *", "diff *", "dig *", "dirname *", "du *", "dust *",
       "echo *", "false", "fd *", "file *", "find *", "grep *", "head *",

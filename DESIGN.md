@@ -28,8 +28,8 @@ parse into pipeline segments (|, &&, ||, ;, newline)
    and trips no screen (core ships no rules; bails on
     $(), backticks, (), heredocs, &, # comments, brace
     lists, variables the command does not set to a
-    literal, and redirects other than 2>&1 and
-    /dev/null; inside single quotes or escaped, all of
+    literal, and redirects other than stream merges,
+    /dev/null or literal writes covered by Edit rules; inside single quotes or escaped, all of
     these are text) -> "allow"
 4. judge (needs jev.keyCmd): one Choice question
      allow + confidence >= 0.75 -> "allow"
@@ -51,7 +51,7 @@ through; malformed file = silent for the session (logged).
 Core understands commands and config decides about them. Core ships no allow
 list: the static tier allows only what `permissions.allow` lists, and with no
 rule a command passes through to the judge or to silence.
-[config.example.json](config.example.json) carries a read-only starting list.
+[config.example.json](config.example.json) carries a starting list of read commands and temporary-file write scopes.
 What core keeps is the parser and the screens - denied flags, risky arguments,
 program text, credential paths and globs, hijacking environment variables.
 A screen never decides anything: it only stops a rule such as `sed *` from
@@ -410,3 +410,31 @@ tiers, allow-or-silence, decisions log), [Letta jev-auto](https://github.com/let
 
 Open assumption to verify on first live call: the `Authorization: Bearer`
 header shape against the TypeSafe API reference.
+
+## Static loops and redirected writes
+
+The static tier screens and matches every body statement of a literal `for`
+loop for each list value, at most 20. The loop variable resolves only inside
+that body and must have no other writer, and it may not be `IFS`, `HOME` or
+`CDPATH`. Every unrolled statement is read both ways, bash's and zsh's, like
+any other; a list word holding an unquoted value of several words stays
+unsound, since bash loops once per field and zsh once over the whole value.
+Nested loops and loops that change working directory stay unsound. `while` and `until` conditions and bodies use
+ordinary command rules; polling loops need no termination proof. Structural
+`do`, `done`, `then`, `fi` and `else` words run nothing themselves.
+
+Output redirects (`>`, `>>`, `2>`, `&>`) and `tee` or `tee -a` file operands
+need an `Edit(<pattern>)` allow rule matching their cleaned absolute target.
+Relative paths need a known cwd, following literal `cd` statements joined
+with `&&`. A `cd` inside control flow stays unsound. Targets containing a
+`..` component are refused before cleaning, `~/` expanding without cleaning,
+and a `~` left quoted is refused. A redirect ahead of the verb, and one on a
+command word zsh cannot find, stay unsound. Credential
+paths, `.claude`, `.git`, `.githooks`, `.husky` and `.env*` components never
+qualify. Target and ancestor symlinks, nonregular targets and shell network pseudo-paths
+are refused. On macOS, the system `/tmp`
+alias is checked as `/private/tmp`; the example config includes both scopes.
+Input redirects other than the existing `/dev/null` exception, here-strings,
+process substitution, clobber redirects and additional descriptor duplications
+stay unsound. These rules grant no command permission: the command still needs
+its own Bash allow rule.
