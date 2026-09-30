@@ -309,6 +309,16 @@ var wrappers = map[string]wrapperSpec{
 	verbUVRun: uvRunSpec,
 }
 
+// privilegeSpec covers sudo and doas, which unwrap leaves alone. Only a
+// heredoc owner is seen through them, where who runs the shell changes nothing.
+var privilegeSpec = wrapperSpec{
+	valueFlags: []string{
+		"-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt", "-C", "--close-from",
+		"-T", "--command-timeout", "-r", "--role", "-t", "--type", "-U", "--other-user", "-a", "-c",
+	},
+	blindFlags: []string{"-D", "--chdir", "-R", "--chroot"},
+}
+
 // Probe statuses reach the judge as trusted state, outside `untrusted`.
 const (
 	probeAttached     = "attached"
@@ -753,9 +763,14 @@ func (p *parsedCommand) heredocBodies(docs []heredoc, s string) string {
 			}
 			rest = after
 		}
+		// The shell that reads the body may sit further down the owner's
+		// pipeline, as in "cat <<EOF | bash".
+		data := true
+		for j := d.owner; j < owners && (j == d.owner || p.stmts[j].sep == "|"); j++ {
+			data = data && !shellReadsStdin(p.stmts[j].tokens())
+		}
 		// Tokenized apart, so a stray quote in the body cannot swallow the
 		// commands after it, and kept so deny and ask rules still see it.
-		data := d.owner >= owners || !shellReadsStdin(p.stmts[d.owner].tokens())
 		for _, st := range tokenize(body).stmts {
 			st.data = st.data || data
 			p.stmts = append(p.stmts, st)
@@ -768,6 +783,11 @@ func (p *parsedCommand) heredocBodies(docs []heredoc, s string) string {
 // from stdin, which makes a heredoc fed to it commands rather than text.
 func shellReadsStdin(seg []string) bool {
 	inner, _, err := unwrap(seg)
+	for err == nil && len(inner) > 0 && (inner[0] == "sudo" || inner[0] == "doas") {
+		if inner, err = wrapperCommand(inner[0], privilegeSpec, inner[1:]); err == nil {
+			inner, _, err = unwrap(inner)
+		}
+	}
 	if err != nil || len(inner) == 0 {
 		return false
 	}
