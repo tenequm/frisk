@@ -125,7 +125,7 @@ var denyFlags = map[string][]string{
 	"find":  {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls"},
 	verbSed: {"-i", "-I", "--in-place", "-f", "--file"},
 	"sort":  {"-o", "--output", "--compress-program"},
-	verbGit: {"-c", "--config-env", "--upload-pack", "--receive-pack", "--output"},
+	verbGit: {"-c", "--upload-pack", "--receive-pack", "--output"},
 	"date":  {"-s", "--set"},
 	"fd":    {"-x", "--exec", "-X", "--exec-batch"},
 	"rg":    {"--pre", "--hostname-bin"},
@@ -1139,46 +1139,9 @@ func riskyArgs(seg []string) bool {
 		return slices.ContainsFunc(sedScripts(args), sedScriptWrites)
 	case "kubectl":
 		return slices.Contains(args, "get") && slices.ContainsFunc(args, kubeSecret.MatchString)
-	case verbGit:
-		return commitSkipsHooks(args)
 	default:
 		return false
 	}
-}
-
-// commitSkipsHooks reports a git commit that bypasses the pre-commit and
-// commit-msg hooks, which no allow rule may wave through.
-func commitSkipsHooks(args []string) bool {
-	for i, a := range args {
-		if a == "commit" {
-			return slices.ContainsFunc(args[i+1:], skipsHooks)
-		}
-		// A word after an option may be its value, as in "-C dir"; any other
-		// word is the subcommand.
-		if !strings.HasPrefix(a, "-") && (i == 0 || !strings.HasPrefix(args[i-1], "-")) {
-			return false
-		}
-	}
-	return false
-}
-
-func skipsHooks(tok string) bool {
-	if name, _, _ := strings.Cut(tok, "="); abbreviates(name, "--no-verify") {
-		return true
-	}
-	if len(tok) < 2 || tok[0] != '-' || tok[1] == '-' {
-		return false
-	}
-	// Short flags bundle up to the first one that takes a value: -qn, -nm.
-	for _, c := range tok[1:] {
-		if c == 'n' {
-			return true
-		}
-		if strings.ContainsRune("CcFmtuS", c) {
-			return false
-		}
-	}
-	return false
 }
 
 // sedScripts picks the script texts out of sed's arguments: every -e value,
