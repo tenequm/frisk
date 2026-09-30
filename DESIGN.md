@@ -87,7 +87,7 @@ construct only where the shell reads it as one: `rg "=>" src` and
 quotes do not stop a substitution. A verb that takes program text reads those
 characters its own way, so its screen has to: awk's covers `>`, `>>`, `<` and
 `@load` besides `system`, pipes and `ENVIRON`; sed's script walker covers `w`
-and `e`; jq and yq have no file or command operators. Heredocs stay unsound
+and `e`; jq's module operators and yq's load operators read other files. Heredocs stay unsound
 whoever reads them.
 
 A statement that is only assignments (`S=/tmp/x; cat $S/f`) runs nothing and
