@@ -200,8 +200,11 @@ var credentialPath = regexp.MustCompile(
 // credentialGlob screens unquoted glob and brace tokens, which credentialPath
 // sees unexpanded. Globs skip dotfiles unless a component starts with a
 // literal ".", so that shape covers every hidden credential directory.
+// ~/.cargo is mostly crate sources: only a glob in the entry right under it, a
+// brace alternative or a ".." can land on its credentials file.
 var credentialGlob = regexp.MustCompile(
-	`(?i)(^|/)\.[^/]*[*?[{]|\.ss|id_|\.aws|\.gnupg|gopass|\.pem|\.key|netrc|keychain|\.kube|\.docker|\.cargo|\.config/gh|credentials`,
+	`(?i)(^|/)\.[^/]*[*?[{]|\.ss|id_|\.aws|\.gnupg|gopass|\.pem|\.key|netrc|keychain|\.kube|\.docker|\.config/gh|credentials` +
+		`|\.cargo(/[^/]*[*?[{]|/(.*/)?\.\.(/|$)|[,}])`,
 )
 
 const secretWords = `SECRET|TOKEN|KEY|PASS|AUTH|CRED|COOKIE|SESSION|DSN|DATABASE_URL`
