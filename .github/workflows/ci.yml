@@ -62,23 +62,23 @@ jobs:
           args: check --config ops/config/goreleaser.yaml
 
   # Runs only on push to main, and only after the gate is green. release-please
-  # maintains the release PR; merging it cuts the tag + GitHub release, and the
-  # gated steps then publish GoReleaser binaries + the Homebrew cask in this
-  # same run - no PAT-triggered tag handoff.
+  # maintains the release PR and never tags. Merging that PR bumps the manifest;
+  # this job then builds, signs and notarizes every artifact first, and the tag
+  # and the GitHub release exist only once GoReleaser publishes them. A failure
+  # before that point leaves no tag, no release and no cask.
   release:
     needs: build-and-test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
-      contents: write # tag + release, GoReleaser upload
-      pull-requests: write # release-please PR
+      contents: write # GoReleaser creates the release, and with it the tag
+      pull-requests: write # release-please PR, release label swap
     concurrency:
       group: release-${{ github.ref }}
       cancel-in-progress: false
     steps:
       # release-please-action is API-driven and needs no checkout.
       - uses: googleapis/release-please-action@v5
-        id: rp
         with:
           # A PAT authors the release PR as a real user so its CI runs without the
           # github-actions[bot] approval gate; falls back to GITHUB_TOKEN if the
@@ -86,25 +86,62 @@ jobs:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           config-file: .github/release-please-config.json
           manifest-file: .github/.release-please-manifest.json
+          # PR only. Left on, release-please tags and publishes the release the
+          # moment the release PR merges, before anything is built.
+          skip-github-release: true
 
-      # Everything below runs only when merging the release PR actually cut a
-      # release (release_created == true).
       - uses: actions/checkout@v7
-        if: steps.rp.outputs.release_created == 'true'
         with:
-          fetch-depth: 0 # GoReleaser needs full history + the new tag
+          fetch-depth: 0 # every tag, for the check below and for git-cliff
+
+      # A release is due when main's manifest names a version that has no tag:
+      # the release PR bumped it and nothing has published it yet. A failed
+      # publish leaves it untagged, so re-running this job - or the next push to
+      # main - tries again.
+      - name: Release due
+        id: due
+        run: |
+          version=$(jq -r '.["."]' .github/.release-please-manifest.json)
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "v$version is already released"
+          else
+            echo "version=$version" >> "$GITHUB_OUTPUT"
+          fi
 
       - uses: actions/setup-go@v7
-        if: steps.rp.outputs.release_created == 'true'
+        if: steps.due.outputs.version != ''
         with:
           go-version-file: go.mod
           cache-dependency-path: go.mod
 
+      # The tag exists only in this checkout. GoReleaser needs one at HEAD to
+      # name the version, `go build` stamps it into the binary and git-cliff
+      # reads it - but nothing pushes it. The notes are rendered before the
+      # build so a failure here, a network blip fetching git-cliff included,
+      # stops the job with nothing published.
+      - name: Tag locally and render the release notes
+        if: steps.due.outputs.version != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.due.outputs.version }}
+        run: |
+          git tag "v$VERSION"
+          ./ops/scripts/install-git-cliff.sh
+          # --latest, not --current: --current renders only when HEAD is itself
+          # the tagged commit, and would silently produce an empty body the first
+          # time that stopped being true.
+          git-cliff --config .github/cliff.toml --strip header --latest > "$RUNNER_TEMP/notes.md"
+          [ -s "$RUNNER_TEMP/notes.md" ] || { echo "git-cliff rendered an empty release body for v$VERSION" >&2; exit 1; }
+
+      # Every artifact is built, signed and notarized before GoReleaser's publish
+      # phase. That phase creates the GitHub release as a draft, uploads the
+      # artifacts and publishes it, which is when GitHub creates the tag
+      # (`release.target_commitish` in the config). The cask goes to the tap last.
       - uses: goreleaser/goreleaser-action@v7
-        if: steps.rp.outputs.release_created == 'true'
+        if: steps.due.outputs.version != ''
         with:
           version: "~> v2"
-          args: release --clean --config ops/config/goreleaser.yaml
+          args: release --clean --config ops/config/goreleaser.yaml --release-notes ${{ runner.temp }}/notes.md
         env:
           GITHUB_TOKEN: ${{ github.token }}
           # Push the Homebrew cask to the separate tap repo.
@@ -117,31 +154,19 @@ jobs:
           APPLE_ASC_KEY_ID: ${{ secrets.APPLE_ASC_KEY_ID }}
           APPLE_ASC_ISSUER_ID: ${{ secrets.APPLE_ASC_ISSUER_ID }}
 
-      # LAST, and non-fatal. release-please runs with skip-changelog, so the
-      # release it just opened has no body yet; git-cliff renders the same entry
-      # it writes to CHANGELOG.md, and GoReleaser (`mode: append`,
-      # `changelog.disable`) leaves it alone.
-      #
-      # Ordering is load-bearing. Before GoReleaser and fatal, a transient
-      # failure here - a network blip fetching git-cliff is enough - fails this
-      # job, so GoReleaser never runs, leaving a tagged release with no binaries
-      # and no cask. The cost of continue-on-error is a green run with a thin
-      # release body, which one `gh release edit` repairs; the alternative costs
-      # a re-run of the whole publish.
-      - name: Release body
-        if: steps.rp.outputs.release_created == 'true'
-        continue-on-error: true
+      # release-please did not tag this release, so it leaves the merged release
+      # PR labelled `autorelease: pending` - and opens no further release PR
+      # while one is outstanding.
+      - name: Mark the release PR as tagged
+        if: steps.due.outputs.version != ''
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.rp.outputs.tag_name }}
+          REPO: ${{ github.repository }}
         run: |
-          ./ops/scripts/install-git-cliff.sh
-          # --latest, not --current: --current renders only when HEAD is itself
-          # the tagged commit, and would silently produce an empty body the first
-          # time that stopped being true.
-          git-cliff --config .github/cliff.toml --strip header --latest > "$RUNNER_TEMP/notes.md"
-          [ -s "$RUNNER_TEMP/notes.md" ] || { echo "git-cliff rendered an empty release body for $TAG" >&2; exit 1; }
-          gh release edit "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
+          gh pr list --repo "$REPO" --state merged --label 'autorelease: pending' --json number -q '.[].number' |
+            while read -r pr; do
+              gh pr edit "$pr" --repo "$REPO" --remove-label 'autorelease: pending' --add-label 'autorelease: tagged'
+            done
 
   # git-cliff owns CHANGELOG.md; release-please runs with skip-changelog and never
   # writes it. This regenerates the file onto the release PR's own branch on every
