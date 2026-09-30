@@ -1521,12 +1521,12 @@ func normalizeGitRule(rule string, tokens []string, allow ...bool) (string, []st
 	required, rest, pok := gitRuleArgs(g.subcommand, pattern[2:])
 	if !ok || !pok {
 		// Flags this matcher cannot place, such as "status -sb", keep the
-		// positional reading rules had before; an allow then also needs the
-		// record to show nothing a rule would have to name.
+		// positional reading rules had before, global options aside; an allow
+		// then also needs the record to show nothing a rule would have to name.
 		if allowing && (g.forced || g.deletesRef || g.noVerify || g.amend || g.hard) {
 			return "", nil, false
 		}
-		return rule, tokens, true
+		return rule, append([]string{verbGit, g.subcommand}, g.words...), true
 	}
 	if allowing {
 		for _, flag := range []string{flagForce, flagDelete, flagNoVerify, "--amend", flagUpstream, "--hard", flagExec, "-D", "-M", flagMirror, flagPrune} {
