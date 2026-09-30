@@ -205,6 +205,17 @@ func TestBareRulesAndFileRulesStaySeparate(t *testing.T) {
 	}
 }
 
+func TestVersionPrintsOneLine(t *testing.T) {
+	newHookEnv(t, "")
+	for _, arg := range []string{"version", "--version", "-V"} {
+		var out strings.Builder
+		code := run([]string{arg}, strings.NewReader(""), &out)
+		if code != 0 || strings.TrimSpace(out.String()) == "" || strings.Count(out.String(), "\n") != 1 {
+			t.Fatalf("%s: code = %d, out = %q", arg, code, out.String())
+		}
+	}
+}
+
 func validateOutput(t *testing.T, cfg string, args ...string) (string, int) {
 	t.Helper()
 	newHookEnv(t, cfg)
@@ -838,6 +849,17 @@ func gitRepo(t *testing.T) string {
 	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
 	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 	t.Setenv("GIT_CEILING_DIRECTORIES", root)
+	// A git hook exports GIT_DIR and friends. Inherited, they aim every git call
+	// below at the real repository: init flips it to bare and commit lands on it.
+	for _, v := range []string{
+		"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_PREFIX",
+		"GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+	} {
+		t.Setenv(v, "") // registers the restore; git reads an empty GIT_DIR as set
+		if err := os.Unsetenv(v); err != nil {
+			t.Fatal(err)
+		}
+	}
 	repo := filepath.Join(root, "repo")
 	steps := [][]string{
 		{"init", "-q", "-b", "main", repo},

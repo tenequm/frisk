@@ -1,5 +1,7 @@
 /frisk
 coverage.out
+# GoReleaser output; untracked it would stamp release builds as +dirty
+/dist/
 .claude/skills/
 .agents/skills/
 /ops/classifier-data/classifier.duckdb

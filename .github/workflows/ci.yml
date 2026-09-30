@@ -1,0 +1,260 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only by default; the release jobs elevate for their own publishing.
+permissions:
+  contents: read
+
+# Concurrency is per-job, not workflow-level: a build stays cancellable, but the
+# release job must never be cancelled mid-publish.
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: build-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          # Stdlib only, so there is no go.sum: without this setup-go's cache
+          # silently turns itself off (a warning, not a failure).
+          cache-dependency-path: go.mod
+
+      # go.mod must already be tidy - lefthook's mod-tidy hook only fires on
+      # staged module files, so a drift can slip in from an unrelated commit.
+      - name: Tidy check
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.13
+
+      - name: No check may rewrite the tree
+        run: git diff --exit-code
+
+      - name: Test
+        run: |
+          go install gotest.tools/gotestsum@v1.13.0
+          gotestsum --format github-actions -- -race -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Vuln
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+          govulncheck ./...
+
+      # The GoReleaser config is otherwise first exercised inside the publish
+      # run, after the tag is cut - a config error there leaves a tagged
+      # release with no binaries and no cask.
+      - name: GoReleaser config check
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          args: check --config ops/config/goreleaser.yaml
+
+  # Runs only on push to main, and only after the gate is green. release-please
+  # maintains the release PR; merging it cuts the tag + GitHub release, and the
+  # gated steps then publish GoReleaser binaries + the Homebrew cask in this
+  # same run - no PAT-triggered tag handoff.
+  release:
+    needs: build-and-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # tag + release, GoReleaser upload
+      pull-requests: write # release-please PR
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      # release-please-action is API-driven and needs no checkout.
+      - uses: googleapis/release-please-action@v5
+        id: rp
+        with:
+          # A PAT authors the release PR as a real user so its CI runs without the
+          # github-actions[bot] approval gate; falls back to GITHUB_TOKEN if the
+          # secret is absent (the PR still opens, but its checks need manual approval).
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          config-file: .github/release-please-config.json
+          manifest-file: .github/.release-please-manifest.json
+
+      # Everything below runs only when merging the release PR actually cut a
+      # release (release_created == true).
+      - uses: actions/checkout@v7
+        if: steps.rp.outputs.release_created == 'true'
+        with:
+          fetch-depth: 0 # GoReleaser needs full history + the new tag
+
+      - uses: actions/setup-go@v7
+        if: steps.rp.outputs.release_created == 'true'
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.mod
+
+      - uses: goreleaser/goreleaser-action@v7
+        if: steps.rp.outputs.release_created == 'true'
+        with:
+          version: "~> v2"
+          args: release --clean --config ops/config/goreleaser.yaml
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          # Push the Homebrew cask to the separate tap repo.
+          GH_RELEASE_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+          # Developer ID sign + notarize the darwin binaries (goreleaser skips
+          # signing while they are unpopulated).
+          APPLE_P12_BASE64: ${{ secrets.APPLE_P12_BASE64 }}
+          APPLE_P12_PASSWORD: ${{ secrets.APPLE_P12_PASSWORD }}
+          APPLE_ASC_KEY_P8: ${{ secrets.APPLE_ASC_KEY_P8 }}
+          APPLE_ASC_KEY_ID: ${{ secrets.APPLE_ASC_KEY_ID }}
+          APPLE_ASC_ISSUER_ID: ${{ secrets.APPLE_ASC_ISSUER_ID }}
+
+      # LAST, and non-fatal. release-please runs with skip-changelog, so the
+      # release it just opened has no body yet; git-cliff renders the same entry
+      # it writes to CHANGELOG.md, and GoReleaser (`mode: append`,
+      # `changelog.disable`) leaves it alone.
+      #
+      # Ordering is load-bearing. Before GoReleaser and fatal, a transient
+      # failure here - a network blip fetching git-cliff is enough - fails this
+      # job, so GoReleaser never runs, leaving a tagged release with no binaries
+      # and no cask. The cost of continue-on-error is a green run with a thin
+      # release body, which one `gh release edit` repairs; the alternative costs
+      # a re-run of the whole publish.
+      - name: Release body
+        if: steps.rp.outputs.release_created == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.rp.outputs.tag_name }}
+        run: |
+          ./ops/scripts/install-git-cliff.sh
+          # --latest, not --current: --current renders only when HEAD is itself
+          # the tagged commit, and would silently produce an empty body the first
+          # time that stopped being true.
+          git-cliff --config .github/cliff.toml --strip header --latest > "$RUNNER_TEMP/notes.md"
+          [ -s "$RUNNER_TEMP/notes.md" ] || { echo "git-cliff rendered an empty release body for $TAG" >&2; exit 1; }
+          gh release edit "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
+
+  # git-cliff owns CHANGELOG.md; release-please runs with skip-changelog and never
+  # writes it. This regenerates the file onto the release PR's own branch on every
+  # refresh, so the PR's diff shows exactly what the changelog will say, and posts
+  # the same entry as a sticky comment.
+  #
+  # The WHOLE file is regenerated rather than prepended to, which makes the output
+  # a pure function of the commits: a re-run that would change nothing commits
+  # nothing, and a release-please force-update of the branch (github.ts,
+  # `force: true`) is simply followed rather than fought.
+  #
+  # The PR *description* is deliberately untouched. release-please parses the
+  # merged body to decide what to release (strategies/base.ts); a body it cannot
+  # parse means no tag and no release, logged at error level and otherwise silent.
+  release-changelog:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      # The release PR is found by looking for it, NOT from release-please's `pr`
+      # output. That output is set only when release-please creates or UPDATES a
+      # PR, and under skip-changelog the file it writes (the manifest) usually
+      # does not change between pushes - so it reports "no code changes
+      # detected", emits nothing, and this job would skip while main moved on.
+      - name: Find the release PR
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          pr=$(gh pr list --repo "$REPO" --state open --json number,headRefName \
+            -q '[.[] | select(.headRefName | startswith("release-please--"))][0]')
+          [ -n "$pr" ] && [ "$pr" != "null" ] || { echo "no open release PR"; exit 0; }
+          echo "branch=$(printf '%s' "$pr" | jq -r .headRefName)" >> "$GITHUB_OUTPUT"
+          echo "number=$(printf '%s' "$pr" | jq -r .number)" >> "$GITHUB_OUTPUT"
+
+      # Checked out at MAIN, not at the release branch. release-please only
+      # rebuilds its branch when the files IT writes change, so between version
+      # bumps that branch keeps the base it was cut from - an older main, with an
+      # older .github/cliff.toml. Generating there reproduces the format of that
+      # snapshot and omits every commit landed since: a stale changelog, and a
+      # CHANGELOG.md conflict against main. Generating from main and writing the
+      # result onto the branch keeps the file a function of main's history and
+      # main's template, whatever base the branch happens to have.
+      - uses: actions/checkout@v7
+        if: steps.find.outputs.branch != ''
+        with:
+          fetch-depth: 0
+      - name: Write the changelog
+        if: steps.find.outputs.branch != ''
+        env:
+          # The PAT release-please itself uses, because it authors the signed
+          # commit below. Written with github.token the actor is
+          # github-actions[bot], which the repo's contributor-approval policy
+          # gates - so every run on the release PR would sit at "2 workflows
+          # awaiting approval" until someone clicked. Writing as the same real
+          # user that authors the release commit keeps its checks running
+          # unattended, which is the whole reason that secret exists.
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
+          BRANCH: ${{ steps.find.outputs.branch }}
+          RP_TOKEN_SET: ${{ secrets.RELEASE_PLEASE_TOKEN != '' }}
+        run: |
+          # The fallback above is silent by design, and its symptom - a release PR
+          # whose checks sit unapproved, with nothing red - reads as a mystery.
+          # Say so here, so an expired PAT explains itself in the run.
+          if [ "$RP_TOKEN_SET" != "true" ]; then
+            echo "::warning::RELEASE_PLEASE_TOKEN is unset, so this commits as github-actions[bot] and the release PR's checks will need manual approval"
+          fi
+          ./ops/scripts/install-git-cliff.sh
+          git fetch -q origin "$BRANCH"
+          # The pending version lives on the release branch; main's manifest still
+          # names the last released one.
+          version=$(git show "origin/$BRANCH:.github/.release-please-manifest.json" | jq -r '.["."]')
+          git-cliff --config .github/cliff.toml --tag "v$version" -o "$RUNNER_TEMP/CHANGELOG.md"
+          git-cliff --config .github/cliff.toml --unreleased --tag "v$version" --strip header \
+            > "$RUNNER_TEMP/entry.md"
+          # Not a git push: main requires signed commits, which the release PR's
+          # commits must be too - see the script. main's copy of it, since the
+          # release branch's base can predate it. A retry follows a release-please
+          # force-push that landed mid-rebuild.
+          cp ops/scripts/sign-release-branch.sh "$RUNNER_TEMP/"
+          for i in 1 2 3; do
+            git fetch -q origin main "$BRANCH"
+            git checkout -q -f -B rp-local "origin/$BRANCH"
+            cp "$RUNNER_TEMP/CHANGELOG.md" CHANGELOG.md
+            "$RUNNER_TEMP/sign-release-branch.sh" "$BRANCH" && exit 0
+            sleep "$i"
+          done
+          echo "could not write the signed release commit after 3 attempts" >&2
+          exit 1
+
+      # A comment, never the description - see the note on this job. It shows the
+      # entry as it will read without opening the diff, and was rendered above
+      # while the tree was still main's.
+      - name: Comment the pending entry
+        if: steps.find.outputs.branch != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.find.outputs.number }}
+        run: |
+          {
+            echo '<!-- changelog-preview -->'
+            echo '### Changelog for the pending release'
+            echo
+            cat "$RUNNER_TEMP/entry.md"
+          } > "$RUNNER_TEMP/preview.md"
+          existing=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            -q '.[] | select(.body | startswith("<!-- changelog-preview -->")) | .id' 2>/dev/null | head -1 || true)
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$existing" -F body=@"$RUNNER_TEMP/preview.md" >/dev/null
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -F body=@"$RUNNER_TEMP/preview.md" >/dev/null
+          fi

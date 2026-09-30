@@ -24,6 +24,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -371,6 +372,12 @@ func main() {
 }
 
 func run(args []string, stdin io.Reader, stdout io.Writer) int {
+	// Global flags are answered before config or the log are touched.
+	if len(args) > 0 && slices.Contains([]string{"--version", "-V", "version"}, args[0]) {
+		fmt.Fprintln(stdout, buildVersion())
+		return 0
+	}
+
 	lg := newLogger()
 	cfg, cfgErr := loadConfig()
 	if cfgErr != nil {
@@ -378,7 +385,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer) int {
 	}
 
 	if len(args) == 0 {
-		fmt.Fprintln(stdout, "usage: frisk hook|check|validate <command>")
+		fmt.Fprintln(stdout, "usage: frisk [--version|-V] hook|check|validate|version")
 		return 2
 	}
 
@@ -394,9 +401,19 @@ func run(args []string, stdin io.Reader, stdout io.Writer) int {
 	case "validate":
 		return runValidate(cfg, cfgErr, args[1:], stdout, lg)
 	default:
-		fmt.Fprintln(stdout, "usage: frisk hook|check|validate <command>")
+		fmt.Fprintln(stdout, "usage: frisk [--version|-V] hook|check|validate|version")
 		return 2
 	}
+}
+
+// buildVersion is what `go build` stamped from the VCS tag, so release and
+// `go install` builds agree without an -X ldflag.
+func buildVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok || info.Main.Version == "" {
+		return "unknown"
+	}
+	return info.Main.Version
 }
 
 func runHook(cfg *config, cfgErr error, stdin io.Reader, stdout io.Writer, lg *slog.Logger) int {

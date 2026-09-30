@@ -18,11 +18,12 @@ pre-commit:
     mod-tidy:
       glob: "*.{go,mod,sum}"
       run: go mod tidy
-
-pre-push:
-  commands:
-    test:
-      run: go test -race ./...
+    # Workflow YAML is only exercised by pushing it, so a typo in an expression
+    # or a shell block is found by a failed run on main. actionlint shellchecks
+    # every `run:` block too, which is where this repo's workflow logic lives.
+    actions:
+      glob: ".github/workflows/*.{yml,yaml}"
+      run: actionlint {staged_files}
 
 post-checkout:
   commands:
