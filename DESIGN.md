@@ -120,6 +120,18 @@ answers. An auto-approver without a record is a rumour.
 
 Uninstall = remove the hook entry.
 
+## File tools
+
+`Edit`, `Write` and `NotebookEdit` are gated by deterministic path checks only,
+no judge. `Edit(<path-pattern>)` rules in `permissions.deny/ask/allow` apply to
+all three; bare rules stay Bash-only and `Edit(...)` rules never match a Bash
+segment. Patterns: `~/` expands to home, a trailing `/**` is the directory and
+everything under it, otherwise `filepath.Match` on the cleaned absolute path.
+Builtin guardrail paths (frisk's own config dir, the frisk binary,
+`~/.claude/settings*.json`, `~/.claude/hooks`) ask, checked raw and
+symlink-resolved. Precedence: config deny > config ask > guardrail ask > config
+allow > silence; there are no builtin allows for file tools.
+
 ## Provenance
 
 Distilled from [jevgate](https://github.com/thevibeworks/jevgate) (code-first

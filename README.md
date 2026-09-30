@@ -12,3 +12,5 @@ frisk check 'git status | head'
 ```
 
 Register `frisk hook` as a `PreToolUse` hook with matcher `Bash`. Design: [DESIGN.md](DESIGN.md).
+
+To gate file edits too, use matcher `Bash|Edit|Write|NotebookEdit` and write `Edit(<path-pattern>)` rules in `permissions.*`; frisk's own config and Claude Code's settings and hooks always ask.

@@ -63,6 +63,148 @@ func TestParseCommand(t *testing.T) {
 	}
 }
 
+type hookEnv struct {
+	home, cfgDir string
+}
+
+// newHookEnv points HOME and XDG_CONFIG_HOME at temp dirs and writes the
+// config; tests using it cannot run in parallel.
+func newHookEnv(t *testing.T, cfg string) hookEnv {
+	t.Helper()
+	e := hookEnv{home: t.TempDir(), cfgDir: t.TempDir()}
+	t.Setenv("HOME", e.home)
+	t.Setenv("XDG_CONFIG_HOME", e.cfgDir)
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	if cfg != "" {
+		if err := os.MkdirAll(filepath.Join(e.cfgDir, "frisk"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(e.cfgDir, "frisk", "config.json"), []byte(cfg), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return e
+}
+
+func hookDecision(t *testing.T, tool, key, target, cwd string) string {
+	t.Helper()
+	in, err := json.Marshal(map[string]any{
+		"tool_name": tool, "tool_input": map[string]string{key: target}, "cwd": cwd,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out strings.Builder
+	if code := run([]string{"hook"}, strings.NewReader(string(in)), &out); code != 0 {
+		t.Fatalf("exit = %d", code)
+	}
+	if out.String() == "" {
+		return ""
+	}
+	var resp map[string]map[string]string
+	if err := json.Unmarshal([]byte(out.String()), &resp); err != nil {
+		t.Fatalf("output not JSON: %v: %s", err, out.String())
+	}
+	return resp["hookSpecificOutput"]["permissionDecision"]
+}
+
+func TestFileToolGuardrails(t *testing.T) {
+	e := newHookEnv(t, "")
+	cfgFile := filepath.Join(e.cfgDir, "frisk", "config.json")
+	settings := filepath.Join(e.home, ".claude", "settings.json")
+	hook := filepath.Join(e.home, ".claude", "hooks", "gate.sh")
+	tests := []struct{ name, tool, key, path, want string }{
+		{"frisk config", "Write", "file_path", cfgFile, decisionAsk},
+		{"claude settings", "Edit", "file_path", settings, decisionAsk},
+		{"claude local settings", "Edit", "file_path", filepath.Join(e.home, ".claude", "settings.local.json"), decisionAsk},
+		{"claude hooks dir", "Write", "file_path", hook, decisionAsk},
+		{"notebook via notebook_path", "NotebookEdit", "notebook_path", settings, decisionAsk},
+		{"dotdot cleaned into guardrail", "Edit", "file_path", filepath.Join(e.home, "x", "..", ".claude", "settings.json"), decisionAsk},
+		{"ordinary file", "Edit", "file_path", filepath.Join(e.home, "proj", "main.go"), ""},
+		{"sibling of hooks dir", "Edit", "file_path", filepath.Join(e.home, ".claude", "hooks-old", "a"), ""},
+		{"wrong key is silent", "Edit", "notebook_path", settings, ""},
+	}
+	for _, tt := range tests {
+		if got := hookDecision(t, tt.tool, tt.key, tt.path, e.home); got != tt.want {
+			t.Errorf("%s: decision = %q, want %q", tt.name, got, tt.want)
+		}
+	}
+}
+
+func TestFileToolRelativePathUsesCwd(t *testing.T) {
+	e := newHookEnv(t, "")
+	if got := hookDecision(t, "Edit", "file_path", "settings.json", filepath.Join(e.home, ".claude")); got != decisionAsk {
+		t.Fatalf("relative guardrail path = %q, want ask", got)
+	}
+	if got := hookDecision(t, "Edit", "file_path", "../.claude/settings.json", filepath.Join(e.home, "proj")); got != decisionAsk {
+		t.Fatalf("relative dotdot guardrail path = %q, want ask", got)
+	}
+	if got := hookDecision(t, "Edit", "file_path", "settings.json", e.home); got != "" {
+		t.Fatalf("relative ordinary path = %q, want silence", got)
+	}
+}
+
+func TestFileToolSymlinkToGuardrail(t *testing.T) {
+	e := newHookEnv(t, "")
+	settings := filepath.Join(e.home, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(settings), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(settings, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "innocent.json")
+	if err := os.Symlink(settings, link); err != nil {
+		t.Fatal(err)
+	}
+	if got := hookDecision(t, "Write", "file_path", link, e.home); got != decisionAsk {
+		t.Fatalf("symlink to guardrail = %q, want ask", got)
+	}
+}
+
+func TestFileToolConfigRules(t *testing.T) {
+	cfg := `{"permissions":{
+		"deny":["Edit(~/.claude/**)","Edit(/secrets/*.env)"],
+		"ask":["Edit(/asked/**)"],
+		"allow":["Edit(~/notes/**)","Edit(/a/b/**)","Edit(~/.config/**)"]}}`
+	e := newHookEnv(t, cfg)
+	settings := filepath.Join(e.home, ".claude", "settings.json")
+	tests := []struct{ name, path, want string }{
+		{"deny beats builtin ask", settings, decisionDeny},
+		{"deny glob", "/secrets/prod.env", decisionDeny},
+		{"deny glob does not cross dirs", "/secrets/sub/prod.env", ""},
+		{"ask rule", "/asked/deep/file", decisionAsk},
+		{"tilde expands", filepath.Join(e.home, "notes", "todo.md"), decisionAllow},
+		{"dir itself matches /**", "/a/b", decisionAllow},
+		{"under dir matches /**", "/a/b/c/d", decisionAllow},
+		{"prefix boundary respected", "/a/bc/x", ""},
+		{"allow does not override builtin ask", filepath.Join(e.cfgDir, "frisk", "config.json"), decisionAsk},
+	}
+	for _, tt := range tests {
+		if got := hookDecision(t, "Write", "file_path", tt.path, "/"); got != tt.want {
+			t.Errorf("%s: decision = %q, want %q", tt.name, got, tt.want)
+		}
+	}
+	if got := hookDecision(t, "NotebookEdit", "notebook_path", "/a/b/n.ipynb", "/"); got != decisionAllow {
+		t.Errorf("Edit rules must apply to NotebookEdit, got %q", got)
+	}
+}
+
+func TestBareRulesAndFileRulesStaySeparate(t *testing.T) {
+	bare := []string{"*", "rm *"}
+	if rule := matchFileRules(bare, "/a/x"); rule != "" {
+		t.Fatalf("bare rules matched a file tool: %q", rule)
+	}
+	fileOnly := &config{Permissions: permissionsConfig{
+		Deny: []string{"Edit(/a/**)", "Edit(git status)"}, Ask: []string{"Edit(*)"}, Allow: []string{"Edit(*)"},
+	}}
+	for _, cmd := range []string{"git status", "Edit(/a/x)", "ls /a/x"} {
+		if v := decide(fileOnly, cmd, t.TempDir(), testLogger); v.Decision != "" {
+			t.Errorf("Edit rule matched Bash command %q: %+v", cmd, v)
+		}
+	}
+}
+
 func TestMatchRule(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

@@ -340,7 +340,9 @@ type config struct {
 }
 
 type toolInput struct {
-	Command string `json:"command"`
+	Command      string `json:"command"`
+	FilePath     string `json:"file_path"`
+	NotebookPath string `json:"notebook_path"`
 }
 
 type hookInput struct {
@@ -361,6 +363,7 @@ type verdict struct {
 	Scripts       int    // script bodies sent to the judge
 	AskRule       jevAnswer
 	DenyRule      jevAnswer
+	Tool          string
 }
 
 func main() {
@@ -401,15 +404,22 @@ func runHook(cfg *config, cfgErr error, stdin io.Reader, stdout io.Writer, lg *s
 		return 0
 	}
 	var in hookInput
-	if err := json.Unmarshal(raw, &in); err != nil || in.ToolName != "Bash" || in.ToolInput.Command == "" {
-		return 0
-	}
-	if cfgErr != nil {
+	if err := json.Unmarshal(raw, &in); err != nil || cfgErr != nil {
 		return 0
 	}
 
-	v := decide(cfg, in.ToolInput.Command, in.Cwd, lg)
-	logVerdict(lg, v, in.ToolInput.Command)
+	var v verdict
+	subject := in.ToolInput.Command
+	if target := fileTarget(in); target != "" {
+		subject = target
+		v = decideFile(cfg, target)
+	} else if in.ToolName == "Bash" && subject != "" {
+		v = decide(cfg, subject, in.Cwd, lg)
+	} else {
+		return 0
+	}
+	v.Tool = in.ToolName
+	logVerdict(lg, v, subject)
 	if v.Decision == "" {
 		return 0
 	}
@@ -748,6 +758,9 @@ func sedScriptWrites(script string) bool {
 // Trailing "*" matches any remaining tokens including none; a standalone
 // mid-pattern "*" matches exactly one token; embedded globs match in-token.
 func matchRule(rule string, tokens []string) bool {
+	if _, isFile := fileRulePattern(rule); isFile {
+		return false
+	}
 	ptoks := strings.Fields(rule)
 	for i, pt := range ptoks {
 		if pt == "*" && i == len(ptoks)-1 {
@@ -1541,6 +1554,7 @@ func logVerdict(lg *slog.Logger, v verdict, command string) {
 		"tier", v.Tier,
 		"reason", v.Reason,
 		"command", command,
+		"tool", v.Tool,
 	}
 	if v.Confidence > 0 {
 		attrs = append(attrs, "confidence", v.Confidence)
@@ -1568,4 +1582,123 @@ func logVerdict(lg *slog.Logger, v verdict, command string) {
 		attrs = append(attrs, "deny_rule", v.DenyRule.Choice, "deny_rule_confidence", v.DenyRule.Confidence)
 	}
 	lg.Info("verdict", attrs...)
+}
+
+// fileRulePattern splits an Edit(<path-pattern>) rule, the only rule shape
+// that applies to file tools; bare rules stay Bash-only.
+func fileRulePattern(rule string) (string, bool) {
+	rule = strings.TrimSpace(rule)
+	if !strings.HasPrefix(rule, "Edit(") || !strings.HasSuffix(rule, ")") {
+		return "", false
+	}
+	return strings.TrimSpace(rule[len("Edit(") : len(rule)-1]), true
+}
+
+// fileTarget returns the cleaned absolute path a file-tool call would modify,
+// or "" for any other call.
+func fileTarget(in hookInput) string {
+	var p string
+	switch in.ToolName {
+	case "Edit", "Write":
+		p = in.ToolInput.FilePath
+	case "NotebookEdit":
+		p = in.ToolInput.NotebookPath
+	default:
+		return ""
+	}
+	if p == "" {
+		return ""
+	}
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(in.Cwd, p)
+	}
+	return filepath.Clean(p)
+}
+
+func matchPathPattern(pattern, path string) bool {
+	if pattern == "" {
+		return false
+	}
+	if rest, ok := strings.CutPrefix(pattern, "~/"); ok {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return false
+		}
+		pattern = filepath.Join(home, rest)
+	}
+	if dir, ok := strings.CutSuffix(pattern, "/**"); ok {
+		return path == dir || strings.HasPrefix(path, strings.TrimSuffix(dir, "/")+"/")
+	}
+	ok, err := filepath.Match(pattern, path)
+	return err == nil && ok
+}
+
+func matchFileRules(rules []string, path string) string {
+	for _, rule := range rules {
+		if pattern, isFile := fileRulePattern(rule); isFile && matchPathPattern(pattern, path) {
+			return rule
+		}
+	}
+	return ""
+}
+
+func decideFile(cfg *config, path string) verdict {
+	if rule := matchFileRules(cfg.Permissions.Deny, path); rule != "" {
+		return verdict{Decision: decisionDeny, Tier: "deny-rule", Reason: "matches deny rule: " + rule}
+	}
+	if rule := matchFileRules(cfg.Permissions.Ask, path); rule != "" {
+		return verdict{Decision: decisionAsk, Tier: "ask-rule", Reason: "matches ask rule: " + rule}
+	}
+	if isGuardrailPath(path) {
+		return verdict{Decision: decisionAsk, Tier: "guardrail", Reason: "modifying the agent's own guardrails"}
+	}
+	if rule := matchFileRules(cfg.Permissions.Allow, path); rule != "" {
+		return verdict{Decision: decisionAllow, Tier: "allow-rule", Reason: "matches allow rule: " + rule}
+	}
+	return verdict{Tier: "no-rule", Reason: "no file rule matched"}
+}
+
+type guardrail struct {
+	path  string
+	isDir bool
+}
+
+func guardrails() []guardrail {
+	home, _ := os.UserHomeDir()
+	claude := filepath.Join(home, ".claude")
+	list := []guardrail{
+		{filepath.Join(configDir(), "frisk"), true},
+		{filepath.Join(claude, "settings.json"), false},
+		{filepath.Join(claude, "settings.local.json"), false},
+		{filepath.Join(claude, "hooks"), true},
+	}
+	if exe, err := os.Executable(); err == nil {
+		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+			list = append(list, guardrail{resolved, false})
+		}
+	}
+	return list
+}
+
+// Both sides are compared raw and symlink-resolved so a link pointing at a
+// guardrail is caught and a symlinked HOME or tmp dir cannot hide one.
+func isGuardrailPath(path string) bool {
+	candidates := []string{path}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil && resolved != path {
+		candidates = append(candidates, resolved)
+	}
+	for _, g := range guardrails() {
+		roots := []string{filepath.Clean(g.path)}
+		if resolved, err := filepath.EvalSymlinks(g.path); err == nil && resolved != roots[0] {
+			roots = append(roots, resolved)
+		}
+		for _, root := range roots {
+			for _, c := range candidates {
+				if c == root || (g.isDir && strings.HasPrefix(c, root+string(filepath.Separator))) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
