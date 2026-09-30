@@ -205,6 +205,17 @@ func TestBareRulesAndFileRulesStaySeparate(t *testing.T) {
 	}
 }
 
+func TestVersionPrintsOneLine(t *testing.T) {
+	newHookEnv(t, "")
+	for _, arg := range []string{"version", "--version", "-V"} {
+		var out strings.Builder
+		code := run([]string{arg}, strings.NewReader(""), &out)
+		if code != 0 || strings.TrimSpace(out.String()) == "" || strings.Count(out.String(), "\n") != 1 {
+			t.Fatalf("%s: code = %d, out = %q", arg, code, out.String())
+		}
+	}
+}
+
 func validateOutput(t *testing.T, cfg string, args ...string) (string, int) {
 	t.Helper()
 	newHookEnv(t, cfg)

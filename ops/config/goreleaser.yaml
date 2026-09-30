@@ -1,0 +1,79 @@
+# GoReleaser builds the cross-platform `frisk` binary and publishes it to the
+# GitHub release (created by release-please) plus a Homebrew cask.
+version: 2
+
+project_name: frisk
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: frisk
+    binary: frisk
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    # No -X version flag: `go build` stamps the tag into the build info itself,
+    # which `frisk version` reads - and that covers `go install` builds too.
+    ldflags:
+      - -s -w
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: frisk
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+# Developer ID sign + notarize the darwin binaries (quill, cross-platform, no
+# macOS runner). Runs before archiving, so the tarballs ship signed binaries
+# and the cask needs no quarantine-stripping postflight. The guard keeps
+# releases working until the Apple secrets are populated; empty env vars
+# count as unset. checksums.txt is computed from the signed binaries.
+notarize:
+  macos:
+    - enabled: '{{ isEnvSet "APPLE_P12_BASE64" }}'
+      sign:
+        certificate: "{{ .Env.APPLE_P12_BASE64 }}"
+        password: "{{ .Env.APPLE_P12_PASSWORD }}"
+      notarize:
+        key: "{{ .Env.APPLE_ASC_KEY_P8 }}"
+        key_id: "{{ .Env.APPLE_ASC_KEY_ID }}"
+        issuer_id: "{{ .Env.APPLE_ASC_ISSUER_ID }}"
+        wait: true
+        timeout: 20m
+
+# release-please already created the GitHub release; append the built artifacts.
+release:
+  mode: append
+
+# git-cliff owns CHANGELOG.md and the release body; `release.mode: append` above
+# is what lets GoReleaser add its artifacts below that body without replacing it.
+changelog:
+  disable: true
+
+# A pre-compiled binary is a cask in modern Homebrew (the `brews` formula section
+# is deprecated). GH_RELEASE_TOKEN can push to the separate tap repo.
+homebrew_casks:
+  - name: frisk
+    binaries:
+      - frisk
+    homepage: https://github.com/tenequm/frisk
+    description: Claude Code PreToolUse hook that gates Bash commands
+    repository:
+      owner: tenequm
+      name: homebrew-tap
+      token: "{{ .Env.GH_RELEASE_TOKEN }}"
+    # No flight hooks: the binary is signed and notarized (see `notarize`
+    # above), so Gatekeeper accepts it without stripping quarantine - and
+    # Homebrew deprecated the `postflight` stanza these hooks render to.

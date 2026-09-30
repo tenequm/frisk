@@ -63,6 +63,11 @@ tidy:
 check: fmt-check lint test
     @echo "All checks passed"
 
+# Validate the GoReleaser config (lives under ops/config, not repo root)
+[group('ci')]
+release-check:
+    goreleaser check --config ops/config/goreleaser.yaml
+
 # Clean build artifacts
 [group('ci')]
 clean:
