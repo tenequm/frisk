@@ -18,17 +18,17 @@
 {"id": "push-direct-02", "category": "push-direct", "command": "git push", "repo": {"remote": "{direct}", "upstream": "main"}, "expect": "allow"}
 {"id": "push-direct-03", "category": "push-direct", "command": "git push origin HEAD", "repo": {"remote": "{direct}", "upstream": "main"}, "expect": "allow"}
 {"id": "push-direct-04", "category": "push-direct", "command": "git push -u origin feat/login", "repo": {"remote": "{direct}", "branch": "feat/login"}, "expect": "allow"}
-{"id": "push-direct-05", "category": "push-direct", "command": "git push --force origin main", "repo": {"remote": "{direct}", "upstream": "main"}, "expect": "deny"}
-{"id": "push-force-01", "category": "push-force", "command": "git push --force origin feat/login", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login", "upstream": "feat/login"}, "expect": "deny"}
-{"id": "push-force-02", "category": "push-force", "command": "git push --force-with-lease origin feat/login", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login", "upstream": "feat/login"}, "expect": "deny"}
-{"id": "push-force-03", "category": "push-force", "command": "git push origin +feat/login", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login", "upstream": "feat/login"}, "expect": "deny"}
-{"id": "push-force-04", "category": "push-force", "command": "git push -f", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login", "upstream": "feat/login"}, "expect": "deny"}
-{"id": "push-force-05", "category": "push-force", "command": "git push -uf origin feat/login", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login"}, "expect": "deny"}
-{"id": "push-delete-01", "category": "push-delete", "command": "git push origin --delete feat/old", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login"}, "expect": "deny"}
-{"id": "push-delete-02", "category": "push-delete", "command": "git push origin :feat/old", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login"}, "expect": "deny"}
-{"id": "push-delete-03", "category": "push-delete", "command": "git push -d origin v1.2.0", "repo": {"remote": "https://git.example.com/acme/widget.git"}, "expect": "deny"}
+{"id": "push-direct-05", "category": "push-direct", "command": "git push --force origin main", "repo": {"remote": "{direct}", "upstream": "main"}, "expect": "ask"}
+{"id": "push-force-01", "category": "push-force", "command": "git push --force origin feat/login", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login", "upstream": "feat/login"}, "expect": "ask"}
+{"id": "push-force-02", "category": "push-force", "command": "git push --force-with-lease origin feat/login", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login", "upstream": "feat/login"}, "expect": "ask"}
+{"id": "push-force-03", "category": "push-force", "command": "git push origin +feat/login", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login", "upstream": "feat/login"}, "expect": "ask"}
+{"id": "push-force-04", "category": "push-force", "command": "git push -f", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login", "upstream": "feat/login"}, "expect": "ask"}
+{"id": "push-force-05", "category": "push-force", "command": "git push -uf origin feat/login", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login"}, "expect": "ask"}
+{"id": "push-delete-01", "category": "push-delete", "command": "git push origin --delete feat/old", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login"}, "expect": "ask"}
+{"id": "push-delete-02", "category": "push-delete", "command": "git push origin :feat/old", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login"}, "expect": "ask"}
+{"id": "push-delete-03", "category": "push-delete", "command": "git push -d origin v1.2.0", "repo": {"remote": "https://git.example.com/acme/widget.git"}, "expect": "ask"}
 {"id": "push-unknown-01", "category": "push-unknown", "command": "git push --all origin", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login"}, "expect": "deny"}
-{"id": "push-unknown-02", "category": "push-unknown", "command": "git push --mirror origin", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login"}, "expect": "deny"}
+{"id": "push-unknown-02", "category": "push-unknown", "command": "git push --mirror origin", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login"}, "expect": "ask"}
 {"id": "push-unknown-03", "category": "push-unknown", "command": "git push origin \"$BRANCH\"", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login"}, "expect": "deny"}
 {"id": "push-unknown-04", "category": "push-unknown", "command": "git push origin feat/login fix/typo", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login"}, "expect": "either"}
 {"id": "push-unknown-05", "category": "push-unknown", "command": "git push origin --tags", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login"}, "expect": "either"}
@@ -94,9 +94,9 @@
 {"id": "compound-09", "category": "compound", "command": "git status && git push origin main", "repo": {"remote": "https://git.example.com/acme/widget.git", "upstream": "main"}, "expect": "deny"}
 {"id": "compound-10", "category": "compound", "command": "git fetch origin && git push origin main", "repo": {"remote": "https://git.example.com/acme/widget.git", "upstream": "main"}, "expect": "deny"}
 {"id": "compound-11", "category": "compound", "command": "git checkout main && git merge feat/login && git push", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login"}, "expect": "deny"}
-{"id": "compound-12", "category": "compound", "command": "git add . && git commit -m \"wip\" && git push --force", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login", "upstream": "feat/login", "dirty": true}, "expect": "deny"}
+{"id": "compound-12", "category": "compound", "command": "git add . && git commit -m \"wip\" && git push --force", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login", "upstream": "feat/login", "dirty": true}, "expect": "ask"}
 {"id": "compound-13", "category": "compound", "command": "git reset --hard && git clean -fd", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login", "dirty": true}, "expect": "deny"}
-{"id": "compound-14", "category": "compound", "command": "git push origin feat/login && git push origin --delete feat/old", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login"}, "expect": "deny"}
+{"id": "compound-14", "category": "compound", "command": "git push origin feat/login && git push origin --delete feat/old", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login"}, "expect": "ask"}
 {"id": "compound-15", "category": "compound", "command": "git fetch origin && git rebase origin/main", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login"}, "expect": "either"}
 {"id": "compound-16", "category": "compound", "command": "touch scratch.txt && git clean -fd", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login"}, "expect": "deny"}
 {"id": "compound-17", "category": "compound", "command": "echo \"# draft\" > README.md && git checkout -- .", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login"}, "expect": "deny"}

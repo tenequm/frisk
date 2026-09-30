@@ -375,7 +375,9 @@ type gitFixture struct {
 	Command  string         `json:"command"`
 	Cwd      string         `json:"cwd"` // relative to the repository, "" for the repository itself
 	Repo     gitFixtureRepo `json:"repo"`
-	Expect   string         `json:"expect"` // allow, deny, or either where the policy does not say
+	// Expect is allow, deny, ask where the user wants to confirm, or either
+	// (allow or deny) where the policy does not say.
+	Expect string `json:"expect"`
 }
 
 type gitFixtureRepo struct {
@@ -532,12 +534,10 @@ func TestEvalGit(t *testing.T) {
 
 	fixtures, dirs, skipped := gitFixtureRepos(t, sandbox)
 	var results []gitEvalResult
-	var report strings.Builder
-	fmt.Fprintf(&report, "frisk git eval: fixtures=%d (skipped %d: no FRISK_EVAL_DIRECT_REMOTE) config=%s\n\n",
-		len(fixtures), skipped, filepath.Join(configHome, "frisk", "config.json"))
-	fmt.Fprintf(&report, "%-14s %6s %7s %11s %10s %6s %4s %11s %6s\n",
+	// The ask column counts asks nobody expected; an expected one is correct.
+	var wrong, table strings.Builder
+	fmt.Fprintf(&table, "%-14s %6s %7s %11s %10s %6s %4s %11s %6s\n",
 		"arm", "judged", "correct", "wrong-allow", "wrong-deny", "silent", "ask", "median-conf", "static")
-	var wrong strings.Builder
 	for arm := range strings.SplitSeq(cmp.Or(os.Getenv("FRISK_EVAL_ARMS"), evalArmBase+","+evalArmRecord), ",") {
 		rewrite, ok := evalArms[arm]
 		if !ok {
@@ -567,10 +567,11 @@ func TestEvalGit(t *testing.T) {
 		if n := len(confidences); n > 0 {
 			median = (confidences[(n-1)/2] + confidences[n/2]) / 2
 		}
-		fmt.Fprintf(&report, "%-14s %6d %7d %11d %10d %6d %4d %11.2f %6d\n", arm, counts["judged"], counts["correct"],
+		fmt.Fprintf(&table, "%-14s %6d %7d %11d %10d %6d %4d %11.2f %6d\n", arm, counts["judged"], counts["correct"],
 			counts["wrong allow"], counts["wrong deny"], counts["silent"], counts["ask"], median, counts["static"])
 	}
-	report.WriteString("\nwrong verdicts\n" + wrong.String())
+	report := fmt.Sprintf("frisk git eval: fixtures=%d (skipped %d: no FRISK_EVAL_DIRECT_REMOTE) config=%s\n\nwrong verdicts\n%s\n%s",
+		len(fixtures), skipped, filepath.Join(configHome, "frisk", "config.json"), wrong.String(), table.String())
 
 	saved := filepath.Join(os.TempDir(), "frisk-eval-git-"+time.Now().Format("20060102T150405")+".jsonl")
 	if out := os.Getenv("FRISK_EVAL_OUT"); out != "" {
@@ -586,7 +587,7 @@ func TestEvalGit(t *testing.T) {
 	if err := os.WriteFile(saved, lines.Bytes(), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("\n%s\nper-fixture results: %s", report.String(), saved)
+	t.Logf("\n%s\nper-fixture results: %s", report, saved)
 }
 
 // gitEvalRun judges one fixture. A failed judge call is retried, since an arm
@@ -622,11 +623,13 @@ func gitEvalRun(cfg *config, proxy *gitEvalProxy, arm string, f gitFixture, cwd 
 	default:
 		r.Outcome = "silent"
 	}
+	// An ask or a silence nobody expected is neither right nor wrong: it is
+	// the cost the arms are compared on.
 	switch {
+	case f.Expect == r.Outcome, f.Expect == evalEither && (r.Outcome == decisionAllow || r.Outcome == decisionDeny):
+		r.Grade = "correct"
 	case r.Outcome == decisionAsk || r.Outcome == "silent":
 		r.Grade = r.Outcome
-	case f.Expect == evalEither || f.Expect == r.Outcome:
-		r.Grade = "correct"
 	default:
 		r.Grade = "wrong " + r.Outcome
 	}
@@ -662,8 +665,10 @@ func gitFixtureRepos(t *testing.T, sandbox string) ([]gitFixture, []string, int)
 		if err := json.Unmarshal([]byte(line), &f); err != nil {
 			t.Fatalf("fixture %d: %v", len(fixtures)+skipped+1, err)
 		}
-		// FRISK_EVAL_ONLY narrows a run to the fixtures whose id contains it.
-		if !strings.Contains(f.ID, os.Getenv("FRISK_EVAL_ONLY")) {
+		// FRISK_EVAL_ONLY narrows a run to the fixtures whose id contains one
+		// of its comma-separated parts.
+		only := strings.Split(os.Getenv("FRISK_EVAL_ONLY"), ",")
+		if !slices.ContainsFunc(only, func(part string) bool { return strings.Contains(f.ID, part) }) {
 			continue
 		}
 		if f.Repo.Remote == evalDirectRemote {
