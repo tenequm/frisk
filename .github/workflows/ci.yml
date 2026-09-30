@@ -9,15 +9,18 @@ on:
 permissions:
   contents: read
 
-# Concurrency is per-job, not workflow-level: a build stays cancellable, but the
-# release job must never be cancelled mid-publish.
+# Concurrency is per-job, not workflow-level: a pull request's build stays
+# cancellable, but the release job must never be cancelled mid-publish.
 
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    # Only a pull request's superseded build is cancelled. On main every push
+    # runs to the end in its own group: cancelling one skips its release job, and
+    # the release is then cut from a later commit than the release PR's.
     concurrency:
-      group: build-${{ github.ref }}
-      cancel-in-progress: true
+      group: build-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || 'pr' }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
