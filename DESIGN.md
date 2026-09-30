@@ -80,6 +80,11 @@ sees through wrappers (`time`, `timeout`, `env`, `nice`, `nohup`, `exec`,
 `uv run`, `uvx`), versioned interpreters, interpreter flags, and shebangs on
 directly executed files. A relative path resolves only against the hook cwd or
 a literal `cd` earlier in the command - never a same-named file elsewhere.
+A heredoc body is commands only when the statement it feeds is a shell reading
+its script from stdin (`sh`, `bash`, `zsh`, `dash`, `ksh`, behind the same
+wrappers, with no script file and no `-c`). Fed to anything else it is text:
+the probe takes no script and no `cd` from it, while `permissions.deny` and
+`permissions.ask` rules still match its lines.
 `$NAME` and `${NAME}` resolve only for a variable the command itself assigns
 exactly once, as its own statement, to a plain literal, before any control
 flow and ahead of the use (`S=/tmp/x; cd "$S" && python3 run.py`); anything

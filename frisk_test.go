@@ -75,6 +75,7 @@ func TestParseCommand(t *testing.T) {
 		{"unsafe redirect input from null with fd", "ls 0</dev/null", nil, true},
 		{"unsafe redirect null then file", "ls 2>/dev/null >f", nil, true},
 		{"heredoc with null redirect", "cat <<EOF >/dev/null\nhi\nEOF", nil, true},
+		{"heredoc body stays in the static view", "cat <<-'EOF' | wc -l\nit's here\n\tEOF\nls", [][]string{{"cat"}, {"wc", "-l"}, {"its here\n"}, {"ls"}}, true},
 		{"quoted redirect stays unsound", `awk '{print > "/dev/null"}'`, nil, true},
 		{"double quoted redirect stays unsound", `echo "a>/dev/null"`, nil, true},
 		{"escaped redirect stays unsound", `echo a\>/dev/null`, nil, true},
@@ -431,6 +432,10 @@ func TestDecideStaticTiers(t *testing.T) {
 		{"null redirect is static", "git status >/dev/null 2>&1", decisionAllow, "static"},
 		{"null input is static", "cat < /dev/null", decisionAllow, "static"},
 		{"deny still sees through a redirect", "gopass show -o k 2>/dev/null", decisionDeny, "deny-rule"},
+		{"heredoc never static", "cat <<EOF\nhi\nEOF", "", "no-judge"},
+		{"deny still sees a heredoc body", "cat > notes.txt <<EOF\ngopass show -o k\nEOF", decisionDeny, "deny-rule"},
+		{"deny still sees past a heredoc body", "cat > notes.txt <<'EOF'\nit's text\nEOF\ngopass show -o k", decisionDeny, "deny-rule"},
+		{"ask still sees a heredoc owner", "ssh prod bash <<EOF\nuptime\nEOF", decisionAsk, "ask-rule"},
 		{"ssh key never static", "cat ~/.ssh/id_rsa", "", "no-judge"},
 		{"ssh dir never static", "ls ~/.ssh", "", "no-judge"},
 		{"aws credentials never static", "head /Users/x/.aws/credentials", "", "no-judge"},
@@ -1205,6 +1210,7 @@ func TestProbeScripts(t *testing.T) {
 		{"uv directory is unresolvable", "proj", "uv run --directory sub python stats.py", probeUnresolvable, nil},
 		{"versioned python", "proj", "python3.12 stats.py", probeAttached, []string{"proj/stats.py"}},
 		{"versioned node", "proj", "node22 app.js", probeAttached, []string{"proj/app.js"}},
+		{"dash runs a script like sh", "proj", "dash smoke.sh", probeAttached, []string{"proj/smoke.sh"}},
 		{"extensionless shebang", "proj", "./teardown", probeAttached, []string{"proj/teardown"}},
 		{"unknown extension shebang", "proj", "./tool.ts", probeAttached, []string{"proj/tool.ts"}},
 		{"binary is not a script", "proj", "./blob", "", nil},
@@ -1302,14 +1308,31 @@ func TestProbeScripts(t *testing.T) {
 		{"zsh equals expansion in the value", ".", "S==ls; python3 $S/run.py", probeUnresolvable, nil},
 		{"cdpath change resolves nothing", ".", "cdpath={root}/proj; D=sub; cd $D && python3 build.py", probeUnresolvable, nil},
 		{"cd to a directory stack entry is unknown", "proj", "cd +1 && python3 stats.py", probeUnresolvable, nil},
+		{"heredoc written to a file is text", ".", "cd {root}/proj && cat > lane.py <<'EOF'\nimport sys\nprint(f\"/favicon.svg:   {s(fav)}\")\nEOF", "", nil},
+		{"heredoc fed to python is text", ".", "cd {root}/proj && python3 - <<'EOF'\npat = re.compile(\n    \"([^/] )\"\n)\nEOF", "", nil},
+		{"heredoc after a subshell is text", "proj", "(cd sub && ls) && python3 - <<'EOF'\nif r.count('/')*d < len(r):\n    pass\nEOF", "", nil},
+		{"heredoc fed to python without a dash is text", "proj", "python3 <<EOF\npython3 stats.py\nEOF", "", nil},
+		{"heredoc body never moves the directory", "proj", "cat > notes.txt <<EOF\ncd sub\nEOF\npython3 stats.py", probeAttached, []string{"proj/stats.py"}},
+		{"heredoc read by a shell is probed", "proj", "bash <<EOF\npython3 stats.py\nEOF", probeAttached, []string{"proj/stats.py"}},
+		{"heredoc read by a wrapped shell is probed", "proj", "timeout 60 dash -s <<'EOF'\npython3 stats.py\nEOF", probeAttached, []string{"proj/stats.py"}},
+		{"heredoc read by a redirected shell is probed", "proj", "sh <<EOF > out.log\npython3 stats.py\nEOF", probeMissing, []string{"proj/stats.py"}},
+		{"heredoc beside bash -c is text", "proj", "bash -c 'cat > copy.txt' <<EOF\npython3 stats.py\nEOF", "", nil},
+		{"heredoc beside a script file is text", "proj", "bash smoke.sh <<EOF\npython3 stats.py\nEOF", probeAttached, []string{"proj/smoke.sh"}},
+		{"heredoc with a tab-stripped terminator", "proj", "bash <<-EOF\n\tpython3 stats.py\n\tEOF\npython3 run.py", probeAttached, []string{"proj/stats.py", "proj/run.py"}},
+		{"heredoc with a quoted terminator", "proj", "cat > notes.txt <<\"END OF NOTES\"\npython3 decoy.py\nEND OF NOTES\npython3 run.py", probeAttached, []string{"proj/run.py"}},
+		{"two heredocs on one line", "proj", "cat <<A > a.txt; bash <<'B'\npython3 decoy.py\nA\npython3 stats.py\nB", probeAttached, []string{"proj/stats.py"}},
+		{"command after the terminator is probed", "proj", "cat > lane.py <<'EOF'\n# it's generated\nEOF\npython3 run.py", probeAttached, []string{"proj/run.py"}},
+		{"unterminated heredoc runs to the end", "proj", "cat > lane.py <<EOF\npython3 stats.py", "", nil},
+		{"arithmetic shift is not a heredoc", "proj", "n=$((1<<2))\npython3 stats.py", probeAttached, []string{"proj/stats.py"}},
+		{"here-string is not a heredoc", "proj", "cat <<<hello\npython3 stats.py", probeAttached, []string{"proj/stats.py"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			segments := tokenize(strings.ReplaceAll(tt.command, "{root}", root)).probeSegments()
 			res := probeScripts(segments, filepath.Join(root, tt.cwd))
-			if res.Status != tt.status {
-				t.Fatalf("status = %q, want %q", res.Status, tt.status)
+			if res.Status != tt.status || (tt.status == "" && res.Missed != "") {
+				t.Fatalf("status = %q, want %q (missed %q)", res.Status, tt.status, res.Missed)
 			}
 			var got []string
 			for _, s := range res.Scripts {

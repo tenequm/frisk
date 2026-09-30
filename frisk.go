@@ -249,8 +249,9 @@ var (
 	secretEnvRef  = regexp.MustCompile(`(?i)\$\{?\w*(` + secretWords + `)`)
 )
 
-// interpreterName also matches versioned binaries such as python3.12 and node22.
-var interpreterName = regexp.MustCompile(`^(python|node|bash|sh|zsh)[0-9.]*$`)
+// interpreterName also matches versioned binaries such as python3.12 and
+// node22. Its group is empty for a shell.
+var interpreterName = regexp.MustCompile(`^(?:(python|node)|bash|sh|zsh|dash|ksh)[0-9.]*$`)
 
 var scriptExtensions = map[string]bool{
 	".bash": true, ".js": true, ".mjs": true, ".py": true, ".sh": true, ".zsh": true,
@@ -275,6 +276,10 @@ var interpreterArgs = map[string]argSpec{
 	},
 	"sh": {valueLetters: "oO", inlineLetters: "cs"},
 }
+
+// stdinShellArgs makes scriptArg stop at a shell's first operand: a script
+// file or the command string of -c, either of which means stdin is not the script.
+var stdinShellArgs = argSpec{valueLetters: "oO", inlineLetters: "s"}
 
 // wrapperSpec describes a command that runs its operands as another command.
 type wrapperSpec struct {
@@ -517,7 +522,30 @@ type word struct {
 type statement struct {
 	sep   string // operator before it: "" for the first, else ";", "&&", "||", "|" or "&"
 	words []word
-	cmd   int // index of the first word that is not a leading NAME=value
+	cmd   int  // index of the first word that is not a leading NAME=value
+	data  bool // a heredoc body line no shell reads: deny and ask rules match it, the probe skips it
+}
+
+// heredocOp matches "<<" or "<<-" with its delimiter, quoted in part or whole.
+var heredocOp = regexp.MustCompile(`^<<(-?)[ \t]*((?:'[^']*'|"[^"]*"|\\.|[^\s;|&<>()'"\\])+)`)
+
+var heredocUnquote = strings.NewReplacer(`'`, "", `"`, "", `\`, "")
+
+type heredoc struct {
+	delim string
+	tabs  bool // "<<-" strips leading tabs from the terminator line
+	owner int  // index of the statement the body is fed to
+}
+
+// heredocAt reads the heredoc operator at s[i] and returns its length, or 0
+// when there is none: "<<<" is a here-string, and "<<" inside an open "((" is
+// an arithmetic shift.
+func heredocAt(s string, i int) (heredoc, int) {
+	m := heredocOp.FindStringSubmatch(s[i:])
+	if m == nil || strings.HasSuffix(s[:i], "<") || strings.Count(s[:i], "((") > strings.Count(s[:i], "))") {
+		return heredoc{}, 0
+	}
+	return heredoc{delim: heredocUnquote.Replace(m[2]), tabs: m[1] != ""}, len(m[0])
 }
 
 type parsedCommand struct {
@@ -539,6 +567,7 @@ func tokenize(command string) parsedCommand {
 	}
 
 	var words []word
+	var docs []heredoc
 	var tok, exp strings.Builder
 	var quote byte
 	globbed, quoted, sep := false, false, ""
@@ -606,6 +635,13 @@ func tokenize(command string) parsedCommand {
 				}
 			}
 			p.unsound = true
+			if d, n := heredocAt(command, i); n > 0 {
+				flushToken()
+				d.owner = len(p.stmts)
+				docs = append(docs, d)
+				i += n - 1
+				continue
+			}
 			write(c, true)
 		case c == '|' || c == ';' || c == '\n':
 			next := ";"
@@ -617,6 +653,10 @@ func tokenize(command string) parsedCommand {
 				}
 			}
 			flushStatement(next)
+			if c == '\n' && len(docs) > 0 {
+				rest := p.heredocBodies(docs, command[i+1:])
+				docs, i = nil, len(command)-len(rest)-1
+			}
 		case c == '&':
 			if tok.Len() == 0 && !quoted && i+1 < len(command) && command[i+1] == '>' {
 				if end := safeRedirect(command, i+1, "&"); end > 0 {
@@ -694,16 +734,69 @@ func wordEnd(s string, j int) bool {
 	return j == len(s) || strings.IndexByte(" \t\n;|&", s[j]) >= 0
 }
 
-// segments is the static tier's view: each statement's tokens with leading
-// assignments stripped and nothing substituted.
+// heredocBodies consumes the bodies that open s, one per pending operator, and
+// returns what follows the last terminator line. An unterminated body runs to
+// the end of the command.
+func (p *parsedCommand) heredocBodies(docs []heredoc, s string) string {
+	owners := len(p.stmts)
+	for _, d := range docs {
+		body := s
+		s = ""
+		for rest := body; rest != ""; {
+			line, after, _ := strings.Cut(rest, "\n")
+			if d.tabs {
+				line = strings.TrimLeft(line, "\t")
+			}
+			if line == d.delim {
+				body, s = body[:len(body)-len(rest)], after
+				break
+			}
+			rest = after
+		}
+		// Tokenized apart, so a stray quote in the body cannot swallow the
+		// commands after it, and kept so deny and ask rules still see it.
+		data := d.owner >= owners || !shellReadsStdin(p.stmts[d.owner].tokens())
+		for _, st := range tokenize(body).stmts {
+			st.data = st.data || data
+			p.stmts = append(p.stmts, st)
+		}
+	}
+	return s
+}
+
+// shellReadsStdin reports whether seg runs a POSIX shell that takes its script
+// from stdin, which makes a heredoc fed to it commands rather than text.
+func shellReadsStdin(seg []string) bool {
+	inner, _, err := unwrap(seg)
+	if err != nil || len(inner) == 0 {
+		return false
+	}
+	m := interpreterName.FindStringSubmatch(filepath.Base(inner[0]))
+	if m == nil || m[1] != "" {
+		return false
+	}
+	// A redirect in operand position is not a script file, and treating the
+	// shell as reading stdin keeps the body probed.
+	arg, found := scriptArg(stdinShellArgs, inner[1:])
+	return !found || strings.IndexAny(strings.TrimLeft(arg, "0123456789&"), "<>") == 0
+}
+
+// tokens is the statement with leading assignments stripped and nothing
+// substituted.
+func (st statement) tokens() []string {
+	seg := make([]string, 0, len(st.words)-st.cmd)
+	for _, w := range st.words[st.cmd:] {
+		seg = append(seg, w.text)
+	}
+	return seg
+}
+
+// segments is the static tier's view: every statement's tokens, heredoc
+// bodies included.
 func (p parsedCommand) segments() [][]string {
 	segs := make([][]string, 0, len(p.stmts))
 	for _, st := range p.stmts {
-		seg := make([]string, 0, len(st.words)-st.cmd)
-		for _, w := range st.words[st.cmd:] {
-			seg = append(seg, w.text)
-		}
-		segs = append(segs, seg)
+		segs = append(segs, st.tokens())
 	}
 	return segs
 }
@@ -849,8 +942,8 @@ func (w word) literalValue() (string, bool) {
 	return filepath.Join(home, value[1:]), true
 }
 
-// probeSegments is the probe's view: segments() with literal variables
-// substituted where the shell would expand them. A reference that is not
+// probeSegments is the probe's view: the statements a shell runs, with literal
+// variables substituted where it would expand them. A reference that is not
 // certain keeps its "$", which the path resolver refuses.
 func (p parsedCommand) probeSegments() [][]string {
 	vars := p.literalVars()
@@ -877,7 +970,15 @@ func (p parsedCommand) probeSegments() [][]string {
 			segs[j][k] = strings.ReplaceAll(expanded, "\x00", "$")
 		}
 	}
-	return segs
+	// Heredoc text is not commands: probed as such, its tokens became scripts
+	// the judge was told it could not see.
+	kept := segs[:0]
+	for j, st := range p.stmts {
+		if !st.data {
+			kept = append(kept, segs[j])
+		}
+	}
+	return kept
 }
 
 // reaches reports whether the assignment in statement at has certainly run
@@ -1513,7 +1614,7 @@ func scriptTarget(seg []string) (string, bool, string) {
 	verb := inner[0]
 	if m := interpreterName.FindStringSubmatch(filepath.Base(verb)); m != nil {
 		family := m[1]
-		if family != "python" && family != "node" {
+		if family == "" {
 			family = "sh"
 		}
 		if arg, runsFile := scriptArg(interpreterArgs[family], inner[1:]); runsFile {
