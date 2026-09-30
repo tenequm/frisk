@@ -1,9 +1,21 @@
 # Changelog
 
+## [0.1.2](https://github.com/tenequm/frisk/compare/v0.1.1...v0.1.2) - 2026-09-30
+
+### <!-- 2 -->🐛 Bug Fixes
+- **static:** stop a quote inside a # comment from hiding the following lines ([9811be3](https://github.com/tenequm/frisk/commit/9811be322e8af4e89e1d2fc013844b00e671e775))
+
+### <!-- 6 -->🧹 Chores
+- **release:** never cancel a build on main, and let a retry reuse a leftover draft ([#10](https://github.com/tenequm/frisk/pull/10)) ([bad6b87](https://github.com/tenequm/frisk/commit/bad6b8763dbf187570e90f74cb33309b1fc7d4f9))
+
+**Full Changelog**: https://github.com/tenequm/frisk/compare/v0.1.1...v0.1.2
+
 ## [0.1.1](https://github.com/tenequm/frisk/compare/v0.1.0...v0.1.1) - 2026-09-30
 
 ### <!-- 1 -->🎉 New Features
 - **judge:** let config choose which decisions the judge issues ([0b27374](https://github.com/tenequm/frisk/commit/0b27374935727805981a281092c3c39056857868))
+- **log:** redact secret-shaped values before writing the log ([288777c](https://github.com/tenequm/frisk/commit/288777ca6e204cf79f3789117716401f781cd15e))
+- **judge:** redact secret literals in the command sent to the judge ([f54ddaf](https://github.com/tenequm/frisk/commit/f54ddaf83696536582a2524ceb36cce9fb41f1ab))
 
 ### <!-- 2 -->🐛 Bug Fixes
 - **probe:** stop reading heredoc bodies as shell commands ([cfcefc4](https://github.com/tenequm/frisk/commit/cfcefc4a6a0218483aa5a974c3437ab8e9a1d88a))
