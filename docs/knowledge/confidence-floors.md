@@ -37,6 +37,8 @@ The judge's answer is enforced only when it is confident:[^code]
 | deny | below 0.50 | ask |
 
 Static `deny` and `ask` rules from config are not affected; they always apply.
+A config can also withhold whole decisions after this mapping; see
+[Config can stop the judge from prompting](judge-decisions-can-withhold-prompts.md).
 
 # Why
 

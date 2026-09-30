@@ -41,6 +41,10 @@ Conventions:
 - [Weak judge verdicts are not acted on](confidence-floors.md) - A judge allow
   below 0.75, an ask below 0.50 or a deny below 0.50 is downgraded rather than
   enforced, because low-confidence verdicts were mostly wrong in live use.
+- [Config can stop the judge from prompting](judge-decisions-can-withhold-prompts.md) -
+  judge.decisions lists which of allow, ask and deny the judge may issue; a user
+  who lists only allow and deny gets no judge prompts, and the withheld verdicts
+  stay countable in the log.
 
 ## Findings
 
@@ -57,6 +61,14 @@ Conventions:
   When a command runs a script whose body is not attached, the judge rates the
   harmless-looking command line and allows it, so the probe must follow the command
   to the real file and say so when it cannot.
+- [The server classifier evaluates every call, whatever the hook says](classifier-runs-regardless-of-hook.md) -
+  Claude Code's auto-mode classifier runs on the API request before any hook, so a
+  frisk allow does not skip it; the allow only lets the tool start without waiting
+  for the verdict.
+- [Replaying logged commands skews verdicts through trusted state](replays-are-skewed-by-trusted-state.md) -
+  A replay sends the judge the replay machine's git facts and probe results, not
+  the ones the command originally ran with, so ask and deny rates from a replay
+  overstate what live traffic gets.
 
 ## References
 

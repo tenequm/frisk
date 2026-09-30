@@ -20,7 +20,7 @@ sources:
     resource: https://docs.typesafe.ai/model-jaggedness/jev-1.13
     title: Jev 1.13 jaggedness
   - id: measured
-    resource: two replays of about 1,800 judged `frisk check` calls each on 2026-09-30 from one macOS machine (results not committed)
+    resource: replays of about 1,800 judged `frisk check` calls each, before and after commit 091465e, and one live fixture eval of 317 judged calls, all on 2026-09-30 from one macOS machine (results not committed)
     title: Measured judge latency
 ---
 
@@ -54,8 +54,11 @@ sources:
 
 # Measured
 
-A judged `frisk check` call took 0.30 to 0.32s at the median and 0.37 to 0.46s at
-the 90th percentile, including process start and fetching the key.[^measured]
+With a single Choice question, a judged `frisk check` call took 0.30 to 0.32s at
+the median and 0.37 to 0.46s at the 90th percentile, including process start and
+fetching the key. With the three-question request and git facts added in commit
+091465e it took 0.39 to 0.41s at the median and 0.52 to 0.56s at the 90th
+percentile.[^measured]
 
 [^models]: TypeSafe models
 [^confidence]: Jev confidence
