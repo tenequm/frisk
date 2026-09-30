@@ -154,7 +154,7 @@ func TestParseCommand(t *testing.T) {
 		{"variable assigned twice is complex", "S=/x; S=/y; cat $S", nil, true},
 		{"variable used before its assignment is complex", "cat $S; S=/x", nil, true},
 		{"variable in an assignment prefix is complex", "A=$B ls", [][]string{{"ls"}}, true},
-		{"path variable is complex", `ls "$HOME/x"`, [][]string{{"ls", "$HOME/x"}}, true},
+		{"path variable is complex", `ls "$HOMEDIR/x"`, [][]string{{"ls", "$HOMEDIR/x"}}, true},
 		{"positional parameter is complex", "echo $1", [][]string{{"echo", "$1"}}, true},
 		{"all parameters are complex", `echo "$@"`, [][]string{{"echo", "$@"}}, true},
 		{"zsh split flag is complex", "fd $=ARGS", [][]string{{"fd", "$=ARGS"}}, true},
@@ -165,7 +165,7 @@ func TestParseCommand(t *testing.T) {
 		{"dollar before an alternation is literal", `rg "^a$|^b$" f`, [][]string{{"rg", "^a$|^b$", "f"}}, false},
 		{"single-quoted dollar is literal", "rg 'a$b' f", [][]string{{"rg", "a$b", "f"}}, false},
 		{"escaped dollar is literal", `echo \$HOME "\$HOME"`, [][]string{{"echo", "$HOME", "$HOME"}}, false},
-		{"escaped backslash leaves the dollar live", `echo "\\$HOME"`, [][]string{{"echo", `\$HOME`}}, true},
+		{"escaped backslash leaves the dollar live", `echo "\\$HOMEDIR"`, [][]string{{"echo", `\$HOMEDIR`}}, true},
 		{"credential glob is complex", "cat ~/.s*/id_*", [][]string{{"cat", "~/.s*/id_*"}}, true},
 		{"quoted glob is not expanded", "jq '.items[]' f.json", [][]string{{"jq", ".items[]", "f.json"}}, false},
 		{"comment with a single quote", "echo hi # it's\nrm -rf /tmp/x # '", [][]string{{"echo", "hi"}, {"rm", "-rf", "/tmp/x"}}, true},
@@ -1075,7 +1075,7 @@ func TestDecideStaticTiers(t *testing.T) {
 		{"echo braced secret ref never static", "echo ${API_KEY}", "", "no-judge"},
 		{"gopass find never static", "gopass find foo", "", "no-judge"},
 		{"printenv name stays static", "printenv HOME", decisionAllow, "static"},
-		{"echo plain var never static", "echo $HOME", "", "no-judge"},
+		{"echo plain var never static", "echo $HOMEDIR", "", "no-judge"},
 		{"variable as arguments never static", "fd $ARGS", "", "no-judge"},
 		{"variable as a path never static", "cat $F", "", "no-judge"},
 		{"quoted variable never static", `cat "$F"`, "", "no-judge"},
@@ -3437,5 +3437,69 @@ func TestStaticLoopsAndWrites(t *testing.T) {
 	}
 	if got := decide(&config{Permissions: permissionsConfig{Allow: []string{"echo *"}}}, "echo x > /tmp/f", dir, nil); got.Decision == decisionAllow {
 		t.Fatal("allowed write without Edit rule")
+	}
+}
+
+func TestKnownPathVariables(t *testing.T) {
+	cwd := t.TempDir()
+	t.Setenv("HOME", "/home/frisk")
+	t.Setenv("TMPDIR", cwd)
+	cfg := &config{Permissions: permissionsConfig{Allow: exampleAllow(t)}}
+	tests := []struct {
+		command string
+		allow   bool
+	}{
+		{`cat $HOME/notes.txt`, true},
+		{`F=$HOME/pjd/x.md; wc -l $F; sed -n '1,12p' $F`, true},
+		{`F="${HOME}/pjd/x.md"; cat "$F"`, true},
+		{`ls "${HOME}/Projects"`, true},
+		{`ls $TMPDIR`, true},
+		{`ls "$TMPDIR"/x`, true},
+		{`F=${TMPDIR}/x; cat $F`, true},
+		{`cat $HOME/.ssh/id_ed25519`, false},
+		{`F=$HOME/.aws/credentials; cat $F`, false},
+		{`cd $HOME/.aws && cat credentials`, false},
+		{`HOME=/tmp/x cat $HOME/.netrc`, false},
+		{`export HOME=/x; ls $HOME`, false},
+		{`TMPDIR=/x; ls $TMPDIR`, false},
+		{`export TMPDIR=/x; ls $HOME`, false},
+		{`ls $HOMEDIR`, false},
+		{`cat $HOME$X`, false},
+		{`IFS=:; ls $HOME`, false},
+		{`CDPATH=/x; ls $HOME`, false},
+		{`eval true; ls $HOME`, false},
+		{`cat $(echo $HOME)`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.command, func(t *testing.T) {
+			v := decide(cfg, tt.command, cwd, testLogger)
+			if (v.Decision == decisionAllow && v.Tier == "static") != tt.allow {
+				t.Fatalf("decide(%q) = (%q, %q), want static allow %v", tt.command, v.Decision, v.Tier, tt.allow)
+			}
+		})
+	}
+	for _, command := range []string{`cat '$HOME/x'`, `cat '\$HOME/x'`} {
+		got := tokenize(command).probeSegments()[0][1]
+		want := "$HOME/x"
+		if strings.Contains(command, `\`) {
+			want = `\$HOME/x`
+		}
+		if got != want {
+			t.Fatalf("probeSegments(%q) = %q, want %q", command, got, want)
+		}
+	}
+	for _, value := range []string{"", "/tmp/my dir", "/tmp/x\u00a0y", "/tmp/x\ty", "/tmp/x\ny", "/tmp/*", "/tmp/?", "/tmp/[x]", "/tmp/{x}", "/tmp/'x", "/tmp/\"x", `/tmp/\x`, "/tmp/$X"} {
+		t.Run("unsafe "+value, func(t *testing.T) {
+			t.Setenv("HOME", value)
+			t.Setenv("TMPDIR", value)
+			for _, command := range []string{`ls "$HOME"`, `ls "$TMPDIR"`, `F=$HOME/x; cat $F`, `F=$TMPDIR/x; cat $F`} {
+				if _, sound := tokenize(command).staticSegments(); sound {
+					t.Fatalf("resolved %q with value %q", command, value)
+				}
+			}
+		})
+	}
+	if got := tokenize(`python3 "$HOME/run.py"`).probeSegments()[0][1]; got != "/home/frisk/run.py" {
+		t.Fatalf("probe path = %q", got)
 	}
 }

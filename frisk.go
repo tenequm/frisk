@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -1172,7 +1173,7 @@ var (
 // Writing any of these changes how every other word expands or where cd
 // lands, so a command that touches one gets no variable resolution at all.
 // zsh ties lowercase cdpath to CDPATH.
-var expansionVars = []string{"IFS", "HOME", "CDPATH", "cdpath"}
+var expansionVars = []string{"IFS", "HOME", "TMPDIR", "CDPATH", "cdpath"}
 
 // Shell words that start or continue a compound command. After the first
 // one, an assignment may be conditional or repeated, so none is collected.
@@ -1221,8 +1222,8 @@ type literalVar struct {
 }
 
 // literalVars finds shell variables whose value is certain at every later
-// use: a plain literal, assigned exactly once as its own statement before any
-// control flow, and never written in any other way. Anything less certain is
+// use: HOME and TMPDIR with no writes, or a plain literal assigned exactly
+// once as its own statement before any control flow. Anything less certain is
 // left out: the probe then reports the path as unresolvable, and the static
 // tier leaves the command to the judge.
 func (p parsedCommand) literalVars() map[string]literalVar {
@@ -1230,6 +1231,13 @@ func (p parsedCommand) literalVars() map[string]literalVar {
 		return nil
 	}
 	vars := map[string]literalVar{}
+	home, _ := os.UserHomeDir()
+	for name, value := range map[string]string{"HOME": home, "TMPDIR": os.Getenv("TMPDIR")} {
+		if value != "" && !strings.ContainsFunc(value, unicode.IsSpace) && !strings.ContainsAny(value, "*?[{}'\"\\$") {
+			vars[name] = literalVar{value: value, at: -1}
+		}
+	}
+	known := maps.Clone(vars)
 	writes := map[string]int{}
 	topLevel := true
 	for i, st := range p.stmts {
@@ -1266,6 +1274,7 @@ func (p parsedCommand) literalVars() map[string]literalVar {
 			continue
 		}
 		for _, w := range st.words {
+			w.text = strings.ReplaceAll(p.substitute(known, i, w), "\x00", "$")
 			if value, ok := w.literalValue(); ok {
 				vars[identifier.FindString(w.text)] = literalVar{value: value, at: i}
 			}
@@ -1274,8 +1283,8 @@ func (p parsedCommand) literalVars() map[string]literalVar {
 	if slices.ContainsFunc(expansionVars, func(name string) bool { return writes[name] > 0 }) {
 		return nil
 	}
-	maps.DeleteFunc(vars, func(name string, _ literalVar) bool {
-		return writes[name] != 1 || shellOwned.MatchString(name)
+	maps.DeleteFunc(vars, func(name string, v literalVar) bool {
+		return v.at >= 0 && writes[name] != 1 || shellOwned.MatchString(name)
 	})
 	return vars
 }
@@ -1346,7 +1355,7 @@ func (p parsedCommand) substitute(vars map[string]literalVar, j int, w word) str
 			ref, tail = ref[:len(ref)-1], ref[len(ref)-1:]
 		}
 		v, ok := vars[strings.Trim(ref, "${}")]
-		if !ok || !p.reaches(v.at, j) ||
+		if !ok || v.at >= 0 && !p.reaches(v.at, j) ||
 			strings.ContainsAny(v.value, " \t") && w.quoted && !w.double {
 			return ref + tail
 		}
