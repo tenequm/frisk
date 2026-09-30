@@ -365,6 +365,8 @@ type verdict struct {
 	AskRule       jevAnswer
 	DenyRule      jevAnswer
 	Tool          string
+	Entry         string    // "hook" or "check"
+	Usage         *jevUsage // nil when the judge did not run or reported none
 }
 
 func main() {
@@ -437,7 +439,7 @@ func runHook(cfg *config, cfgErr error, stdin io.Reader, stdout io.Writer, lg *s
 	} else {
 		return 0
 	}
-	v.Tool = in.ToolName
+	v.Tool, v.Entry = in.ToolName, "hook"
 	logVerdict(lg, v, subject)
 	if v.Decision == "" {
 		return 0
@@ -462,6 +464,7 @@ func runCheck(cfg *config, cfgErr error, command string, stdout io.Writer, lg *s
 	}
 	cwd, _ := os.Getwd()
 	v := decide(cfg, command, cwd, lg)
+	v.Entry = "check"
 	logVerdict(lg, v, command)
 	decision := v.Decision
 	if decision == "" {
@@ -509,7 +512,8 @@ type statement struct {
 type parsedCommand struct {
 	stmts []statement
 	// unsound reports constructs that defeat static reasoning: substitution,
-	// redirection, heredocs, backgrounding, hijacking env assignments, and
+	// redirection (except stderr merges and /dev/null, which write nothing),
+	// heredocs, backgrounding, hijacking env assignments, and
 	// unquoted globs that could expand onto credential paths.
 	unsound bool
 	// opaque reports constructs whose variable flow is not followed:
@@ -519,7 +523,7 @@ type parsedCommand struct {
 
 func tokenize(command string) parsedCommand {
 	p := parsedCommand{
-		unsound: strings.ContainsAny(command, "`<>") || strings.Contains(command, "$("),
+		unsound: strings.Contains(command, "`") || strings.Contains(command, "$("),
 		opaque:  strings.Contains(command, "`") || strings.Contains(command, "<<") || strings.Contains(command, "$("),
 	}
 
@@ -571,6 +575,7 @@ func tokenize(command string) parsedCommand {
 			if c == quote {
 				quote = 0
 			} else {
+				p.unsound = p.unsound || c == '<' || c == '>'
 				write(c, quote == '"' && command[i-1] != '\\')
 			}
 		case c == '\'' || c == '"':
@@ -578,7 +583,19 @@ func tokenize(command string) parsedCommand {
 		case c == '\\' && i+1 < len(command):
 			i++
 			quoted = true
+			p.unsound = p.unsound || command[i] == '<' || command[i] == '>'
 			write(command[i], false)
+		case c == '<' || c == '>':
+			if fd := tok.String(); !quoted && (fd == "" || fd == "0" || fd == "1" || fd == "2") {
+				if end := safeRedirect(command, i, fd); end > 0 {
+					tok.Reset()
+					exp.Reset()
+					globbed, i = false, end-1
+					continue
+				}
+			}
+			p.unsound = true
+			write(c, true)
 		case c == '|' || c == ';' || c == '\n':
 			next := ";"
 			if c == '|' {
@@ -590,6 +607,12 @@ func tokenize(command string) parsedCommand {
 			}
 			flushStatement(next)
 		case c == '&':
+			if tok.Len() == 0 && !quoted && i+1 < len(command) && command[i+1] == '>' {
+				if end := safeRedirect(command, i+1, "&"); end > 0 {
+					i = end - 1
+					continue
+				}
+			}
 			next := "&"
 			if i+1 < len(command) && command[i+1] == '&' {
 				i++
@@ -611,6 +634,53 @@ func tokenize(command string) parsedCommand {
 		p.unsound = true
 	}
 	return p
+}
+
+// safeRedirect returns the index just past the redirect whose operator sits at
+// s[i] after the file descriptor fd, or 0 if it is not one of the forms that
+// cannot write anywhere: a stdout/stderr merge, or either stream to /dev/null.
+func safeRedirect(s string, i int, fd string) int {
+	j := i + 1
+	if s[i] == '<' {
+		if fd != "" {
+			return 0
+		}
+		return devNullEnd(s, j)
+	}
+	if j < len(s) && s[j] == '&' {
+		want := byte('2')
+		switch fd {
+		case "", "1":
+		case "2":
+			want = '1'
+		default:
+			return 0
+		}
+		if j+1 < len(s) && s[j+1] == want && wordEnd(s, j+2) {
+			return j + 2
+		}
+		return 0
+	}
+	if j < len(s) && s[j] == '>' {
+		j++
+	}
+	return devNullEnd(s, j)
+}
+
+// devNullEnd matches the whole word /dev/null after optional blanks; a longer
+// path such as /dev/null/../x names a different file.
+func devNullEnd(s string, j int) int {
+	for j < len(s) && (s[j] == ' ' || s[j] == '\t') {
+		j++
+	}
+	if strings.HasPrefix(s[j:], "/dev/null") && wordEnd(s, j+len("/dev/null")) {
+		return j + len("/dev/null")
+	}
+	return 0
+}
+
+func wordEnd(s string, j int) bool {
+	return j == len(s) || strings.IndexByte(" \t\n;|&", s[j]) >= 0
 }
 
 // segments is the static tier's view: each statement's tokens with leading
@@ -1108,6 +1178,7 @@ func judge(cfg *config, command, cwd string, segments [][]string, lg *slog.Logge
 	ans := res.Decision
 	v.Confidence, v.Probabilities, v.Model = ans.Confidence, ans.Probabilities, res.Model
 	v.AskRule, v.DenyRule = res.AskRule, res.DenyRule
+	v.Usage = res.Usage
 
 	// The floor forms show confidence, which is what the floor tests; the
 	// plain forms show the split when the response carries one.
@@ -1649,7 +1720,13 @@ type jevAnswer struct {
 // Answers stay raw so a malformed attribution answer cannot fail the decision.
 type jevResponse struct {
 	Model   string                     `json:"model"`
+	Usage   *jevUsage                  `json:"usage"`
 	Answers map[string]json.RawMessage `json:"answers"`
+}
+
+type jevUsage struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
 }
 
 type jevResult struct {
@@ -1657,6 +1734,7 @@ type jevResult struct {
 	AskRule  jevAnswer // zero when absent or malformed
 	DenyRule jevAnswer
 	Model    string
+	Usage    *jevUsage
 }
 
 // ruleQuestion asks which single rule fits, one option per prose item. It
@@ -1735,7 +1813,7 @@ func askJev(jc jevConfig, rules judgeConfig, state map[string]any) (jevResult, e
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&parsed); err != nil {
 		return jevResult{}, fmt.Errorf("decoding jev response: %w", err)
 	}
-	res := jevResult{Model: parsed.Model}
+	res := jevResult{Model: parsed.Model, Usage: parsed.Usage}
 	if err := json.Unmarshal(parsed.Answers["decision"], &res.Decision); err != nil {
 		return jevResult{}, fmt.Errorf("decoding jev decision: %w", errJevMalformed)
 	}
@@ -1855,6 +1933,12 @@ func logVerdict(lg *slog.Logger, v verdict, command string) {
 			probe = "none"
 		}
 		attrs = append(attrs, "probe", probe, "scripts", v.Scripts)
+	}
+	if v.Entry != "" {
+		attrs = append(attrs, "entry", v.Entry)
+	}
+	if v.Usage != nil {
+		attrs = append(attrs, "input_tokens", v.Usage.InputTokens, "output_tokens", v.Usage.OutputTokens)
 	}
 	if v.AskRule.Choice != "" {
 		attrs = append(attrs, "ask_rule", v.AskRule.Choice, "ask_rule_confidence", v.AskRule.Confidence)

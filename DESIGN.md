@@ -26,7 +26,8 @@ parse into pipeline segments (|, &&, ||, ;, newline)
 2. permissions.ask   match -> "ask"
 3. static allow: EVERY segment provably read-only
    (builtin verb table + config allow; bails on
-    $(), backticks, redirects, heredocs, &)     -> "allow"
+    $(), backticks, redirects, heredocs, &; except 2>&1 and
+    /dev/null redirects)      -> "allow"
 4. judge (needs jev.keyCmd): one Choice question
      allow + confidence >= 0.75 -> "allow"
      deny  + confidence >= 0.50 -> "deny" (below: "ask")
