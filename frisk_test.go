@@ -4,12 +4,17 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 var testLogger = slog.New(slog.NewJSONHandler(io.Discard, nil))
@@ -168,6 +173,102 @@ func TestDecideStaticTiers(t *testing.T) {
 		{"printenv name stays static", "printenv HOME", decisionAllow, "static"},
 		{"echo plain var stays static", "echo $HOME", decisionAllow, "static"},
 		{"gopass ls stays static", "gopass ls", decisionAllow, "static"},
+		{"awk print stays static", "awk '{print $1}' f.txt", decisionAllow, "static"},
+		{"awk field separator stays static", "awk -F: '{print $1}' /etc/passwd", decisionAllow, "static"},
+		{"awk system never static", `awk 'BEGIN{system("id")}'`, "", "no-judge"},
+		{"awk pipe never static", `awk '{print | "sh"}' f.txt`, "", "no-judge"},
+		{"awk program file never static", "awk -f prog.awk f.txt", "", "no-judge"},
+		{"awk environ never static", `awk 'BEGIN{print ENVIRON["HOME"]}'`, "", "no-judge"},
+		{"yq read stays static", "yq .a f.yaml", decisionAllow, "static"},
+		{"yq in-place never static", "yq -i .a=1 f.yaml", "", "no-judge"},
+		{"yq env never static", "yq '.a = strenv(X)' f.yaml", "", "no-judge"},
+		{"jq env field stays static", "jq .spec.env f.json", decisionAllow, "static"},
+		{"jq env dump never static", "jq -n env", "", "no-judge"},
+		{"jq ENV never static", "jq -n '$ENV.HOME'", "", "no-judge"},
+		{"tree depth stays static", "tree -L 2", decisionAllow, "static"},
+		{"tree output file never static", "tree -o out.txt", "", "no-judge"},
+		{"od stays static", "od -c f.bin", decisionAllow, "static"},
+		{"strings stays static", "strings bin/app", decisionAllow, "static"},
+		{"more stays static", "more README.md", decisionAllow, "static"},
+		{"less log file never static", "less -o log f.txt", "", "no-judge"},
+		{"sw_vers stays static", "sw_vers -productVersion", decisionAllow, "static"},
+		{"find name stays static", "find . -name '*.go'", decisionAllow, "static"},
+		{"find type stays static", "find . -type f -newer x", decisionAllow, "static"},
+		{"find -fls never static", "find . -fls out", "", "no-judge"},
+		{"find -fprint0 never static", "find . -fprint0 out", "", "no-judge"},
+		{"find -exec never static", "find . -exec rm {} +", "", "no-judge"},
+		{"git config get stays static", "git config --get user.name", decisionAllow, "static"},
+		{"git config list stays static", "git config --list", decisionAllow, "static"},
+		{"git -C config get stays static", "git -C repo config --get user.name", decisionAllow, "static"},
+		{"git config set never static", "git config user.name x", "", "no-judge"},
+		{"git config global set never static", "git config --global user.name x", "", "no-judge"},
+		{"git stash show stays static", "git stash show -p", decisionAllow, "static"},
+		{"git -C stash list stays static", "git -C repo stash list", decisionAllow, "static"},
+		{"git stash pop never static", "git stash pop", "", "no-judge"},
+		{"bare git tag stays static", "git tag", decisionAllow, "static"},
+		{"git tag list stays static", "git tag -l 'v*'", decisionAllow, "static"},
+		{"git tag create never static", "git tag v1.0", "", "no-judge"},
+		{"git -C tag create never static", "git -C repo tag v2", "", "no-judge"},
+		{"git tag delete never static", "git tag -d v1", "", "no-judge"},
+		{"bare git reflog stays static", "git reflog", decisionAllow, "static"},
+		{"git reflog show stays static", "git reflog show HEAD", decisionAllow, "static"},
+		{"git reflog expire never static", "git reflog expire --all", "", "no-judge"},
+		{"git notes list stays static", "git notes list", decisionAllow, "static"},
+		{"git notes add never static", "git notes add -m x", "", "no-judge"},
+		{"gh pr view stays static", "gh pr view 12", decisionAllow, "static"},
+		{"gh pr list stays static", "gh pr list --state open", decisionAllow, "static"},
+		{"gh run watch stays static", "gh run watch 1", decisionAllow, "static"},
+		{"gh search stays static", "gh search repos frisk", decisionAllow, "static"},
+		{"gh pr merge never static", "gh pr merge 12", "", "no-judge"},
+		{"gh api never static", "gh api repos/x/y", "", "no-judge"},
+		{"gh release create never static", "gh release create v1", "", "no-judge"},
+		{"gh auth token never static", "gh auth token", "", "no-judge"},
+		{"gh show-token never static", "gh auth status --show-token", "", "no-judge"},
+		{"gh browser env never static", "GH_BROWSER=evil gh pr view --web", "", "no-judge"},
+		{"sed w command never static", "sed -n 'w /tmp/copy.txt' README.md", "", "no-judge"},
+		{"sed addressed w command never static", "sed -n '/err/w out.txt' app.log", "", "no-judge"},
+		{"sed s w flag never static", "sed 's/a/b/w /tmp/out.txt' README.md", "", "no-judge"},
+		{"sed s gw flag never static", "sed 's/a/b/gw out.txt' README.md", "", "no-judge"},
+		{"sed e command never static", "sed '1e touch /tmp/pwned' README.md", "", "no-judge"},
+		{"sed s e flag never static", "sed 's/x/date/e' README.md", "", "no-judge"},
+		{"sed -e w command never static", "sed -n -e p -e 'w out.txt' README.md", "", "no-judge"},
+		{"sed w after line-length never static", "sed -l 5 'w out.txt' README.md", "", "no-judge"},
+		{"sed script file never static", "sed -f edit.sed README.md", "", "no-judge"},
+		{"sed range print stays static", "sed -n 1,9p f", decisionAllow, "static"},
+		{"sed word with w and e stays static", "sed 's/where/there/' f", decisionAllow, "static"},
+		{"sed -e scripts stay static", "sed -n -e '/start/,/end/p' -e 's/a/b/g' f.txt", decisionAllow, "static"},
+		{"sed delete and append stay static", "sed '/^#/d;$a done' f.txt", decisionAllow, "static"},
+		{"git diff output never static", "git diff --output=/tmp/x.patch", "", "no-judge"},
+		{"git log output never static", "git log -p --output=/tmp/log.txt", "", "no-judge"},
+		{"git show abbreviated output never static", "git show --out=f HEAD", "", "no-judge"},
+		{"git log oneline stays static", "git log --oneline -5", decisionAllow, "static"},
+		{"git diff stat stays static", "git diff --stat HEAD~1", decisionAllow, "static"},
+		{"less lesskey-src never static", "less --lesskey-src=/tmp/k README.md", "", "no-judge"},
+		{"less lesskey-file never static", "less --lesskey-file /tmp/k README.md", "", "no-judge"},
+		{"less -k never static", "less -k /tmp/k README.md", "", "no-judge"},
+		{"less with flags stays static", "less -SN README.md", decisionAllow, "static"},
+		{"kube config never static", "head -50 ~/.kube/config", "", "no-judge"},
+		{"docker config never static", "cat ~/.docker/config.json", "", "no-judge"},
+		{"gh hosts never static", "cat ~/.config/gh/hosts.yml", "", "no-judge"},
+		{"git-credentials never static", "cat ~/.git-credentials", "", "no-judge"},
+		{"pgpass never static", "cat ~/.pgpass", "", "no-judge"},
+		{"my.cnf never static", "cat ~/.my.cnf", "", "no-judge"},
+		{"cargo credentials never static", "cat ~/.cargo/credentials.toml", "", "no-judge"},
+		{"kube glob never static", "head ~/.kube/conf*", "", "no-judge"},
+		{"cargo manifest stays static", "cat Cargo.toml", decisionAllow, "static"},
+		{"project config stays static", "cat config/app.json", decisionAllow, "static"},
+		{"date set never static", "date -s '2020-01-01'", "", "no-judge"},
+		{"date long set never static", "date --set=2020-01-01", "", "no-judge"},
+		{"date bundled set never static", "date -us 2020-01-01", "", "no-judge"},
+		{"date format stays static", "date +%Y-%m-%d", decisionAllow, "static"},
+		{"date utc stays static", "date -u", decisionAllow, "static"},
+		{"kubectl get secret never static", "kubectl get secret db -o yaml", "", "no-judge"},
+		{"kubectl get secrets never static", "kubectl get secrets", "", "no-judge"},
+		{"kubectl get secret by name never static", "kubectl -n prod get secret/db", "", "no-judge"},
+		{"kubectl get secret in list never static", "kubectl get pods,secrets -A", "", "no-judge"},
+		{"kubectl get pods stays static", "kubectl get pods", decisionAllow, "static"},
+		{"kubectl describe secret stays static", "kubectl describe secret x", decisionAllow, "static"},
+		{"kubectl get sealedsecrets stays static", "kubectl get sealedsecrets", decisionAllow, "static"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -191,19 +292,91 @@ func TestAllowListWithoutDefaultsReplacesBuiltins(t *testing.T) {
 	}
 }
 
+// jevCapture records what the fake server received.
+type jevCapture struct {
+	mu    sync.Mutex
+	calls int
+	raw   string
+	req   jevRequest
+}
+
+type jevRequest struct {
+	State     jevState               `json:"state"`
+	Questions map[string]jevQuestion `json:"questions"`
+}
+
+type jevQuestion struct {
+	Instructions string            `json:"instructions"`
+	Criteria     map[string]string `json:"criteria"`
+}
+
+// jevState is the request state as the judge sees it.
+type jevState struct {
+	Cwd       string            `json:"cwd"`
+	Probe     *jevProbeState    `json:"probe"`
+	Git       map[string]string `json:"git"`
+	Untrusted jevUntrusted      `json:"untrusted"`
+}
+
+type jevProbeState struct {
+	Status string `json:"status"`
+}
+
+type jevUntrusted struct {
+	Command    string              `json:"command"`
+	Script     string              `json:"script"`
+	ScriptPath string              `json:"script_path"`
+	ScriptSHA  string              `json:"script_sha256"`
+	Scripts    []map[string]string `json:"scripts"`
+}
+
+func (c *jevCapture) last() (int, jevState) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls, c.req.State
+}
+
+func (c *jevCapture) request() (string, jevRequest) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.raw, c.req
+}
+
 func fakeJev(t *testing.T, answer jevAnswer) *config {
 	t.Helper()
+	cfg, _ := fakeJevCapture(t, answer)
+	return cfg
+}
+
+func fakeJevCapture(t *testing.T, answer jevAnswer) (*config, *jevCapture) {
+	t.Helper()
+	return fakeJevAnswers(t, map[string]any{"decision": answer})
+}
+
+// fakeJevAnswers serves the given answers verbatim, so a test can return
+// attribution answers or malformed ones.
+func fakeJevAnswers(t *testing.T, answers map[string]any) (*config, *jevCapture) {
+	t.Helper()
+	capture := &jevCapture{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer test-key" {
 			t.Error("missing bearer auth")
 		}
-		var req map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("reading request body: %v", err)
+		}
+		var req jevRequest
+		if err := json.Unmarshal(raw, &req); err != nil {
 			t.Errorf("bad request body: %v", err)
 		}
+		capture.mu.Lock()
+		capture.calls++
+		capture.raw, capture.req = string(raw), req
+		capture.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"model":   "jev-1.13.0",
-			"answers": map[string]jevAnswer{"decision": answer},
+			"answers": answers,
 		})
 	}))
 	t.Cleanup(srv.Close)
@@ -212,7 +385,7 @@ func fakeJev(t *testing.T, answer jevAnswer) *config {
 	t.Cleanup(func() { jevEndpoint = prev })
 	return &config{
 		Jev: jevConfig{Model: "jev-test", KeyCmd: []string{"echo", "test-key"}},
-	}
+	}, capture
 }
 
 func TestJudgeVerdicts(t *testing.T) {
@@ -223,8 +396,13 @@ func TestJudgeVerdicts(t *testing.T) {
 	}{
 		{"confident allow", jevAnswer{Choice: "allow", Confidence: 0.98}, decisionAllow},
 		{"low-confidence allow is silence", jevAnswer{Choice: "allow", Confidence: 0.60}, ""},
-		{"ask passes through", jevAnswer{Choice: "ask", Confidence: 0.30}, decisionAsk},
+		{"ask passes through", jevAnswer{Choice: "ask", Confidence: 0.80}, decisionAsk},
+		{"ask at the floor stays ask", jevAnswer{Choice: "ask", Confidence: 0.50}, decisionAsk},
+		{"uncertain ask is silence", jevAnswer{Choice: "ask", Confidence: 0.49}, ""},
 		{"deny passes through", jevAnswer{Choice: "deny", Confidence: 0.90}, decisionDeny},
+		{"deny at the floor stays deny", jevAnswer{Choice: "deny", Confidence: 0.50}, decisionDeny},
+		{"uncertain deny becomes ask, not silence", jevAnswer{Choice: "deny", Confidence: 0.40}, decisionAsk},
+		{"allow floor is unchanged", jevAnswer{Choice: "allow", Confidence: 0.74}, ""},
 		{"defer is silence", jevAnswer{Choice: "defer", Confidence: 0.90}, ""},
 		{"garbage is silence", jevAnswer{Choice: "banana", Confidence: 0.90}, ""},
 	}
@@ -264,6 +442,227 @@ func TestJudgeRecordsProbabilities(t *testing.T) {
 	}
 }
 
+func TestJudgeReasons(t *testing.T) {
+	const pushRule = "Publishing packages or pushing to a shared branch without review, which others may already have pulled."
+	softClosest := `closest rule: soft_deny "` + pushRule[:70] + `..." (0.71)`
+	const hardClosest = `closest rule: hard_deny "Reading, printing, or transmitting credentials or secret material. Mod..." (0.80)`
+	ask := jevAnswer{Choice: "ask", Confidence: 0.62}
+	r1 := jevAnswer{Choice: "r1", Confidence: 0.80}
+	tests := []struct {
+		name     string
+		command  string
+		answers  map[string]any
+		decision string
+		reason   string
+	}{
+		{
+			"split and closest rule", "terraform apply",
+			map[string]any{
+				"decision": jevAnswer{Choice: "ask", Confidence: 0.62, Probabilities: map[string]float64{"allow": 0.30, "ask": 0.62, "deny": 0.08}},
+				"ask_rule": jevAnswer{Choice: "r2", Confidence: 0.71},
+			},
+			decisionAsk, "jev ask (allow 0.30 / ask 0.62 / deny 0.08); " + softClosest,
+		},
+		{"no closest rule without an answer", "terraform apply", map[string]any{"decision": ask}, decisionAsk, "jev ask (0.62)"},
+		{
+			"attribution none is omitted", "terraform apply",
+			map[string]any{"decision": ask, "ask_rule": jevAnswer{Choice: "none", Confidence: 0.90}},
+			decisionAsk, "jev ask (0.62)",
+		},
+		{
+			"malformed attribution is ignored", "terraform apply",
+			map[string]any{"decision": ask, "ask_rule": "banana", "deny_rule": 7},
+			decisionAsk, "jev ask (0.62)",
+		},
+		{
+			"unknown rule key is ignored", "terraform apply",
+			map[string]any{"decision": ask, "ask_rule": jevAnswer{Choice: "r9", Confidence: 0.90}},
+			decisionAsk, "jev ask (0.62)",
+		},
+		{
+			"deny reads only the deny rule", "terraform apply",
+			map[string]any{"decision": jevAnswer{Choice: "deny", Confidence: 0.90}, "ask_rule": jevAnswer{Choice: "r2", Confidence: 0.99}, "deny_rule": r1},
+			decisionDeny, "jev deny (0.90); " + hardClosest,
+		},
+		{
+			"downgraded deny keeps its rule", "terraform apply",
+			map[string]any{"decision": jevAnswer{Choice: "deny", Confidence: 0.40}, "deny_rule": r1},
+			decisionAsk, "jev deny below confidence floor (0.40), asking; " + hardClosest,
+		},
+		{
+			"silenced ask names no rule", "terraform apply",
+			map[string]any{"decision": jevAnswer{Choice: "ask", Confidence: 0.49}, "ask_rule": r1},
+			"", "jev ask below confidence floor (0.49)",
+		},
+		{
+			"floor form carries the split", "terraform apply",
+			map[string]any{"decision": jevAnswer{Choice: "ask", Confidence: 0.47, Probabilities: map[string]float64{"allow": 0.44, "ask": 0.48, "deny": 0.07}}},
+			"", "jev ask below confidence floor (0.47, allow 0.44 / ask 0.48 / deny 0.07)",
+		},
+		{
+			"allow names no rule", "terraform apply",
+			map[string]any{"decision": jevAnswer{Choice: "allow", Confidence: 0.98}, "ask_rule": r1, "deny_rule": r1},
+			decisionAllow, "jev allow (0.98)",
+		},
+		{
+			"missing script is named", "python3 nope.py",
+			map[string]any{"decision": ask},
+			decisionAsk, "jev ask (0.62); script nope.py not attached: missing",
+		},
+		{
+			"script lost after cd is named", "cd $DIR && python3 build.py",
+			map[string]any{"decision": ask},
+			decisionAsk, "jev ask (0.62); script build.py not attached: unresolvable after cd",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, capture := fakeJevAnswers(t, tt.answers)
+			cfg.Judge.SoftDeny = []string{defaultsMarker, pushRule}
+			v := decide(cfg, tt.command, t.TempDir(), testLogger)
+			if v.Decision != tt.decision || v.Reason != tt.reason {
+				t.Fatalf("verdict = (%q, %q), want (%q, %q)", v.Decision, v.Reason, tt.decision, tt.reason)
+			}
+			_, req := capture.request()
+			wantAsk := map[string]string{"r1": builtinJudge.SoftDeny[0], "r2": pushRule, "none": "No rule fits."}
+			wantDeny := map[string]string{"r1": builtinJudge.HardDeny[0], "none": "No rule fits."}
+			if !maps.Equal(req.Questions["ask_rule"].Criteria, wantAsk) || !maps.Equal(req.Questions["deny_rule"].Criteria, wantDeny) {
+				t.Fatalf("rule questions = %+v", req.Questions)
+			}
+		})
+	}
+}
+
+func TestLogsAttribution(t *testing.T) {
+	cfg, _ := fakeJevAnswers(t, map[string]any{
+		"decision":  jevAnswer{Choice: "ask", Confidence: 0.62},
+		"ask_rule":  jevAnswer{Choice: "r1", Confidence: 0.71},
+		"deny_rule": jevAnswer{Choice: "none", Confidence: 0.93},
+	})
+	v := decide(cfg, "terraform apply", t.TempDir(), testLogger)
+
+	var buf strings.Builder
+	logVerdict(slog.New(slog.NewJSONHandler(&buf, nil)), v, "terraform apply")
+	var rec struct {
+		Reason   string  `json:"reason"`
+		AskRule  string  `json:"ask_rule"`
+		AskConf  float64 `json:"ask_rule_confidence"`
+		DenyRule string  `json:"deny_rule"`
+		DenyConf float64 `json:"deny_rule_confidence"`
+	}
+	if err := json.Unmarshal([]byte(buf.String()), &rec); err != nil {
+		t.Fatalf("log not JSON: %v: %s", err, buf.String())
+	}
+	if rec.AskRule != "r1" || rec.AskConf != 0.71 || rec.DenyRule != "none" || rec.DenyConf != 0.93 || rec.Reason != v.Reason {
+		t.Fatalf("log record = %s", buf.String())
+	}
+}
+
+func TestJoinReason(t *testing.T) {
+	t.Parallel()
+	got := joinReason("jev ask\n(0.62)", "", strings.Repeat("x", 400))
+	if strings.ContainsAny(got, "\n\r") || !strings.HasPrefix(got, "jev ask (0.62); xxx") {
+		t.Fatalf("reason = %q", got)
+	}
+	if n := len([]rune(got)); n != maxReasonChars+3 || !strings.HasSuffix(got, "...") {
+		t.Fatalf("reason length = %d, want capped at %d plus ellipsis", n, maxReasonChars)
+	}
+}
+
+// gitRepo builds a repo on branch feature tracking origin/main, whose remote
+// URL carries userinfo, and returns the directory above it.
+func gitRepo(t *testing.T) string {
+	t.Helper()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_CEILING_DIRECTORIES", root)
+	repo := filepath.Join(root, "repo")
+	steps := [][]string{
+		{"init", "-q", "-b", "main", repo},
+		{"-C", repo, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "init"},
+		{"-C", repo, "remote", "add", "origin", "https://deploy:s3cretpass@github.com/owner/repo.git"}, // gitleaks:allow
+		{"-C", repo, "update-ref", "refs/remotes/origin/main", "HEAD"},
+		{"-C", repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"},
+		{"-C", repo, "checkout", "-q", "-b", "feature"},
+		{"-C", repo, "branch", "-q", "--set-upstream-to=origin/main"},
+	}
+	for _, args := range steps {
+		if out, err := exec.CommandContext(t.Context(), "git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	return root
+}
+
+func TestGitFacts(t *testing.T) {
+	root := gitRepo(t)
+	prev := gitFactsTimeout
+	gitFactsTimeout = 10 * time.Second
+	t.Cleanup(func() { gitFactsTimeout = prev })
+
+	facts := map[string]string{
+		"branch": "feature", "upstream": "origin/main", "default_branch": "main", "remote": "github.com/owner/repo",
+	}
+	tests := []struct {
+		name    string
+		cwd     string
+		command string
+		want    map[string]string
+	}{
+		{"git command", "repo", "git push", facts},
+		{"gh command", "repo", "gh pr create --fill", facts},
+		{"wrapped git command", "repo", "time git push", facts},
+		{"literal cd target", ".", "cd repo && git push", facts},
+		{"git -C target", ".", "git -C repo push", facts},
+		{"non-git command", "repo", "terraform plan", nil},
+		{"outside a repo", ".", "git push", nil},
+		{"unknown directory", "repo", "cd $DIR && git push", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, capture := fakeJevCapture(t, jevAnswer{Choice: "ask", Confidence: 0.90})
+			decide(cfg, tt.command, filepath.Join(root, tt.cwd), testLogger)
+			raw, req := capture.request()
+			if !maps.Equal(req.State.Git, tt.want) {
+				t.Fatalf("git state = %v, want %v", req.State.Git, tt.want)
+			}
+			if strings.Contains(raw, "s3cretpass") || strings.Contains(raw, "deploy") {
+				t.Fatalf("remote userinfo leaked into the request: %s", raw)
+			}
+			explained := strings.Contains(req.Questions["decision"].Instructions, "`git.upstream`")
+			if explained != (tt.want != nil) || strings.Contains(raw, `"git":{}`) {
+				t.Fatalf("git instruction present = %v, want %v", explained, tt.want != nil)
+			}
+		})
+	}
+}
+
+func TestRemoteSlug(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		raw  string
+		want string
+	}{
+		{"https://deploy:s3cretpass@github.com/owner/repo.git", "github.com/owner/repo"}, // gitleaks:allow
+		{"https://github.com/owner/repo", "github.com/owner/repo"},
+		{"https://github.com/owner/repo.git?token=abc", "github.com/owner/repo"},
+		{"git@github.com:owner/repo.git", "github.com/owner/repo"},
+		{"ssh://git@gitlab.example.com:2222/group/sub/repo.git", "gitlab.example.com/group/sub/repo"},
+		{"/srv/git/repo.git", ""},
+		{"../sibling/repo", ""},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		if got := remoteSlug(tt.raw); got != tt.want {
+			t.Errorf("remoteSlug(%q) = %q, want %q", tt.raw, got, tt.want)
+		}
+	}
+}
+
 func TestJevUnreachableIsSilence(t *testing.T) {
 	prev := jevEndpoint
 	jevEndpoint = "http://127.0.0.1:1"
@@ -274,39 +673,212 @@ func TestJevUnreachableIsSilence(t *testing.T) {
 	}
 }
 
-func TestProbeScript(t *testing.T) {
+// probeFixture lays out scripts, decoys, symlinks, and credential-shaped
+// files, and returns the symlink-resolved root.
+func probeFixture(t *testing.T) string {
+	t.Helper()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	filler := strings.Repeat("x = 1\n", 20<<10/6)
+	files := map[string]string{
+		"proj/stats.py":     "print('ok')\n",
+		"proj/smoke.sh":     "#!/usr/bin/env bash\necho smoke\n",
+		"proj/app.js":       "console.log(1)\n",
+		"proj/teardown":     "#!/usr/bin/env bash\nrm -rf build\n",
+		"proj/tool.ts":      "#!/usr/bin/env -S node22 --no-warnings\nconsole.log(1)\n",
+		"proj/blob":         "\x7fELF\x02\x01\x01",
+		"proj/decoy.py":     "print('decoy')\n",
+		"proj/sub/stats.py": "print('sub')\n",
+		"proj/big.py":       strings.Repeat("x = 1\n", maxScriptBytes/6+1),
+		"proj/half1.py":     filler,
+		"proj/half2.py":     filler + "y = 2\n",
+		"proj/latin.py":     "# caf\xe9\nprint(1)\n",
+		"proj/paths.py":     "ROOT = '/Users/someone/Projects/example/scripts/tools/helpers'\n",
+		"outside/.netrc":    "machine example.com\n",
+		"outside/netrc":     "machine api.example.com\n  login deploy\n  password hunter2hunter2\n", // gitleaks:allow
+		"proj/keyed.py":     "api_key = 'abcdefghij0123456789'\n",                                   // gitleaks:allow
+		"proj/dsn.py":       "URL = 'postgres://admin:S3cr3tP4ss@db.internal:5432/app'\n",           // gitleaks:allow
+		"proj/oneline.py":   "# machine api.example.com login deploy password hunter2\n",            // gitleaks:allow
+		"proj/aws.py":       "aws_secret_access_key = wJalr\n",                                      // gitleaks:allow
+		"proj/hex.py":       "DIGEST = '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08'\n",
+		"proj/b64.py":       "BLOB = 'aW1wb3J0IHNodXRpbCwgb3MKc2h1dGlsLnJtdHJlZShvcy5wYXRoLmV4cGFuZHVzZXIoIn4vLmNvbmZpZyIpKQ=='\n", // gitleaks:allow
+	}
+	for rel, body := range files {
+		path := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	links := map[string]string{"proj/link_path.py": "../outside/.netrc", "proj/link_content.py": "../outside/netrc"}
+	for rel, target := range links {
+		if err := os.Symlink(target, filepath.Join(root, rel)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
+}
+
+func TestProbeScripts(t *testing.T) {
 	t.Parallel()
-	dir := t.TempDir()
-	resolved, err := filepath.EvalSymlinks(dir)
-	if err != nil {
-		t.Fatal(err)
+	root := probeFixture(t)
+	tests := []struct {
+		name    string
+		cwd     string
+		command string
+		status  string
+		paths   []string
+	}{
+		{"plain interpreter", "proj", "python3 stats.py", probeAttached, []string{"proj/stats.py"}},
+		{"no script", "proj", "git status", "", nil},
+		{"stacked wrappers", "proj", "time uv run python stats.py", probeAttached, []string{"proj/stats.py"}},
+		{"timeout wrapper", "proj", "timeout 120 bash smoke.sh", probeAttached, []string{"proj/smoke.sh"}},
+		{"timeout with signal flag", "proj", "timeout -s KILL 5 bash smoke.sh", probeAttached, []string{"proj/smoke.sh"}},
+		{"redirect and pipe after script", "proj", "timeout 120 bash smoke.sh 2>&1 | tail -20", probeAttached, []string{"proj/smoke.sh"}},
+		{"env nice nohup", "proj", "env FOO=1 nice -n 5 nohup python3 stats.py", probeAttached, []string{"proj/stats.py"}},
+		{"exec wrapper", "proj", "exec python3 stats.py", probeAttached, []string{"proj/stats.py"}},
+		{"uv run script file", "proj", "uv run --with rich stats.py", probeAttached, []string{"proj/stats.py"}},
+		{"uvx wrapper", "proj", "uvx --from tools python stats.py", probeAttached, []string{"proj/stats.py"}},
+		{"env chdir is unresolvable", "proj", "env -C sub python3 stats.py", probeUnresolvable, nil},
+		{"uv directory is unresolvable", "proj", "uv run --directory sub python stats.py", probeUnresolvable, nil},
+		{"versioned python", "proj", "python3.12 stats.py", probeAttached, []string{"proj/stats.py"}},
+		{"versioned node", "proj", "node22 app.js", probeAttached, []string{"proj/app.js"}},
+		{"extensionless shebang", "proj", "./teardown", probeAttached, []string{"proj/teardown"}},
+		{"unknown extension shebang", "proj", "./tool.ts", probeAttached, []string{"proj/tool.ts"}},
+		{"binary is not a script", "proj", "./blob", "", nil},
+		{"flag value skipped", "proj", "python3 -W ignore stats.py", probeAttached, []string{"proj/stats.py"}},
+		{"attached flag value skipped", "proj", "python3 -Wignore -u stats.py", probeAttached, []string{"proj/stats.py"}},
+		{"node require skipped", "proj", "node -r dotenv/config app.js", probeAttached, []string{"proj/app.js"}},
+		{"bash option value skipped", "proj", "bash -euo pipefail smoke.sh", probeAttached, []string{"proj/smoke.sh"}},
+		{"python -c has no file", "proj", "python3 -c 'print(1)' stats.py", "", nil},
+		{"python -m has no file", "proj", "python3 -m http.server", "", nil},
+		{"python stdin has no file", "proj", "python3 - stats.py", "", nil},
+		{"bash -c has no file", "proj", "bash -ec 'echo hi'", "", nil},
+		{"node -e has no file", "proj", "node -e 'console.log(1)'", "", nil},
+		{"cd then relative", "proj", "cd sub && python3 stats.py", probeAttached, []string{"proj/sub/stats.py"}},
+		{"cd never falls back to cwd", "proj", "cd sub && python3 decoy.py", probeMissing, nil},
+		{"cd variable is unresolvable", "proj", "cd $DIR && python3 stats.py", probeUnresolvable, nil},
+		{"subshell cd is unresolvable", "proj", "(cd sub && python3 stats.py)", probeUnresolvable, nil},
+		{"absolute path survives unknown cd", "proj", "cd $DIR && python3 {root}/proj/stats.py", probeAttached, []string{"proj/stats.py"}},
+		{"variable target is unresolvable", "proj", "python3 $SCRIPT", probeUnresolvable, nil},
+		{"bare script name is unresolvable", "proj", "smoke.sh", probeUnresolvable, nil},
+		{"missing script", "proj", "python3 nope.py", probeMissing, nil},
+		{"every script is probed", "proj", "python3 stats.py && bash smoke.sh", probeAttached, []string{"proj/stats.py", "proj/smoke.sh"}},
+		{"repeated script sent once", "proj", "python3 stats.py; python3 stats.py", probeAttached, []string{"proj/stats.py"}},
+		{"one missing among several", "proj", "python3 stats.py && bash nope.sh", probeMissing, []string{"proj/stats.py"}},
+		{"combined cap truncates", "proj", "python3 half1.py && python3 half2.py", probeTruncated, []string{"proj/half1.py"}},
+		{"oversize", "proj", "python3 big.py", probeOversize, nil},
+		{"non-utf8", "proj", "python3 latin.py", probeNonUTF8, nil},
+		{"symlink to credential path", "proj", "python3 link_path.py", probeWithheld, nil},
+		{"symlink to credential content", "proj", "python3 link_content.py", probeWithheld, nil},
+		{"withheld wins over attached", "proj", "python3 stats.py && python3 keyed.py", probeWithheld, []string{"proj/stats.py"}},
+		{"key assignment withheld", "proj", "python3 keyed.py", probeWithheld, nil},
+		{"url userinfo withheld", "proj", "python3 dsn.py", probeWithheld, nil},
+		{"netrc line withheld", "proj", "python3 oneline.py", probeWithheld, nil},
+		{"aws secret withheld", "proj", "python3 aws.py", probeWithheld, nil},
+		{"long hex withheld", "proj", "python3 hex.py", probeWithheld, nil},
+		{"long base64 withheld", "proj", "python3 b64.py", probeWithheld, nil},
+		{"long path is not a secret", "proj", "python3 paths.py", probeAttached, []string{"proj/paths.py"}},
 	}
-	script := filepath.Join(resolved, "analyze.py")
-	if writeErr := os.WriteFile(script, []byte("print('ok')\n"), 0o600); writeErr != nil {
-		t.Fatal(writeErr)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			segments, _ := parseCommand(strings.ReplaceAll(tt.command, "{root}", root))
+			res := probeScripts(segments, filepath.Join(root, tt.cwd))
+			if res.Status != tt.status {
+				t.Fatalf("status = %q, want %q", res.Status, tt.status)
+			}
+			var got []string
+			for _, s := range res.Scripts {
+				rel, _ := filepath.Rel(root, s.Path)
+				got = append(got, rel)
+				if len(s.SHA) != 64 || s.Contents == "" {
+					t.Fatalf("incomplete probe: %+v", s)
+				}
+			}
+			if !slices.Equal(got, tt.paths) {
+				t.Fatalf("scripts = %v, want %v", got, tt.paths)
+			}
+		})
 	}
+}
 
-	segments, _ := parseCommand("python3 analyze.py")
-	probe, err := probeScript(segments, resolved)
-	if err != nil {
-		t.Fatal(err)
+func TestJudgeState(t *testing.T) {
+	root := probeFixture(t)
+	cwd := filepath.Join(root, "proj")
+	tests := []struct {
+		name    string
+		command string
+		called  bool
+		status  string // "" means no probe field
+		scripts int
+	}{
+		{"single script keeps flat fields", "python3 stats.py", true, probeAttached, 1},
+		{"several scripts ride as an array", "python3 stats.py && bash smoke.sh", true, probeAttached, 2},
+		{"missing body is explained", "python3 nope.py", true, probeMissing, 0},
+		{"oversize body is explained", "python3 big.py", true, probeOversize, 0},
+		{"no script has no probe field", "terraform plan", true, "", 0},
+		{"credential-shaped script never reaches the judge", "python3 keyed.py", false, probeWithheld, 0},
 	}
-	if probe.Path != script || !strings.Contains(probe.Contents, "print") || len(probe.SHA) != 64 {
-		t.Fatalf("probe = %+v", probe)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, capture := fakeJevCapture(t, jevAnswer{Choice: "allow", Confidence: 0.98})
+			v := decide(cfg, tt.command, cwd, testLogger)
+			calls, state := capture.last()
+			if (calls == 1) != tt.called {
+				t.Fatalf("judge calls = %d, want called=%v", calls, tt.called)
+			}
+			if v.Probe != tt.status || v.Scripts != tt.scripts {
+				t.Fatalf("verdict probe = (%q, %d), want (%q, %d)", v.Probe, v.Scripts, tt.status, tt.scripts)
+			}
 
-	secret := filepath.Join(resolved, "leak.py")
-	if err := os.WriteFile(secret, []byte("api_key = 'abcdefghij0123456789'\n"), 0o600); err != nil { // gitleaks:allow
-		t.Fatal(err)
-	}
-	segments, _ = parseCommand("python3 leak.py")
-	if _, probeErr := probeScript(segments, resolved); probeErr == nil {
-		t.Fatal("credential-shaped script must not be sent")
-	}
+			var buf strings.Builder
+			logVerdict(slog.New(slog.NewJSONHandler(&buf, nil)), v, tt.command)
+			var rec struct {
+				Probe   string `json:"probe"`
+				Scripts *int   `json:"scripts"`
+			}
+			if err := json.Unmarshal([]byte(buf.String()), &rec); err != nil {
+				t.Fatalf("log not JSON: %v: %s", err, buf.String())
+			}
+			wantLogged := tt.status
+			if wantLogged == "" {
+				wantLogged = "none"
+			}
+			if rec.Probe != wantLogged || rec.Scripts == nil || *rec.Scripts != tt.scripts {
+				t.Fatalf("log record = %s", buf.String())
+			}
+			if !tt.called {
+				if v.Decision != "" {
+					t.Fatalf("withheld script must be silence, got %q", v.Decision)
+				}
+				return
+			}
 
-	segments, _ = parseCommand("git status")
-	if probe, _ := probeScript(segments, resolved); probe.Path != "" {
-		t.Fatalf("no script expected, got %q", probe.Path)
+			if state.Cwd != cwd {
+				t.Fatalf("state cwd = %q, want %q", state.Cwd, cwd)
+			}
+			if (state.Probe != nil) != (tt.status != "") || (state.Probe != nil && state.Probe.Status != tt.status) {
+				t.Fatalf("state probe = %+v, want status %q", state.Probe, tt.status)
+			}
+			u := state.Untrusted
+			if u.Command != tt.command {
+				t.Fatalf("untrusted command = %q", u.Command)
+			}
+			flat := u.Script != "" && u.ScriptPath != "" && len(u.ScriptSHA) == 64
+			if flat != (tt.scripts == 1) || (tt.scripts > 1 && len(u.Scripts) != tt.scripts) || (tt.scripts <= 1 && u.Scripts != nil) {
+				t.Fatalf("untrusted scripts = flat %v, array %d, want %d", flat, len(u.Scripts), tt.scripts)
+			}
+			for _, entry := range u.Scripts {
+				if entry["path"] == "" || len(entry["sha256"]) != 64 || entry["contents"] == "" || len(entry) != 3 {
+					t.Fatalf("script entry = %v", entry)
+				}
+			}
+		})
 	}
 }
 

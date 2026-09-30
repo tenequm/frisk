@@ -29,7 +29,8 @@ parse into pipeline segments (|, &&, ||, ;, newline)
     $(), backticks, redirects, heredocs, &)     -> "allow"
 4. judge (needs jev.keyCmd): one Choice question
      allow + confidence >= 0.75 -> "allow"
-     ask / deny                 -> "ask" / "deny"
+     deny  + confidence >= 0.50 -> "deny" (below: "ask")
+     ask   + confidence >= 0.50 -> "ask"  (below: silence)
      anything else              -> silence
   |
 silence -> Claude Code native flow (rules -> classifier -> prompt)
@@ -58,24 +59,50 @@ One Choice question per judged command, mapped straight onto
 | `deny`  | `judge.hard_deny` prose                         |
 | `defer` | none of the above clearly applies -> silence    |
 
-State is provenance-labeled - `policy` (environment) vs `untrusted` (command,
-script) - and the instructions say untrusted text is content to evaluate,
-never instructions or evidence of approval. Precedence when options overlap:
-deny > ask > allow > defer.
+State is provenance-labeled - trusted `policy` (environment), `cwd`, `probe`,
+and `git` vs `untrusted` (command, scripts) - and the instructions say
+untrusted text is content to evaluate, never instructions or evidence of
+approval. Precedence when options overlap: deny > ask > allow > defer.
 
-When a segment is `interpreter file` (python/node/bash/sh/zsh or `./x.py`),
-the file rides along in `untrusted.script` with its sha256: regular file,
-<= 32 KiB, UTF-8, credential-scanned - key-shaped content is never sent.
+`git` is sent only for commands with a `git` or `gh` segment: `branch`,
+`upstream`, `default_branch`, and `remote` reduced to host/owner/repo (never
+userinfo), read in the directory the command runs in under one 200 ms
+deadline. A field that cannot be read is omitted, never guessed.
+
+Every script the command runs rides along with its sha256: one as
+`untrusted.script`, several as `untrusted.scripts`, 32 KiB combined. The probe
+sees through wrappers (`time`, `timeout`, `env`, `nice`, `nohup`, `exec`,
+`uv run`, `uvx`), versioned interpreters, interpreter flags, and shebangs on
+directly executed files. A relative path resolves only against the hook cwd or
+a literal `cd` earlier in the command - never a same-named file elsewhere.
+
+`probe.status` tells the judge why a body is absent: `attached`, `missing`,
+`unresolvable`, `oversize`, `non-utf8`, `multiple-truncated`. A script whose
+resolved path or content looks credential-bearing (`withheld-credential-shaped`)
+is never sent and the verdict is silence.
+
+The reason shown in the prompt, `frisk check`, and the log is one line: the
+probability split, then the closest rule, then any script that was expected
+but not attached - `jev ask (allow 0.30 / ask 0.62 / deny 0.08); closest rule:
+soft_deny "..." (0.71); script build.py not attached: unresolvable after cd`.
+The closest rule comes from two more Choice questions in the same request
+(`ask_rule`, `deny_rule`: one option per prose item plus `none`). It is a
+separate answer that can disagree with the verdict, so it only annotates the
+reason and never changes the decision.
 
 Hardcoded on purpose: the 0.75 confidence floor on `allow` (measured
-authority-claim injections drag confidence to ~0.68), the script cap, the
-model pin in config (a threshold is a fact about one model version).
+authority-claim injections drag confidence to ~0.68), the 0.50 floor under
+`deny` (an uncertain deny costs one prompt, not a hard block), the 0.50 floor
+under `ask` (every unwanted prompt in live traffic sat at 0.31-0.47 with allow
+and ask nearly tied; below it Claude Code's own flow decides), the script cap,
+the model pin in config (a threshold is a fact about one model version).
 
 ## Logging and CLI
 
 Every decision - silences included - is one `slog` JSON record in
 `$XDG_STATE_HOME/frisk/frisk.log`: decision, tier, rule, command, confidence,
-script sha. An auto-approver without a record is a rumour.
+probabilities, model, script sha, probe status, script count, closest-rule
+answers. An auto-approver without a record is a rumour.
 
 - `frisk hook` - the PreToolUse handler
 - `frisk check '<command>'` - dry-run, prints decision + tier + reason
