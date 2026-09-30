@@ -15,4 +15,4 @@ Register `frisk hook` as a `PreToolUse` hook with matcher `Bash`. Design: [DESIG
 
 To gate file edits too, use matcher `Bash|Edit|Write|NotebookEdit` and write `Edit(<path-pattern>)` rules in `permissions.*`; frisk's own config and Claude Code's settings and hooks always ask.
 
-`frisk validate [--live]` checks the config (a malformed one silently disables the gate); `--live` makes one real judge call. `frisk version` (or `--version`, `-V`) prints the build's version.
+`frisk validate [--live]` checks the config (a malformed one silently disables the gate); `--live` makes one real judge call. `frisk --version` (or `-V`, or `frisk version`) prints the build's version.

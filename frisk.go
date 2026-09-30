@@ -372,6 +372,12 @@ func main() {
 }
 
 func run(args []string, stdin io.Reader, stdout io.Writer) int {
+	// Global flags are answered before config or the log are touched.
+	if len(args) > 0 && slices.Contains([]string{"--version", "-V", "version"}, args[0]) {
+		fmt.Fprintln(stdout, buildVersion())
+		return 0
+	}
+
 	lg := newLogger()
 	cfg, cfgErr := loadConfig()
 	if cfgErr != nil {
@@ -379,7 +385,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer) int {
 	}
 
 	if len(args) == 0 {
-		fmt.Fprintln(stdout, "usage: frisk hook|check|validate|version")
+		fmt.Fprintln(stdout, "usage: frisk [--version|-V] hook|check|validate|version")
 		return 2
 	}
 
@@ -394,11 +400,8 @@ func run(args []string, stdin io.Reader, stdout io.Writer) int {
 		return runCheck(cfg, cfgErr, strings.Join(args[1:], " "), stdout, lg)
 	case "validate":
 		return runValidate(cfg, cfgErr, args[1:], stdout, lg)
-	case "version", "--version", "-V":
-		fmt.Fprintln(stdout, buildVersion())
-		return 0
 	default:
-		fmt.Fprintln(stdout, "usage: frisk hook|check|validate|version")
+		fmt.Fprintln(stdout, "usage: frisk [--version|-V] hook|check|validate|version")
 		return 2
 	}
 }
