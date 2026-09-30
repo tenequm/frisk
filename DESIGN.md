@@ -156,12 +156,18 @@ aimed at another repository (`--git-dir`, `GIT_DIR`, ...). State is not
 followed across segments either, so an earlier git segment of the same command
 can make it `unknown`, by what the record depends on:
 
-- a push's fields depend on the checked-out branch, its upstream and the
-  remotes. An earlier `switch`, `checkout`, `branch`, `remote`, `worktree`,
-  `clone` or `bisect` that is not a read, a `-u` / `--set-upstream`, a
-  `stash branch`, a rebase given the branch to rebase, or any segment of class
-  `exec` or `unknown` invalidates them. `add`, `commit`, `merge`, `reset` and
-  the like do not: `git add -A && git commit -m x && git push` keeps its facts.
+- a push's fields depend on the remotes, and on the checked-out branch and
+  its upstream when the push leaves its remote or destination to them (no
+  remote, no refspec, or `HEAD`). An earlier `remote` or `clone` that is not a
+  read, or any segment of class `exec` or `unknown`, may have changed a remote
+  and invalidates every push after it. An earlier `switch`, `checkout`,
+  `branch`, `worktree` or `bisect` that is not a read, a `-u` /
+  `--set-upstream`, a `stash branch`, or a rebase given the branch to rebase
+  may have moved the branch and invalidates only a push that goes by it:
+  `git switch -c x && git push -u origin x` keeps its facts, `git switch main
+  && git push` does not. `add`, `commit`, `merge`, `reset` and the like
+  invalidate neither: `git add -A && git commit -m x && git push` keeps its
+  facts.
 - a discard's counts are invalidated by any earlier git segment that is not a
   read. A non-git segment that writes files is not noticed.
 

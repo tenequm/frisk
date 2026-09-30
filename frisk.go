@@ -1578,10 +1578,11 @@ const (
 // it, in gitArgClass. vals are the short flags that take a value, so the word
 // after one is neither a flag nor an operand.
 type gitSub struct {
-	class string
-	vals  string
-	force bool // -f and --force override a safety check here
-	moves bool // can change the checked-out branch, its upstream or a remote
+	class   string
+	vals    string
+	force   bool // -f and --force override a safety check here
+	moves   bool // can change which branch is checked out or its upstream
+	rewires bool // can change a remote
 }
 
 var gitSubs = map[string]gitSub{
@@ -1600,7 +1601,7 @@ var gitSubs = map[string]gitSub{
 
 	subPush: {class: gitRemote, vals: "o", force: true}, "fetch": {class: gitRemote, force: true},
 	"pull": {class: gitRemote, force: true}, "ls-remote": {class: gitRemote},
-	"clone": {vals: "ubco", moves: true}, subRemote: {moves: true},
+	"clone": {vals: "ubco", rewires: true}, subRemote: {rewires: true},
 
 	"config": {vals: "f"}, "submodule": {}, "difftool": {class: gitExec},
 	"mergetool": {class: gitExec}, "filter-branch": {class: gitExec},
@@ -1658,9 +1659,9 @@ type gitCommand struct {
 	override   bool     // -c or another option that swaps config or the programs git runs
 
 	forced, noVerify, deletesRef, hard, amend bool
-	// moves: it can change the checked-out branch, its upstream or a remote,
-	// which is what a later push in the same command goes by.
-	moves bool
+	// A later push in the same command goes by the checked-out branch and its
+	// upstream, which moves can change, and by the remotes, which rewires can.
+	moves, rewires bool
 
 	remote      string // push: the remote operand, "" when the words name none
 	destination string // push: a branch, gitHead, "" with no refspec, or gitUnknown
@@ -1792,6 +1793,7 @@ func (g *gitCommand) describeArgs(words []string) {
 	g.moves = g.class != gitRead && (row.moves || a.has("--set-upstream") || sub == subPush && a.has("-u") ||
 		sub == subStash && slices.Contains(a.operands[:min(1, len(a.operands))], subBranch) ||
 		sub == subRebase && len(a.operands) > 1)
+	g.rewires = g.class != gitRead && row.rewires
 	switch sub {
 	case subBranch:
 		g.deletesRef = a.has("-d", "-D", "--delete")
@@ -1995,7 +1997,7 @@ func gitFacts(segments, env [][]string, cwd string) (map[string]any, string) {
 	dir := shellDir{path: cwd, known: cwd != ""}
 	var targets []gitTarget
 	var base *shellDir
-	moved, changed := false, false
+	moved, rewired, changed := false, false, false
 	for i, seg := range segments {
 		if len(seg) == 0 || dir.step(seg) {
 			continue
@@ -2013,11 +2015,14 @@ func gitFacts(segments, env [][]string, cwd string) (map[string]any, string) {
 			}
 			at.known = at.known && !cmd.retargeted
 			// State is not followed across segments. A push's facts go stale
-			// once a segment may have moved the branch, its upstream or a
-			// remote; a discard's counts once anything but a read has run.
-			stale := cmd.subcommand == subPush && moved || cmd.class == gitDiscard && changed
+			// once a segment may have changed a remote, and once one may have
+			// moved the branch if the push leaves its remote or destination to
+			// the branch; a discard's counts once anything but a read has run.
+			byBranch := cmd.remote == "" || cmd.destination == "" || cmd.destination == gitHead
+			stale := cmd.subcommand == subPush && (rewired || moved && byBranch) || cmd.class == gitDiscard && changed
 			targets = append(targets, gitTarget{cmd: cmd, dir: at.path, current: at.known && !stale})
-			moved = moved || cmd.moves || cmd.class == gitExec || cmd.class == gitUnknown
+			moved = moved || cmd.moves
+			rewired = rewired || cmd.rewires || cmd.class == gitExec || cmd.class == gitUnknown
 			changed = changed || cmd.class != gitRead
 		case verbGH:
 		default:

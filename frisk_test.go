@@ -1965,10 +1965,28 @@ func TestGitRecords(t *testing.T) {
 			"push:remote",
 		},
 		{
-			"state is unknown after a local change", "git switch -c x && git push -u origin x",
+			"a push that names its remote and branch does not go by the checked-out branch", "git switch -c x && git push -u origin x",
 			`[{"class":"local","state":"current","subcommand":"switch"},` +
-				`{"class":"remote","deletes_ref":false,"destination":"x","destination_is_default":"unknown","forced":false,"remote":"unknown","state":"unknown","subcommand":"push"}]`,
+				`{"class":"remote","deletes_ref":false,"destination":"x","destination_is_default":"no","forced":false,"remote":"github.com/owner/repo","state":"current","subcommand":"push"}]`,
 			"switch:local,push:remote",
+		},
+		{
+			"a push that goes by the checked-out branch is unknown once it may have moved", "git switch main && git push",
+			`[{"class":"local","state":"current","subcommand":"switch"},` +
+				`{"class":"remote","deletes_ref":false,"destination":"unknown","destination_is_default":"unknown","forced":false,"remote":"unknown","state":"unknown","subcommand":"push"}]`,
+			"switch:local,push:remote",
+		},
+		{
+			"a push of HEAD is unknown once the branch may have moved", "git switch -c x && git push -u origin HEAD",
+			`[{"class":"local","state":"current","subcommand":"switch"},` +
+				`{"class":"remote","deletes_ref":false,"destination":"unknown","destination_is_default":"unknown","forced":false,"remote":"unknown","state":"unknown","subcommand":"push"}]`,
+			"switch:local,push:remote",
+		},
+		{
+			"a changed remote makes a push's facts unknown", "git remote set-url origin https://example.com/o/r.git && git push origin main",
+			`[{"class":"remote","deletes_ref":false,"forced":false,"state":"current","subcommand":"remote"},` +
+				`{"class":"remote","deletes_ref":false,"destination":"main","destination_is_default":"unknown","forced":false,"remote":"unknown","state":"unknown","subcommand":"push"}]`,
+			"remote:remote,push:remote",
 		},
 		{
 			"a read leaves the state current", "git --no-pager log -1 && git push origin main",
@@ -2146,10 +2164,7 @@ func TestGitMoves(t *testing.T) {
 		{"git branch feat/x", true},
 		{"git branch -u origin/other", true},
 		{"git branch -D feat/x", true},
-		{"git remote set-url origin https://example.com/o/r.git", true},
-		{"git remote add up https://example.com/o/r.git", true},
 		{"git worktree add ../wt", true},
-		{"git clone https://example.com/o/r.git", true},
 		{"git bisect start", true},
 		{"git push -u origin feat/x", true},
 		{"git push --set-upstream origin feat/x", true},
@@ -2158,6 +2173,8 @@ func TestGitMoves(t *testing.T) {
 		{"git stash branch feat/y", true},
 		{"git rebase main feat/x", true},
 
+		{"git remote set-url origin https://example.com/o/r.git", false},
+		{"git clone https://example.com/o/r.git", false},
 		{"git branch", false},
 		{"git branch -avv", false},
 		{"git remote -v", false},
@@ -2183,6 +2200,21 @@ func TestGitMoves(t *testing.T) {
 		g, ok := describeGit(strings.Fields(tt.command))
 		if !ok || g.moves != tt.moves {
 			t.Errorf("describeGit(%q).moves = %v, want %v", tt.command, g.moves, tt.moves)
+		}
+	}
+	for command, rewires := range map[string]bool{
+		"git remote set-url origin https://example.com/o/r.git": true,
+		"git remote add up https://example.com/o/r.git":         true,
+		"git remote remove up":                                  true,
+		"git clone https://example.com/o/r.git":                 true,
+		"git remote -v":                                         false,
+		"git remote get-url origin":                             false,
+		"git switch -c feat/x":                                  false,
+		"git fetch origin":                                      false,
+		"git commit -m x":                                       false,
+	} {
+		if g, ok := describeGit(strings.Fields(command)); !ok || g.rewires != rewires {
+			t.Errorf("describeGit(%q).rewires = %v, want %v", command, g.rewires, rewires)
 		}
 	}
 }
