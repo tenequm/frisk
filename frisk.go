@@ -506,10 +506,10 @@ func runCheck(cfg *config, cfgErr error, command string, stdout io.Writer, lg *s
 
 func decide(cfg *config, command, cwd string, lg *slog.Logger) verdict {
 	parsed := tokenize(command)
-	static, sound := parsed.staticSegments()
-	// Deny and ask rules see the words both as written and as the static tier
-	// reads them, so a literal variable cannot carry a command past one.
-	segments := slices.Concat(parsed.segments(), static)
+	readings, sound := parsed.staticSegments()
+	// Deny and ask rules see the words as written and as each shell reads
+	// them, so a literal variable cannot carry a command past one.
+	segments := slices.Concat(parsed.segments(), readings[0], readings[1])
 
 	if rule := matchAny(cfg.Permissions.Deny, segments); rule != "" {
 		return verdict{Decision: decisionDeny, Tier: "deny-rule", Reason: "matches deny rule: " + rule}
@@ -517,8 +517,8 @@ func decide(cfg *config, command, cwd string, lg *slog.Logger) verdict {
 	if rule := matchAny(cfg.Permissions.Ask, segments); rule != "" {
 		return verdict{Decision: decisionAsk, Tier: "ask-rule", Reason: "matches ask rule: " + rule}
 	}
-	if sound && len(static) > 0 {
-		if rule, ok := allSegmentsAllowed(cfg.Permissions.Allow, static); ok {
+	if sound && len(readings[0]) > 0 {
+		if rule, ok := allSegmentsAllowed(cfg.Permissions.Allow, readings[:]...); ok {
 			return verdict{Decision: decisionAllow, Tier: "static", Reason: "every segment is read-only: " + rule}
 		}
 	}
@@ -534,7 +534,10 @@ func decide(cfg *config, command, cwd string, lg *slog.Logger) verdict {
 type word struct {
 	text, exp string
 	quoted    bool // any quoting or escaping, which stops tilde expansion
-	glob      bool // an unquoted "*", "?", "[" or "{", which the shell may expand into paths
+	// double: every byte sat inside double quotes, where an expanded value
+	// stays one word in bash and zsh alike.
+	double bool
+	glob   bool // an unquoted "*", "?", "[" or "{", which the shell may expand into paths
 }
 
 type statement struct {
@@ -588,16 +591,16 @@ func tokenize(command string) parsedCommand {
 	var docs []heredoc
 	var tok, exp strings.Builder
 	var quote byte
-	globbed, quoted, dollarQuote, sep := false, false, false, ""
+	globbed, quoted, bare, dollarQuote, sep := false, false, false, false, ""
 	// unsound and redirected describe the statement being read.
 	unsound, redirected := false, false
 	flushToken := func() {
 		if tok.Len() > 0 {
-			words = append(words, word{text: tok.String(), exp: exp.String(), quoted: quoted, glob: globbed})
+			words = append(words, word{text: tok.String(), exp: exp.String(), quoted: quoted, double: quoted && !bare, glob: globbed})
 			tok.Reset()
 			exp.Reset()
 		}
-		globbed, quoted = false, false
+		globbed, quoted, bare = false, false, false
 	}
 	// A blank statement keeps a pending "&&", "||" or "|": a newline after the
 	// operator continues the chain rather than ending it.
@@ -627,6 +630,7 @@ func tokenize(command string) parsedCommand {
 			p.opaque, unsound = true, true
 		}
 		tok.WriteByte(c)
+		bare = bare || quote != '"'
 		if c == '$' && !expands {
 			c = 0
 		}
@@ -879,40 +883,64 @@ var expansion = regexp.MustCompile(`\$[^\s|)\]}/.,;:%\\?$#!]`)
 var braceExpansion = regexp.MustCompile(`\{[^{}]*(,|\.\.)[^{}]*\}`)
 
 // staticSegments is the static tier's view: segments with literal variables
-// substituted, so every screen runs on the word the shell will see. It reports
-// false when the command is unsound or a word keeps an expansion, whose value
-// could be a flag, a credential path or several words.
-func (p parsedCommand) staticSegments() ([][]string, bool) {
+// substituted, so every screen runs on the word the shell will see. Which
+// shell runs the command is not known, and they read a value of several words
+// differently where the word has no quotes: bash splits it into fields, zsh
+// keeps one word. It returns bash's reading, then zsh's, and a static allow
+// must pass both. In zsh's, a command word with a blank names no program, so
+// that segment runs nothing and is left empty; with a "/" zsh would run it as
+// a path, and the command does not settle. The bool is false when the command
+// is unsound or a word keeps an expansion, whose value could be a flag, a
+// credential path or several words.
+func (p parsedCommand) staticSegments() ([2][][]string, bool) {
 	vars := p.literalVars()
-	segs, sound := p.segments(), !p.unsound
+	var readings [2][][]string
+	sound := !p.unsound
 	for j, st := range p.stmts {
 		sound = sound && !st.unsound
+		bash, zsh, runsInZsh := []string{}, []string{}, true
 		for k, w := range st.words {
 			text := p.substitute(vars, j, w)
 			sound = sound && !expansion.MatchString(text) &&
 				(!w.glob || !credentialGlob.MatchString(text) && !braceExpansion.MatchString(text))
-			if k >= st.cmd {
-				segs[j][k-st.cmd] = strings.ReplaceAll(text, "\x00", "$")
-				if k > st.cmd && w.glob && strings.IndexByte("*?[", text[0]) >= 0 {
-					_, screenedVerb := denyFlags[segs[j][0]]
-					sound = sound && !screenedVerb
-				}
+			if k < st.cmd {
+				// An assignment is matched against no rule, so the screens an
+				// argument would meet run here: a value naming a credential file,
+				// and a secret-named variable set as a statement of its own.
+				name, _, _ := strings.Cut(text, "=")
+				sound = sound && !credentialPath.MatchString(text) &&
+					(st.cmd < len(st.words) || !secretEnvName.MatchString(name))
 				continue
 			}
-			// An assignment is matched against no rule, so the screens an
-			// argument would meet run here: a value naming a credential file,
-			// and a secret-named variable set as a statement of its own.
-			name, _, _ := strings.Cut(text, "=")
-			sound = sound && !credentialPath.MatchString(text) &&
-				(st.cmd < len(st.words) || !secretEnvName.MatchString(name))
+			text = strings.ReplaceAll(text, "\x00", "$")
+			fields := []string{text}
+			// A word with no quotes has a blank only where a value put one.
+			if !w.quoted && strings.ContainsAny(text, " \t") {
+				fields = strings.FieldsFunc(text, func(r rune) bool { return r == ' ' || r == '\t' })
+				// bash would match a glob against each field, which the
+				// screens below see only as a whole. The value has none, so a
+				// glob character left is the word's own.
+				sound = sound && !strings.ContainsAny(text, "*?[{") && (k > st.cmd || !strings.Contains(text, "/"))
+				runsInZsh = runsInZsh && k > st.cmd
+			}
+			if k > st.cmd && w.glob && strings.IndexByte("*?[", text[0]) >= 0 {
+				_, screenedVerb := denyFlags[bash[0]]
+				sound = sound && !screenedVerb
+			}
+			bash = append(bash, fields...)
+			zsh = append(zsh, text)
 		}
+		if !runsInZsh {
+			zsh = []string{}
+		}
+		readings[0], readings[1] = append(readings[0], bash), append(readings[1], zsh)
 	}
-	return segs, sound
+	return readings, sound
 }
 
 func parseCommand(command string) ([][]string, bool) {
-	segs, sound := tokenize(command).staticSegments()
-	return segs, !sound
+	readings, sound := tokenize(command).staticSegments()
+	return readings[0], !sound
 }
 
 var (
@@ -1033,13 +1061,17 @@ func (p parsedCommand) literalVars() map[string]literalVar {
 }
 
 // literalValue returns the value of a NAME=value word when the shell stores
-// it verbatim. Whitespace is refused because an unquoted use would split it
-// into several words; a quoted "~" because it does not expand; a later "~"
-// because the shell expands it after ":"; a leading "=" because zsh expands
-// "=cmd" to that command's path.
+// it verbatim. Words separated by spaces or tabs are kept, and each use of
+// them is read the way both bash and zsh would (see staticSegments); a quote
+// or backslash among them is refused, because bash keeps it literal in the
+// fields it splits, which parts the readings further. A newline is refused; a
+// quoted "~" because it does not expand; a later "~" because the shell expands
+// it after ":"; a leading "=" because zsh expands "=cmd" to that command's path.
 func (w word) literalValue() (string, bool) {
 	_, value, _ := strings.Cut(w.text, "=")
-	if value == "" || value[0] == '=' || strings.ContainsAny(value, "$`*?[{ \t\n") || strings.Contains(value[1:], "~") {
+	blank := strings.ContainsAny(value, " \t")
+	if strings.Trim(value, " \t") == "" || value[0] == '=' || strings.ContainsAny(value, "$`*?[{\n") ||
+		strings.Contains(value[1:], "~") || blank && strings.ContainsAny(value, `'"\`) {
 		return "", false
 	}
 	if !strings.HasPrefix(value, "~") {
@@ -1054,13 +1086,17 @@ func (w word) literalValue() (string, bool) {
 
 // probeSegments is the probe's view: the statements a shell runs, with literal
 // variables substituted where it would expand them. A reference that is not
-// certain keeps its "$", which the path resolver refuses.
+// certain keeps its "$", which the path resolver refuses. A word with no
+// quotes that a value of several words went into is kept as written: bash
+// splits it and zsh does not, and the probe follows neither.
 func (p parsedCommand) probeSegments() [][]string {
 	vars := p.literalVars()
 	segs := p.segments()
 	for j, st := range p.stmts {
 		for k, w := range st.words[st.cmd:] {
-			segs[j][k] = strings.ReplaceAll(p.substitute(vars, j, w), "\x00", "$")
+			if text := p.substitute(vars, j, w); w.quoted || !strings.ContainsAny(text, " \t") {
+				segs[j][k] = strings.ReplaceAll(text, "\x00", "$")
+			}
 		}
 	}
 	// Heredoc text is not commands: probed as such, its tokens became scripts
@@ -1076,7 +1112,10 @@ func (p parsedCommand) probeSegments() [][]string {
 
 // substitute expands the literal variables in word w of statement j. A
 // reference that is not certain keeps its "$"; a "$" the shell would not
-// expand stays NUL.
+// expand stays NUL. A value of several words goes into a word inside double
+// quotes, which both shells keep whole, and into a word with no quotes, which
+// the caller must read both ways; a word with quoted and unquoted parts keeps
+// the reference.
 func (p parsedCommand) substitute(vars map[string]literalVar, j int, w word) string {
 	return variableRef.ReplaceAllStringFunc(w.exp, func(ref string) string {
 		tail := ""
@@ -1087,7 +1126,8 @@ func (p parsedCommand) substitute(vars map[string]literalVar, j int, w word) str
 			ref, tail = ref[:len(ref)-1], ref[len(ref)-1:]
 		}
 		v, ok := vars[strings.Trim(ref, "${}")]
-		if !ok || !p.reaches(v.at, j) {
+		if !ok || !p.reaches(v.at, j) ||
+			strings.ContainsAny(v.value, " \t") && w.quoted && !w.double {
 			return ref + tail
 		}
 		return v.value + tail
@@ -1144,24 +1184,28 @@ func matchAny(rules []string, segments [][]string) string {
 }
 
 // allSegmentsAllowed needs a permissions.allow rule for every segment that
-// runs a command: core ships none, and its screens only keep a rule from
-// matching a form that is not what the rule means. An empty segment is a
-// statement of assignments, which staticSegments has screened and which runs
-// nothing; a command made of those alone has no rule behind it.
-func allSegmentsAllowed(rules []string, segments [][]string) (string, bool) {
-	var matched, dir string
-	for _, seg := range segments {
-		if len(seg) == 0 {
-			continue
-		}
-		if hasDeniedFlag(seg) || riskyArgs(seg) || credentialUnder(dir, seg[1:]) {
-			return "", false
-		}
-		if matched = matchAny(rules, [][]string{seg}); matched == "" {
-			return "", false
-		}
-		if seg[0] == "cd" {
-			dir = cdTarget(dir, seg[1:])
+// runs a command, in every reading of the command: core ships none, and its
+// screens only keep a rule from matching a form that is not what the rule
+// means. An empty segment runs nothing: a statement of assignments, which
+// staticSegments has screened, or a command zsh would not find. A command made
+// of those alone has no rule behind it.
+func allSegmentsAllowed(rules []string, readings ...[][]string) (string, bool) {
+	var matched string
+	for _, segments := range readings {
+		dir := ""
+		for _, seg := range segments {
+			if len(seg) == 0 {
+				continue
+			}
+			if hasDeniedFlag(seg) || riskyArgs(seg) || credentialUnder(dir, seg[1:]) {
+				return "", false
+			}
+			if matched = matchAny(rules, [][]string{seg}); matched == "" {
+				return "", false
+			}
+			if seg[0] == "cd" {
+				dir = cdTarget(dir, seg[1:])
+			}
 		}
 	}
 	return matched, matched != ""

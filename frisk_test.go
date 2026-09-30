@@ -135,6 +135,19 @@ func TestParseCommand(t *testing.T) {
 		{"literal variable is substituted", "S=/x; cat $S/f", [][]string{{}, {"cat", "/x/f"}}, false},
 		{"substituted flag is what the screens see", `A=-x; fd . "$A" rm`, [][]string{{}, {"fd", ".", "-x", "rm"}}, false},
 		{"substituted glob is screened", `S=~/.s; cat "$S"*/config`, nil, true},
+		{"value of several words splits where unquoted", `A="src docs"; ls $A`, [][]string{{}, {"ls", "src", "docs"}}, false},
+		{"attached text joins the first and last field", `A="a b"; ls x$A/y`, [][]string{{}, {"ls", "xa", "b/y"}}, false},
+		{"blanks around a value split it from attached text", "A=' a\tb '; ls x$A/y", [][]string{{}, {"ls", "x", "a", "b", "/y"}}, false},
+		{"value of several words stays whole in double quotes", `A="a b"; ls "$A/x"`, [][]string{{}, {"ls", "a b/x"}}, false},
+		{"value of several words in a mixed word is complex", `A="a b"; ls $A"/x"`, [][]string{{}, {"ls", "$A/x"}}, true},
+		{"value of several words beside a quoted part is complex", `A="a b"; ls "$A"/x`, [][]string{{}, {"ls", "$A/x"}}, true},
+		{"command of several words splits", `C="git status"; $C --short`, [][]string{{}, {"git", "status", "--short"}}, false},
+		{"command path of several words is complex", `C="./tool arg"; $C`, [][]string{{}, {"./tool", "arg"}}, true},
+		{"value of several words with a glob is complex", `A="src docs"; ls $A/*.go`, nil, true},
+		{"value of several words with a quote is complex", `C="git log --format='%h'"; $C`, nil, true},
+		{"value of several words with a backslash is complex", `C='rg a\.b'; $C`, nil, true},
+		{"value of several words with a later tilde is complex", `A="src ~/x"; ls $A`, nil, true},
+		{"blank value is complex", `A=" "; ls $A`, nil, true},
 		{"unresolved variable is complex", "cat $F", [][]string{{"cat", "$F"}}, true},
 		{"quoted unresolved variable is complex", `cat "$F"`, [][]string{{"cat", "$F"}}, true},
 		{"braced unresolved variable is complex", "cat ${F}", [][]string{{"cat", "${F}"}}, true},
@@ -1397,6 +1410,93 @@ func TestAssignmentBuiltinScreens(t *testing.T) {
 				t.Fatalf("decide(%q) = (%q, %q), want (%q, %q)", tt.command, v.Decision, v.Tier, "", "no-judge")
 			}
 		})
+	}
+}
+
+// A value of several words is split by bash and kept whole by zsh, and frisk
+// cannot tell which shell runs the command: a static allow passes both.
+func TestMultiWordVariables(t *testing.T) {
+	t.Parallel()
+	cfg := &config{
+		Permissions: permissionsConfig{
+			Allow: append(exampleAllow(t), "cuttle *"),
+			Deny:  []string{"gopass show -o *"},
+			Ask:   []string{"ssh prod *"},
+		},
+	}
+	cuttle := `C="cuttle --name box pw"; $C fill e39 'x' >/dev/null 2>&1; echo "rc=$?"; $C snapshot 2>&1 | rg -n "textbox" | head`
+	tests := []struct {
+		name     string
+		command  string
+		decision string
+		tier     string
+	}{
+		{"command of several words", `C="git status"; $C --short`, decisionAllow, "static"},
+		{"quoted value stays one word", `A="a b"; ls "$A"`, decisionAllow, "static"},
+		{"unquoted value of several words", `A="src docs"; ls $A`, decisionAllow, "static"},
+		{"braced value of several words", `A="src docs"; ls ${A}`, decisionAllow, "static"},
+		{"tab between the words", "C='git\tstatus'; $C", decisionAllow, "static"},
+		{"two commands of several words", `C="git log"; D="--oneline -5"; $C $D`, decisionAllow, "static"},
+		{"command of several words in a chain", cuttle, decisionAllow, "static"},
+		{"command without its rule", strings.ReplaceAll(cuttle, "cuttle", "puppet"), "", "no-judge"},
+		{"exec flag in a value", `A="-x rm"; fd . $A`, "", "no-judge"},
+		{"delete flag in a value", `A="-delete"; find . $A`, "", "no-judge"},
+		{"delete flag among the words", `A="-name x -delete"; find . $A`, "", "no-judge"},
+		{"command path of several words", `C="./tool arg"; $C`, "", "no-judge"},
+		{"absolute command path of several words", `C="git -C /tmp/repo log"; $C --oneline | head -3`, "", "no-judge"},
+		{"writer of several words", `C="rm -rf"; $C x`, "", "no-judge"},
+		{"credential path among the words", `C="cat /home/dev/.ssh/id_ed25519"; $C`, "", "no-judge"},
+		{"git config override among the words", `C="git -c core.pager=less log"; $C`, "", "no-judge"},
+		{"kubeconfig among the words", `A="pods --kubeconfig /tmp/e.yaml"; kubectl get $A`, "", "no-judge"},
+		{"IFS written", `C="cuttle pw"; IFS=:; $C snapshot`, "", "no-judge"},
+		{"IFS as a prefix", `C="cuttle pw"; IFS=: $C snapshot`, "", "no-judge"},
+		{"variable written twice", `C="cuttle pw"; C="rm x"; $C`, "", "no-judge"},
+		{"mixed quoting", `A="a b"; ls $A"/x"`, "", "no-judge"},
+		{"mixed quoting the other way", `A="a b"; ls "$A"/x`, "", "no-judge"},
+		{"command path in a mixed word", `C="cuttle pw"; $C/x`, "", "no-judge"},
+		{"glob beside a value of several words", `A="src docs"; ls $A/*.go`, "", "no-judge"},
+		{"quote inside the value", `C="git log --format='%h'"; $C`, "", "no-judge"},
+		{"inside a substitution", `A="src docs"; echo $(ls $A)`, "", "no-judge"},
+		{"after eval", `C="git status"; eval true; $C`, "", "no-judge"},
+		{"after control flow", `if true; then C="git status"; fi; $C`, "", "no-judge"},
+		{"zsh reading needs a rule too", `A="log -p"; git $A`, "", "no-judge"},
+		{"zsh reading is screened too", `A="-H x"; fd $A`, "", "no-judge"},
+		{"deny sees the split words", `C="gopass show -o k"; $C`, decisionDeny, "deny-rule"},
+		{"deny sees split arguments", `A="show -o k"; gopass $A`, decisionDeny, "deny-rule"},
+		{"ask sees the split words", `C="ssh prod uptime"; $C`, decisionAsk, "ask-rule"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			v := decide(cfg, tt.command, t.TempDir(), testLogger)
+			if v.Decision != tt.decision || v.Tier != tt.tier {
+				t.Fatalf("decide(%q) = (%q, %q), want (%q, %q)", tt.command, v.Decision, v.Tier, tt.decision, tt.tier)
+			}
+		})
+	}
+}
+
+func TestStaticReadings(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		command    string
+		split, zsh [][]string
+	}{
+		{`A="src docs"; ls $A`, [][]string{{}, {"ls", "src", "docs"}}, [][]string{{}, {"ls", "src docs"}}},
+		{`C="git status"; $C --short | head`, [][]string{{}, {"git", "status", "--short"}, {"head"}}, [][]string{{}, {}, {"head"}}},
+		{`A="a b"; ls "$A"`, [][]string{{}, {"ls", "a b"}}, [][]string{{}, {"ls", "a b"}}},
+		{"S=/x; cat $S/f", [][]string{{}, {"cat", "/x/f"}}, [][]string{{}, {"cat", "/x/f"}}},
+	}
+	for _, tt := range tests {
+		readings, sound := tokenize(tt.command).staticSegments()
+		if !sound {
+			t.Errorf("%q: unsound", tt.command)
+		}
+		got, _ := json.Marshal(readings)
+		want, _ := json.Marshal([][][]string{tt.split, tt.zsh})
+		if string(got) != string(want) {
+			t.Errorf("%q: readings = %s, want %s", tt.command, got, want)
+		}
 	}
 }
 
@@ -2700,6 +2800,7 @@ func probeFixture(t *testing.T) string {
 		"proj/sub/stats.py": "print('sub')\n",
 		"proj/sub/build.py": "print('build')\n",
 		"proj/run.py":       "print('run')\n",
+		"pr oj/run.py":      "print('spaced')\n",
 		"proj/big.py":       strings.Repeat("x = 1\n", maxScriptBytes/6+1),
 		"proj/half1.py":     filler,
 		"proj/half2.py":     filler + "y = 2\n",
@@ -2818,7 +2919,10 @@ func TestProbeScripts(t *testing.T) {
 		{"value from substitution", ".", "S=$(pwd); python3 $S/run.py", probeUnresolvable, nil},
 		{"value from another variable", ".", "R={root}; S=$R/proj; python3 $S/run.py", probeUnresolvable, nil},
 		{"value with a glob", ".", "S={root}/pro?; python3 $S/run.py", probeUnresolvable, nil},
-		{"value with a space", ".", `S="{root}/pr oj"; python3 "$S/run.py"`, probeUnresolvable, nil},
+		{"value with a space inside double quotes", ".", `S="{root}/pr oj"; python3 "$S/run.py"`, probeAttached, []string{"pr oj/run.py"}},
+		{"value with a space outside quotes", ".", `S="{root}/pr oj"; python3 $S/run.py`, probeUnresolvable, nil},
+		{"value with a space in a mixed word", ".", `S="{root}/pr oj"; python3 $S"/run.py"`, probeUnresolvable, nil},
+		{"command of several words is not followed", "proj", `P="python3 -u"; $P run.py`, "", nil},
 		{"env prefix is not an assignment", ".", "S={root}/proj python3 $S/run.py", probeUnresolvable, nil},
 		{"use before assignment", ".", "python3 $S/run.py; S={root}/proj", probeUnresolvable, nil},
 		{"assignment after ||", ".", "false || S={root}/proj; python3 $S/run.py", probeUnresolvable, nil},

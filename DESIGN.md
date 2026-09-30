@@ -212,7 +212,9 @@ less certain, and any command with a subshell, substitution, heredoc, `eval`,
 `source`, `trap` or `alias`, stays `unresolvable`. Names the shell rewrites
 itself (`PWD`, `OLDPWD`, `RANDOM`, `BASH*`, `ZSH*`, ...) never resolve, nor
 does a bare `$NAME` followed by `:` or `[`, which zsh reads as a modifier or
-subscript.
+subscript. A value of several words resolves for the probe only inside double
+quotes, where bash and zsh both keep it one word (`S="/tmp/my dir"; python3
+"$S/run.py"`).
 
 The static tier and the `permissions.deny` / `permissions.ask` rules read the
 same substitution, so every screen runs on the word the shell will see:
@@ -221,6 +223,22 @@ same substitution, so every screen runs on the word the shell will see:
 after that - `$NAME`, `${...}`, a positional parameter, zsh's `$=NAME` - is
 never allowed statically, because its value could be a flag, a credential path
 or several words. `$?`, `$$`, `$#` and `$!` are numbers and pass.
+
+A literal may be several words separated by spaces or tabs
+(`C="git status"; $C --short`), with no quote or backslash among them. frisk
+does not know which shell runs the command, and the two read such a value
+differently in a word with no quotes: bash splits it into fields, with text
+attached before or after joining the first or last field (`$A/x` with
+`A="a b"` is `a` and `b/x`), while zsh keeps one word, spaces included. Inside
+double quotes both keep one word; a word that mixes quoted and unquoted parts
+(`$A"/x"`, `"$A"/x`) is not resolved. The static tier allows only when both
+readings pass every screen and every segment of each that runs a command
+matches an allow rule, so `A="log -p"; git $A` needs a rule for zsh's
+`git "log -p"` too. In command position zsh looks up a program whose name has
+spaces in it, finds none, and runs nothing; with a `/` in the word it runs that
+path instead (`C="git -C /tmp/repo log"; $C` runs `./git -C /tmp/repo log` if
+it exists), so such a command never settles, nor does a value of several words
+in a word with a glob character. Deny and ask rules see both readings.
 
 `probe.status` tells the judge why a body is absent: `attached`, `missing`,
 `unresolvable`, `oversize`, `non-utf8`, `multiple-truncated`. A script whose
