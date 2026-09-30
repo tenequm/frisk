@@ -3167,3 +3167,24 @@ func TestBrokenConfigIsSilent(t *testing.T) {
 		t.Fatalf("broken config must be full silence, got %d %s", code, out.String())
 	}
 }
+
+func TestCredentialShapedSkipsPaths(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		data string
+		want bool
+	}{
+		{"long path with high entropy", "cd /home/dev/pj/worktrees/.treehouse/projBX-38f3f2/1/projBX/internal/adapter/Xq7Zp/Kw9v\n", false},
+		{"high-entropy base64 run", "echo " + fakeSecret(alnumChars, 48) + "\n", true},
+		{"base64 with a slash", "echo " + fakeSecret(alnumChars, 23) + "/" + fakeSecret(alnumChars, 27) + "+Q=\n", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := credentialShaped([]byte(tt.data)); got != tt.want {
+				t.Fatalf("credentialShaped(%q) = %v, want %v", tt.data, got, tt.want)
+			}
+		})
+	}
+}
