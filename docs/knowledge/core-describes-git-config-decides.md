@@ -1,0 +1,79 @@
+---
+type: Decision
+title: Core describes git, config decides
+description: frisk sends the judge a trusted record for each git command (class, forcing, push destination, files a discard would lose) and ships no git policy; the user's judge prose is written against the record's fields.
+tags: [git, judge, architecture]
+status: stable
+generated: { by: claude-code/opus-5-5, at: "2026-09-30T16:40:00Z" }
+sources:
+  - id: maintainer
+    resource: maintainer instructions on 2026-09-30 (no durable link)
+    title: How frisk should treat git
+  - id: design
+    resource: repository file DESIGN.md
+    title: frisk design
+  - id: eval
+    resource: live run of `just eval-git` on 2026-09-30, 103 fixtures in testdata/git-fixtures.jsonl with pinned repository state (no durable link)
+    title: Git record measurement
+---
+
+# Decision
+
+Core understands git and decides nothing about it. For every git segment of a
+command the judge receives one record under `state.git.commands`: the
+subcommand, a class (`read`, `local`, `discard`, `remote`, `exec`, `unknown`),
+whether it forces, deletes a ref or skips hooks, where a push goes and whether
+that is the remote's default branch, and how many files a discard would
+lose.[^design] What to do with those facts is the user's `judge` prose. With no
+prose about git, git commands pass through like any other.[^maintainer]
+
+A field that cannot be determined says `unknown`. It is never guessed and never
+resolved toward the permissive value.
+
+# Why not rules in core, or a pattern list
+
+- A class table in core that allowed or denied by itself would be a decision
+  made for the user, which
+  [core does not make](core-generic-config-specific.md).[^maintainer]
+- "Allow all git, deny a few patterns" leaks: git runs programs through
+  `-c alias.x=!cmd`, `--exec` and `bisect run`, positional rules miss reordered
+  flags, and whether a push is acceptable depends on the remote and the
+  destination branch, which are not in the words.
+- Judge prose about wording ("git push --force or --force-with-lease, deleting
+  remote branches ...") makes the judge infer facts from text. The same policy
+  keyed on record fields is both stricter and more confident.
+
+# What was measured
+
+On fixtures that each build a repository with known state, the judge was given
+the same policy twice: as prose about wording with no record, and as prose
+written against the record.[^eval]
+
+| | Correct of 102 | Wrong allow | Silent | Unexpected ask | Median confidence |
+|---|---|---|---|---|---|
+| No record | 66 | 1 | 25 | 10 | 0.80 |
+| Record | 82 | 1 | 15 | 4 | 0.93 |
+
+Re-running one arm flips 1 to 7 of 99 outcomes at the confidence floors, so
+differences of a few fixtures between arms are noise.
+
+Asking the judge a two-way question (allow or deny, no ask) was measured in the
+same run and rejected. It gave no gain once the prose keyed on the record, and
+it cannot express the cases the user wants asked about: with soft-deny prose
+sent as deny criteria it denied all 12 forced-push and ref-deletion fixtures, and
+with that prose dropped it allowed a forced push to a default branch.[^eval]
+
+# Consequences
+
+- A subcommand missing from the table is class `unknown`, and prose that decides
+  by class then has nothing to allow it with. A read such as `git shortlog` went
+  from a confident allow to silence until it was added, so the table has to
+  cover the read subcommands people actually use.
+- A record describes the repository before the command runs. Facts that an
+  earlier segment of the same command may have changed are reported as
+  `unknown`: a push that goes by the checked-out branch after a `switch`, a
+  discard's file counts after anything but a `cd` or a git read.
+
+[^maintainer]: How frisk should treat git
+[^design]: frisk design
+[^eval]: Git record measurement
