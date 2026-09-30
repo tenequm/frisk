@@ -75,6 +75,32 @@ Rules use Claude Code's `Bash(...)` rule-content syntax, matched against
 parsed segments - so `cd x && git push` still matches `git push *`. Trailing
 `*` matches the rest; a standalone mid-pattern `*` matches one token.
 
+### Git rule normalization
+
+For a known git subcommand, matching reuses `describeGit` to remove global
+options such as `-C` and `--no-pager`. Config overrides (`-c`, `--config-env`,
+and attached `--exec-path`) and unknown subcommands keep literal matching.
+Non-git matching and deny/ask/allow precedence are unchanged.
+
+After the subcommand, a rule's flags are required in any position. Known
+short/long spellings, short bundles and unambiguous long abbreviations match
+together. Value-taking flags use the subcommand's `vals` table; their values
+remain positional constraints, so `git commit -m *` also covers `--message=x`
+and quiet commits. Other operands retain the usual wildcard semantics.
+`--` ends flags and stays in the operand sequence. Unknown flags have literal
+names; an unknown short bundle or missing value falls back to positional
+matching for deny/ask and cannot allow through normalization.
+
+Allow rules must name policy flags: force, deletion, hook skipping, amend,
+upstream changes, hard reset and execution. Deny/ask match the force family
+together; a lease-specific allow retains its lease constraint and cannot
+authorize plain force. Force/delete refspecs also cannot
+hide inside an ordinary push allow. With a flag-bearing allow rule, additional
+flags must be named, except quiet, verbose and all. Rules without flags retain
+positional matching after globals are removed, subject to these safety checks.
+For example, `git commit --no-verify *` replaces flag-position and `-n`
+variants; its trailing wildcard is needed to accept message operands.
+
 An unquoted `#` that starts a word is a comment: the rest of the line is
 dropped unread, so a quote inside it cannot hide the lines after it from the
 rules. A command with a comment is never allowed statically, because a shell

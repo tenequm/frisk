@@ -93,10 +93,10 @@ var denyFlags = map[string][]string{
 	"sort":    {"-o", "--output", "--compress-program"},
 	verbGit:   {"-c", "--upload-pack", "--receive-pack", "--output"},
 	"date":    {"-s", "--set"},
-	"fd":      {"-x", "--exec", "-X", "--exec-batch"},
+	"fd":      {"-x", flagExec, "-X", "--exec-batch"},
 	"rg":      {"--pre", "--hostname-bin"},
 	verbXXD:   {"-r"},
-	verbAwk:   {"-f", "--file", "-i", "--include", "-l", "--load", "-E", "--exec"},
+	verbAwk:   {"-f", "--file", "-i", "--include", "-l", "--load", "-E", flagExec},
 	"yq":      {"-i", "--inplace", "-f", "--from-file", "-s", "--split-exp"},
 	"jq":      {"-f", "--from-file"},
 	"kubectl": {"--kubeconfig"},
@@ -1169,13 +1169,13 @@ func (p parsedCommand) reaches(at, use int) bool {
 	return true
 }
 
-func matchAny(rules []string, segments [][]string) string {
+func matchAny(rules []string, segments [][]string, allow ...bool) string {
 	for _, rule := range rules {
 		if rule == defaultsMarker {
 			continue
 		}
 		for _, seg := range segments {
-			if matchRule(rule, seg) {
+			if matchRule(rule, seg, allow...) {
 				return rule
 			}
 		}
@@ -1200,7 +1200,7 @@ func allSegmentsAllowed(rules []string, readings ...[][]string) (string, bool) {
 			if hasDeniedFlag(seg) || riskyArgs(seg) || credentialUnder(dir, seg[1:]) {
 				return "", false
 			}
-			if matched = matchAny(rules, [][]string{seg}); matched == "" {
+			if matched = matchAny(rules, [][]string{seg}, true); matched == "" {
 				return "", false
 			}
 			if seg[0] == "cd" {
@@ -1457,10 +1457,16 @@ func sedScriptWrites(script string) bool {
 
 // Trailing "*" matches any remaining tokens including none; a standalone
 // mid-pattern "*" matches exactly one token; embedded globs match in-token.
-func matchRule(rule string, tokens []string) bool {
+func matchRule(rule string, tokens []string, allow ...bool) bool {
 	if _, isFile := fileRulePattern(rule); isFile {
 		return false
 	}
+	var ok bool
+	rule, tokens, ok = normalizeGitRule(rule, tokens, allow...)
+	if !ok {
+		return false
+	}
+
 	ptoks := strings.Fields(rule)
 	for i, pt := range ptoks {
 		if pt == "*" && i == len(ptoks)-1 {
@@ -1483,6 +1489,179 @@ func matchRule(rule string, tokens []string) bool {
 		}
 	}
 	return len(tokens) == len(ptoks)
+}
+
+const (
+	flagUpstream   = "--set-upstream"
+	flagPrune      = "--prune"
+	flagNoVerify   = "--no-verify"
+	flagMirror     = "--mirror"
+	flagVerbose    = "--verbose"
+	flagQuiet      = "--quiet"
+	flagForce      = "--force"
+	flagDelete     = "--delete"
+	flagAll        = "--all"
+	flagForceLease = "--force-with-lease"
+	subSwitch      = "switch"
+	subConfig      = "config"
+)
+
+func normalizeGitRule(rule string, tokens []string, allow ...bool) (string, []string, bool) {
+	allowing := len(allow) > 0 && allow[0]
+	pattern := strings.Fields(rule)
+	if len(pattern) < 2 || pattern[0] != verbGit {
+		return rule, tokens, true
+	}
+	g, git := describeGit(tokens)
+	_, known := gitSubs[g.subcommand]
+	if !git || !known || g.override || pattern[1] != g.subcommand {
+		return rule, tokens, true
+	}
+	flags, operands, ok := gitRuleArgs(g.subcommand, g.words)
+	required, rest, pok := gitRuleArgs(g.subcommand, pattern[2:])
+	if !ok || !pok {
+		return rule, tokens, !allowing
+	}
+	if allowing {
+		for _, flag := range []string{flagForce, flagDelete, flagNoVerify, "--amend", flagUpstream, "--hard", flagExec, "-D", "-M", flagMirror, flagPrune} {
+			if flags[flag] && !required[flag] {
+				return "", nil, false
+			}
+		}
+		if g.forced && !required[flagForce] || g.deletesRef && !required[flagDelete] {
+			return "", nil, false
+		}
+	}
+	if len(required) == 0 {
+		return rule, append([]string{verbGit, g.subcommand}, g.words...), true
+	}
+	if allowing {
+		for flag := range flags {
+			if !required[flag] && (!strings.HasPrefix(flag, flagForceLease) || !required[flagForce]) && !slices.Contains([]string{flagQuiet, flagVerbose, flagAll}, flag) {
+				return "", nil, false
+			}
+		}
+	}
+	for flag := range required {
+		if !allowing && strings.HasPrefix(flag, flagForceLease) {
+			continue
+		}
+		if !flags[flag] {
+			return "", nil, false
+		}
+	}
+	return strings.Join(rest, " "), operands, true
+}
+
+// Values stay positional so a rule can constrain the message or file it permits.
+func gitRuleArgs(sub string, words []string) (map[string]bool, []string, bool) {
+	flags := map[string]bool{}
+	var operands []string
+	aliases := map[string]string{"-q": flagQuiet, "-v": flagVerbose}
+	values := map[string]string{}
+	for _, c := range gitSubs[sub].vals {
+		values["-"+string(c)] = "-" + string(c)
+	}
+	if gitSubs[sub].force {
+		aliases["-f"] = flagForce
+	}
+	switch sub {
+	case subCommit:
+		aliases["-n"] = flagNoVerify
+		aliases["-a"] = flagAll
+		values["--message"], values["--file"] = "-m", "-F"
+		values["--reuse-message"], values["--reedit-message"] = "-C", "-c"
+	case subSwitch:
+		values["--create"], values["--force-create"] = "-c", "-C"
+	case subPush:
+		aliases["-u"], aliases["-d"] = flagUpstream, flagDelete
+	case subBranch:
+		aliases["-d"] = flagDelete
+	case subConfig, subTag:
+		aliases["-l"] = "--list"
+	default:
+	}
+	long := []string{flagQuiet, flagVerbose, flagForce, flagForceLease, flagDelete, flagUpstream, flagNoVerify, "--amend", "--hard", flagExec, flagMirror, flagPrune, "--list", "--get", "--get-all", "--get-regexp", flagAll}
+	for name := range values {
+		if strings.HasPrefix(name, "--") {
+			long = append(long, name)
+		}
+	}
+	for i := 0; i < len(words); i++ {
+		w := words[i]
+		if w == "--" {
+			operands = append(operands, words[i:]...)
+			break
+		}
+		if len(w) < 2 || w[0] != '-' {
+			operands = append(operands, w)
+			continue
+		}
+		parts := []string{w}
+		if (sub == "log" || sub == "show") && len(w) > 1 && strings.Trim(w[1:], "0123456789") == "" {
+			flags[w] = true
+			continue
+		}
+		if !strings.HasPrefix(w, "--") {
+			parts = nil
+			for j := 1; j < len(w); j++ {
+				name := "-" + w[j:j+1]
+				parts = append(parts, name)
+				if values[name] != "" {
+					if j+1 < len(w) {
+						parts[len(parts)-1] += "=" + w[j+1:]
+					}
+					break
+				}
+				if aliases[name] == "" && len(w) > 2 {
+					return nil, nil, false
+				}
+			}
+		}
+		for _, part := range parts {
+			name, value, attached := strings.Cut(part, "=")
+			if strings.HasPrefix(name, "--") && !slices.Contains(long, name) {
+				var matches []string
+				for _, candidate := range long {
+					if abbreviates(name, candidate) {
+						matches = append(matches, candidate)
+					}
+				}
+				if len(matches) > 1 {
+					return nil, nil, false
+				}
+				if len(matches) == 1 {
+					name = matches[0]
+				}
+			}
+			if canonical := values[name]; canonical != "" {
+				name = canonical
+				if !attached {
+					i++
+					if i >= len(words) {
+						return nil, nil, false
+					}
+					value = words[i]
+				}
+				operands = append(operands, value)
+			} else if attached && name != flagForceLease {
+				// Unknown value syntax must not silently discard a constraint.
+				name = part
+			}
+			if canonical := aliases[name]; canonical != "" {
+				name = canonical
+			}
+			if name == flagForceLease {
+				flags[flagForceLease] = true
+				if attached {
+					flags[flagForceLease+"="+value] = true
+				}
+				name = flagForce
+			}
+			flags[name] = true
+		}
+	}
+	return flags, operands, true
 }
 
 func spliceDefaults(list, defaults []string) []string {
@@ -1682,13 +1861,13 @@ var gitSubs = map[string]gitSub{
 	"show-ref": {class: gitRead}, "describe": {class: gitRead}, "cat-file": {class: gitRead},
 	"merge-base": {class: gitRead}, "shortlog": {class: gitRead}, "for-each-ref": {class: gitRead},
 	"count-objects": {class: gitRead}, "name-rev": {class: gitRead}, "diff-tree": {class: gitRead},
-	"check-ignore": {class: gitRead}, "verify-commit": {class: gitRead}, "grep": {}, "reflog": {},
+	"check-ignore": {class: gitRead}, "verify-commit": {class: gitRead}, "grep": {}, "reflog": {}, "notes": {},
 
 	"add": {class: gitLocal}, subCommit: {class: gitLocal, vals: "mFCct"},
 	"merge": {class: gitLocal}, "cherry-pick": {class: gitLocal}, "revert": {class: gitLocal},
 	"mv": {class: gitLocal, force: true}, "init": {class: gitLocal, rewires: true},
 	subRebase: {vals: "x"}, "bisect": {moves: true}, subReset: {}, "restore": {vals: "s"},
-	"switch": {vals: "cC", force: true, moves: true}, subCheckout: {vals: "bB", force: true, moves: true},
+	subSwitch: {vals: "cC", force: true, moves: true}, subCheckout: {vals: "bB", force: true, moves: true},
 	subStash: {vals: "m"}, subBranch: {vals: "u", force: true, moves: true}, subTag: {vals: "mFu", force: true},
 	"worktree": {vals: "bB", force: true, moves: true}, "clean": {vals: "e", force: true}, "rm": {force: true},
 
@@ -1696,7 +1875,7 @@ var gitSubs = map[string]gitSub{
 	"pull": {class: gitRemote, force: true}, "ls-remote": {class: gitRemote},
 	"clone": {vals: "ubco", rewires: true}, subRemote: {rewires: true},
 
-	"config": {vals: "f"}, "submodule": {}, "difftool": {class: gitExec},
+	subConfig: {vals: "f"}, "submodule": {}, "difftool": {class: gitExec},
 	"mergetool": {class: gitExec}, "filter-branch": {class: gitExec},
 	"credential": {class: gitExec}, "daemon": {class: gitExec},
 }
@@ -1736,15 +1915,16 @@ var (
 	// push more than the refspec names. Any other flag may take an operand as
 	// its value, so neither the remote nor the destination is reported.
 	pushPlain = []string{
-		"-u", "--set-upstream", "-f", "--force", "--force-with-lease", "--force-if-includes",
-		"--no-verify", "--verify", "-n", "--dry-run", "-q", "--quiet", "-v", "--verbose",
-		"--progress", "--porcelain", "--atomic", "-d", "--delete", "-o",
+		"-u", flagUpstream, "-f", flagForce, flagForceLease, "--force-if-includes",
+		flagNoVerify, "--verify", "-n", "--dry-run", "-q", flagQuiet, "-v", flagVerbose,
+		"--progress", "--porcelain", "--atomic", "-d", flagDelete, "-o",
 	}
-	pushWide = []string{"--all", "--branches", "--mirror", "--tags", "--follow-tags", "--prune"}
+	pushWide = []string{flagAll, "--branches", flagMirror, "--tags", "--follow-tags", flagPrune}
 )
 
 // gitCommand describes one git invocation from its words alone.
 type gitCommand struct {
+	words      []string
 	subcommand string   // gitUnknown when the words do not name one
 	class      string   // one of the git classes
 	dirs       []string // -C operands in order, each relative to the one before
@@ -1848,7 +2028,8 @@ func describeGit(seg []string) (gitCommand, bool) {
 	}
 	if i < len(args) && gitWord.MatchString(args[i]) {
 		g.subcommand = args[i]
-		g.describeArgs(args[i+1:])
+		g.words = args[i+1:]
+		g.describeArgs(g.words)
 	}
 	if g.override {
 		g.class = gitExec
@@ -1878,13 +2059,13 @@ func (g *gitCommand) describeArgs(words []string) {
 	default:
 	}
 
-	g.forced = row.force && a.has("-f", "--force") || a.has("--force-with-lease")
-	g.noVerify = a.has("--no-verify") || sub == subCommit && a.has("-n")
+	g.forced = row.force && a.has("-f", flagForce) || a.has(flagForceLease)
+	g.noVerify = a.has(flagNoVerify) || sub == subCommit && a.has("-n")
 	g.hard = sub == subReset && a.has("--hard")
 	g.amend = sub == subCommit && a.has("--amend")
 	// Beyond the table: -u records an upstream, "stash branch" and a rebase
 	// given the branch to rebase both check one out.
-	g.moves = g.class != gitRead && (row.moves || a.has("--set-upstream") || sub == subPush && a.has("-u") ||
+	g.moves = g.class != gitRead && (row.moves || a.has(flagUpstream) || sub == subPush && a.has("-u") ||
 		sub == subStash && slices.Contains(a.operands[:min(1, len(a.operands))], subBranch) ||
 		sub == subRebase && len(a.operands) > 1)
 	g.rewires = g.class != gitRead && row.rewires
@@ -1893,10 +2074,10 @@ func (g *gitCommand) describeArgs(words []string) {
 	}
 	switch sub {
 	case subBranch:
-		g.deletesRef = a.has("-d", "-D", "--delete")
+		g.deletesRef = a.has("-d", "-D", flagDelete)
 		g.forced = g.forced || a.has("-D", "-M", "-C")
 	case subTag:
-		g.deletesRef = a.has("-d", "--delete")
+		g.deletesRef = a.has("-d", flagDelete)
 	case subPush, "fetch", "pull":
 		g.describeRefspecs(a)
 	default:
@@ -1916,8 +2097,8 @@ func (g *gitCommand) describeRefspecs(a gitArgs) {
 	if !push {
 		return
 	}
-	g.deletesRef = g.deletesRef || a.has("-d", "--delete", "--prune", "--mirror")
-	g.forced = g.forced || a.has("--mirror")
+	g.deletesRef = g.deletesRef || a.has("-d", flagDelete, flagPrune, flagMirror)
+	g.forced = g.forced || a.has(flagMirror)
 
 	if len(operands) > 0 {
 		g.remote = gitUnknown
@@ -1988,18 +2169,18 @@ func gitArgClass(sub string, a gitArgs) string {
 		return pick(a.has("--hard"), gitDiscard, pick(a.has("--merge", "--keep"), gitUnknown, gitLocal))
 	case "restore":
 		return pick(a.has("--staged", "-S") && !a.has("--worktree", "-W"), gitLocal, gitDiscard)
-	case "switch":
-		return pick(a.has("-f", "--force", "--discard-changes"), gitDiscard, gitLocal)
+	case subSwitch:
+		return pick(a.has("-f", flagForce, "--discard-changes"), gitDiscard, gitLocal)
 	case "clean":
 		return pick(a.has("-n", "--dry-run"), gitRead, gitDiscard)
 	case "rm":
-		return pick(a.has("-f", "--force"), gitDiscard, gitLocal)
+		return pick(a.has("-f", flagForce), gitDiscard, gitLocal)
 	case subCheckout:
 		// A ref name cannot start with "." or "/" or end in "/", so such an
 		// operand is a path; any other lone operand may be a branch or a file.
 		path := strings.HasPrefix(first, ".") || strings.HasPrefix(first, "/") || strings.HasSuffix(first, "/")
 		switch {
-		case a.has("-f", "--force", "-p", "--patch", "--ours", "--theirs", "--pathspec-from-file") || len(a.paths) > 0 || path:
+		case a.has("-f", flagForce, "-p", "--patch", "--ours", "--theirs", "--pathspec-from-file") || len(a.paths) > 0 || path:
 			return gitDiscard
 		case a.has("-b", "-B", "--orphan", "--detach", "-t", "--track"):
 			return gitLocal
@@ -2019,24 +2200,24 @@ func gitArgClass(sub string, a gitArgs) string {
 		}
 	case subBranch:
 		switch {
-		case a.has("-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C", "--copy", "-f", "--force",
+		case a.has("-d", "-D", flagDelete, "-m", "-M", "--move", "-c", "-C", "--copy", "-f", flagForce,
 			"-u", "--set-upstream-to", "--unset-upstream", "--edit-description", "-t", "--track", "--no-track"):
 			return gitLocal
-		case a.has("-l", "--list", "-a", "--all", "-r", "--remotes", "--show-current", "--contains", "--no-contains",
-			"--merged", "--no-merged", "--points-at", "-v", "--verbose", "--format", "--sort", "--column"):
+		case a.has("-l", "--list", "-a", flagAll, "-r", "--remotes", "--show-current", "--contains", "--no-contains",
+			"--merged", "--no-merged", "--points-at", "-v", flagVerbose, "--format", "--sort", "--column"):
 			return gitRead
 		default:
 			return pick(first == "", gitRead, gitLocal)
 		}
 	case subTag:
 		lists := a.has("-l", "--list", "-n", "--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "-v", "--verify")
-		return pick(!a.has("-d", "--delete") && (lists || first == ""), gitRead, gitLocal)
+		return pick(!a.has("-d", flagDelete) && (lists || first == ""), gitRead, gitLocal)
 	case "worktree":
 		switch {
 		case is("list"):
 			return gitRead
 		case is("remove"):
-			return pick(a.has("-f", "--force"), gitDiscard, gitLocal)
+			return pick(a.has("-f", flagForce), gitDiscard, gitLocal)
 		default:
 			return pick(is("add", "prune", "move", "lock", "unlock", "repair"), gitLocal, gitUnknown)
 		}
@@ -2045,7 +2226,7 @@ func gitArgClass(sub string, a gitArgs) string {
 			return gitRead
 		}
 		return pick(is("add", "set-url", "remove", "rm", "rename", "show", "prune", "update", "set-head", "set-branches"), gitRemote, gitUnknown)
-	case "config":
+	case subConfig:
 		switch {
 		case a.has("--add", "--unset", "--unset-all", "--replace-all", "--rename-section", "--remove-section", "-e", "--edit"),
 			is("set", "unset", "rename-section", "remove-section", "edit"):
