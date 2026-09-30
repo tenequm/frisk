@@ -62,7 +62,9 @@ A `gh api *` rule is kept to GET requests. gh sends a POST as soon as a field
 (`-f`, `-F`, `--field`, `--raw-field`) or `--input` is given, so those, a
 method other than `GET`, and the `graphql` endpoint pass through. gh runs a
 `--jq` filter with the environment loaded, so on any gh command it is screened
-like a jq program.
+like a jq program. A `ps *` rule does not cover a call that prints the
+environment of other processes: `-E` on macOS, a BSD-style `e` as in `ps eww`
+on Linux, or an `environ` column.
 
 In the four `judge` lists `"$defaults"` splices the built-in prose,
 autoMode-style. The `permissions` lists have no built-in entries, so there the

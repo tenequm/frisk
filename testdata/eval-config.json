@@ -5,7 +5,7 @@
       "date *", "df *", "diff *", "dig *", "dirname *", "du *", "dust *",
       "echo *", "false", "fd *", "file *", "find *", "grep *", "head *",
       "hostname", "id", "jq *", "less *", "ls *", "md5 *", "more *", "nl *", "od *",
-      "paste *", "printenv [A-Za-z_]*", "printf *", "pwd", "readlink *", "realpath *",
+      "paste *", "printenv [A-Za-z_]*", "printf *", "ps *", "pwd", "readlink *", "realpath *",
       "rg *", "sed *", "shasum *", "sleep *", "sort *", "stat *", "strings *",
       "sw_vers *", "tail *", "tee", "test *", "tokei *", "tr *", "tree *", "true",
       "type *", "uname *", "uniq *", "uptime", "wc *", "which *", "whoami", "xxd *",

@@ -142,8 +142,9 @@ var programVerbs = map[string]*regexp.Regexp{
 var hijackEnv = regexp.MustCompile(`^(` +
 	// What the shell looks up and reads: commands and functions, startup
 	// files, a child shell's options and trace prompt, and zsh's command for
-	// a bare redirect, its argv[0] override and its stty hook.
-	`PATH|path|FPATH|fpath|MODULE_PATH|module_path|EXECIGNORE|HOME|ENV|BASH_ENV|ZDOTDIR` +
+	// a bare redirect, its argv[0] override and its stty hook. COMMAND_MODE
+	// switches macOS utilities to legacy option meanings.
+	`PATH|path|FPATH|fpath|MODULE_PATH|module_path|EXECIGNORE|HOME|ENV|BASH_ENV|ZDOTDIR|COMMAND_MODE` +
 	`|SHELLOPTS|BASHOPTS|POSIXLY_CORRECT|PS4|PROMPT4|BASH_XTRACEFD|NULLCMD|READNULLCMD|ARGV0|STTY` +
 	// Code the dynamic loader or an interpreter pulls in.
 	`|LD_[A-Z0-9_]+|DYLD_[A-Z0-9_]+|PYTHON(STARTUP|PATH|HOME|INSPECT|USERBASE|BREAKPOINT)` +
@@ -1183,9 +1184,31 @@ func riskyArgs(seg []string) bool {
 		return slices.Contains(args, "get") && slices.ContainsFunc(args, kubeSecret.MatchString)
 	case verbGH:
 		return len(args) > 0 && args[0] == "api" && !ghAPIReads(args[1:])
+	case "ps":
+		return psShowsEnv(args)
 	default:
 		return false
 	}
+}
+
+var (
+	psOptions   = regexp.MustCompile(`^[A-Za-z]+$`)
+	psValueFlag = regexp.MustCompile(`^-[A-Za-z]*[oOptuUG]$`)
+)
+
+// psShowsEnv reports a ps call that prints the environment of other
+// processes: -E on macOS, a BSD-style "e" as in "ps eww" on Linux, or an
+// environ column.
+func psShowsEnv(args []string) bool {
+	for i, a := range args {
+		short := strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--")
+		// The value of -o, -p, -t, -u, -U or -G is not a set of options.
+		options := psOptions.MatchString(a) && (i == 0 || !psValueFlag.MatchString(args[i-1]))
+		if strings.Contains(a, "environ") || short && strings.Contains(a, "E") || options && strings.Contains(a, "e") {
+			return true
+		}
+	}
+	return false
 }
 
 // ghAPIReads reports a gh api call that can only send a GET. gh switches to
