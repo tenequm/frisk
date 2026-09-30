@@ -281,6 +281,10 @@ var interpreterArgs = map[string]argSpec{
 // file or the command string of -c, either of which means stdin is not the script.
 var stdinShellArgs = argSpec{valueLetters: "oO", inlineLetters: "s"}
 
+// stdinPaths name an interpreter's own stdin, so as a script operand they
+// mean the same as "-": no file to probe.
+var stdinPaths = map[string]bool{"/dev/stdin": true, "/dev/fd/0": true, "/proc/self/fd/0": true}
+
 // wrapperSpec describes a command that runs its operands as another command.
 type wrapperSpec struct {
 	valueFlags []string // consume the next token
@@ -790,6 +794,10 @@ func shellReadsStdin(seg []string) bool {
 	}
 	if err != nil || len(inner) == 0 {
 		return false
+	}
+	// source and "." run their operand in the current shell.
+	if len(inner) > 1 && (inner[0] == "source" || inner[0] == ".") {
+		return stdinPaths[inner[1]]
 	}
 	m := interpreterName.FindStringSubmatch(filepath.Base(inner[0]))
 	if m == nil || m[1] != "" {
@@ -1737,7 +1745,7 @@ func scriptArg(spec argSpec, args []string) (string, bool) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
-		case a == "-":
+		case a == "-" || stdinPaths[a]:
 			return "", false
 		case a == "--":
 			if i+1 < len(args) {

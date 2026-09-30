@@ -83,7 +83,9 @@ a literal `cd` earlier in the command - never a same-named file elsewhere.
 A heredoc body is commands only when a shell reads it as its script from stdin
 (`sh`, `bash`, `zsh`, `dash`, `ksh`, behind the same wrappers or `sudo` /
 `doas`, with no script file and no `-c`): the statement it feeds, or a later
-stage of that statement's pipeline, as in `cat <<EOF | bash`. Fed to anything
+stage of that statement's pipeline, as in `cat <<EOF | bash`. An operand of
+`-`, `/dev/stdin` or `/dev/fd/0` is stdin, not a script file, and `source` or
+`.` reading one of those paths counts as that shell. Fed to anything
 else it is text: the probe takes no script and no `cd` from it, while
 `permissions.deny` and `permissions.ask` rules still match its lines.
 `$NAME` and `${NAME}` resolve only for a variable the command itself assigns
