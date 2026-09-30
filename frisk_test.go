@@ -3188,3 +3188,151 @@ func TestCredentialShapedSkipsPaths(t *testing.T) {
 		})
 	}
 }
+
+func TestGitRuleNormalization(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		rule, command string
+		allow, want   bool
+	}{
+		{"git status *", "git -C /x --no-pager status -s", true, true},
+		{"git status *", "git -c core.pager=x status", true, false},
+		{"git log *", "git --config-env=core.pager=CMD log", true, false},
+		{"git log *", "git -C /x commit", true, false},
+		{"git -c * *", "git -c alias.st=!sh st", false, true},
+		{"git commit --no-verify", "git commit -m x --no-verify", false, false},
+		{"git commit --no-verify *", "git commit -m x --no-verify", false, true},
+		{"git commit --no-verify *", "git commit -n -m x", false, true},
+		{"git commit --no-verify *", "git commit -m --no-verify", false, false},
+		{"git commit --no-verify *", "git commit --message=--no-verify", false, false},
+		{"git commit --no-verify *", "git commit --no-ver -m x", false, true},
+		{"git commit -m *", "git commit -qam x", true, true},
+		{"git commit -m *", "git commit --message=x --quiet", true, true},
+		{"git commit -m *", "git commit -m x --no-verify", true, false},
+		{"git commit -m *", "git commit -m x --amend", true, false},
+		{"git commit -m *", "git commit -m x --unknown y", true, false},
+		// A missing value leaves the old positional reading; git refuses the command itself.
+		{"git commit -m *", "git commit -m", true, true},
+		{"git status *", "git status -sb", true, true},
+		{"git push *", "git push -xf origin main", true, false},
+		{"git commit -m *", "git commit -Snm x", true, false},
+		{"git commit -F *", "git commit --file f -q", true, true},
+		{"git commit -C *", "git commit --reuse-message HEAD", true, true},
+		{"git push --force *", "git push origin main -fu", false, true},
+		{"git push -f *", "git push --force-with-lease=main origin", false, true},
+		{"git push *", "git push -f origin main", true, false},
+		{"git push --force-with-lease *", "git push --force origin main", true, false},
+		{"git push --force-with-lease=main:abc *", "git push --force-with-lease=main:def origin main", true, false},
+		{"git push --force-with-lease=main:abc *", "git push --force-with-lease=main:abc origin main", true, true},
+		{"git push --force *", "git push --force-with-lease=main:abc origin main", true, true},
+		{"git push --force-with-lease *", "git push -f origin main", false, true},
+		{"git push *", "git push origin +main", true, false},
+		{"git push *", "git push origin :main", true, false},
+		{"git push --delete *", "git push origin -d main", false, true},
+		{"git branch --delete *", "git branch topic -d", false, true},
+		{"git push -u *", "git push origin main --set-upstream", false, true},
+		{"git commit --no-verify *", "git commit -- --no-verify", false, false},
+		{"git st *", "git -C /x st", false, false},
+		{"git st *", "git st --foo", false, true},
+		{"git status *", "git --bogus status", true, false},
+		{"git commit --no-verify *", "git commit --no-verify -xyz", false, true},
+		{"git commit --no-verify *", "git commit --no-verify -xyz", true, false},
+		{"echo -n *", "echo x -n", false, false},
+	}
+	for _, tt := range tests {
+		if got := matchRule(tt.rule, strings.Fields(tt.command), tt.allow); got != tt.want {
+			t.Errorf("%q against %q (allow %v) = %v, want %v", tt.rule, tt.command, tt.allow, got, tt.want)
+		}
+	}
+}
+
+func TestGitRuleCleanup(t *testing.T) {
+	t.Parallel()
+	oldAsk := make([]string, 0, 8)
+	for _, flag := range []string{"--no-verify", "-n"} {
+		for i := range 4 {
+			oldAsk = append(oldAsk, "git commit "+strings.Repeat("* ", i)+flag+" *")
+		}
+	}
+	oldAllow := []string{"git commit -m *", "git commit -q -m *", "git commit -F *", "git commit -q -F *", "git add *", "git stash", "git stash push *", "git stash pop *", "git stash apply *", "git stash list *", "git stash show *", "git switch -c *", "git checkout -b *"}
+	newAllow := slices.DeleteFunc(slices.Clone(oldAllow), func(rule string) bool { return strings.Contains(rule, "commit -q") })
+	literalMatch := func(rules []string, command string) bool {
+		for _, rule := range rules {
+			pattern, words := strings.Fields(rule), strings.Fields(command)
+			matched := true
+			for i, token := range pattern {
+				if token == "*" && i == len(pattern)-1 {
+					return matched
+				}
+				if i >= len(words) || token != "*" && token != words[i] {
+					matched = false
+					break
+				}
+			}
+			if matched && len(pattern) == len(words) {
+				return true
+			}
+		}
+		return false
+	}
+	commands := []string{"git commit -m x", "git commit -q -m x", "git commit -F f", "git commit -q -F f", "git add a", "git stash", "git stash push x", "git stash pop x", "git stash apply x", "git stash list x", "git stash show x", "git switch -c topic", "git checkout -b topic", "git push origin main", "git commit --amend -m x"}
+	for _, flag := range []string{"--no-verify", "-n"} {
+		for _, args := range []string{flag + " -m x", "-m x " + flag, "-q -m x " + flag} {
+			commands = append(commands, "git commit "+args)
+		}
+	}
+	for _, command := range commands {
+		words := strings.Fields(command)
+		old := literalMatch(oldAsk, command)
+		if got := matchAny([]string{"git commit --no-verify *"}, [][]string{words}) != ""; got != old {
+			t.Errorf("ask cleanup %q: old %v, new %v", command, old, got)
+		}
+		old = !old && literalMatch(oldAllow, command)
+		got := matchAny([]string{"git commit --no-verify *"}, [][]string{words}) == "" && matchAny(newAllow, [][]string{words}, true) != ""
+		if got != old {
+			t.Errorf("allow cleanup %q: old %v, new %v", command, old, got)
+		}
+	}
+	data, err := os.ReadFile("config.example.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	for _, rule := range cfg.Permissions.Allow {
+		if !strings.HasPrefix(rule, "git ") {
+			continue
+		}
+		if strings.Contains(rule, "-C *") {
+			t.Fatalf("duplicate remains: %s", rule)
+		}
+		command := strings.TrimSuffix(rule, " *")
+		command = strings.ReplaceAll(command, "*", "x")
+		directed := strings.Replace(command, "git ", "git -C /x ", 1)
+		oldRules := []string{rule, strings.Replace(rule, "git ", "git -C * ", 1)}
+		for _, candidate := range []string{command, directed} {
+			if !literalMatch(oldRules, candidate) || !matchRule(rule, strings.Fields(candidate), true) {
+				t.Errorf("read cleanup %q against %q", rule, candidate)
+			}
+		}
+	}
+}
+
+func TestGitRuleGlobals(t *testing.T) {
+	t.Parallel()
+	for _, global := range []string{"-C /x", "--no-pager", "-P", "--git-dir=/x", "--work-tree=/x", "--namespace x", "--bare", "--no-optional-locks", "--attr-source HEAD", "--literal-pathspecs"} {
+		command := strings.Fields("git " + global + " status -s")
+		for _, allow := range []bool{false, true} {
+			if !matchRule("git status *", command, allow) {
+				t.Errorf("global %q, allow %v", global, allow)
+			}
+		}
+	}
+	for _, global := range []string{"-c core.pager=x", "--config-env core.pager=CMD", "--exec-path=/x"} {
+		if matchRule("git log *", strings.Fields("git "+global+" log"), true) {
+			t.Errorf("override %q matched", global)
+		}
+	}
+}
