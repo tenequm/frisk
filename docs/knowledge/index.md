@@ -50,6 +50,10 @@ Conventions:
   frisk sends the judge a trusted record for each git command (class, forcing,
   push destination, files a discard would lose) and ships no git policy; the
   user's judge prose is written against the record's fields.
+- [Chained commands are judged whole](chains-are-judged-whole.md) - Judging each
+  piece of a chain separately and keeping the strictest verdict moved as many
+  chains out of allow as into it, at 1.8 times the judge calls, and loses the
+  context that links the pieces.
 
 ## Findings
 
@@ -79,6 +83,10 @@ Conventions:
   A replay sends the judge the replay machine's git facts and probe results, not
   the ones the command originally ran with, so ask and deny rates from a replay
   overstate what live traffic gets.
+- [Bash and zsh read a variable of several words differently](shells-disagree-on-word-splitting.md) -
+  Bash splits an unquoted variable into words and zsh keeps it whole, so a static
+  allow must pass both readings, and in zsh a command variable holding a path
+  with a space runs that path.
 
 ## References
 
