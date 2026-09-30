@@ -35,9 +35,10 @@ Conventions:
 - [frisk front-runs Claude Code's permission flow](front-run-not-bypass.md) - frisk
   runs in front of auto mode and never as the only gate under bypassPermissions,
   because in that mode every frisk failure path would become an allow.
-- [Core is generic, config is personal](core-generic-config-specific.md) - Builtin
-  rules must be right for any user on Linux or macOS; one user's tools, hosts and
-  secret-handling policy live in their config.
+- [Core understands commands, config decides](core-generic-config-specific.md) -
+  Core parses commands and screens their arguments for any unix user and ships no
+  allow rules; which commands settle, and one user's tools, hosts and policy, live
+  in their config.
 - [Weak judge verdicts are not acted on](confidence-floors.md) - A judge allow
   below 0.75, an ask below 0.50 or a deny below 0.50 is downgraded rather than
   enforced, because low-confidence verdicts were mostly wrong in live use.
@@ -55,8 +56,9 @@ Conventions:
   Actions whose safety depends on what the user asked for cannot be settled from
   command text, and they surface as low-confidence verdicts.
 - [Static allow needs argument screening](static-allow-needs-argument-screening.md) -
-  A read-only verb list is not a safe allow rule; arguments, flags, environment
-  prefixes and globs can turn a reader into a writer, an executor or a secret leak.
+  A read-only verb rule is not a safe allow on its own; arguments, flags,
+  environment assignments, globs, shell quoting and variables can turn a reader
+  into a writer, an executor or a secret leak.
 - [A script the judge cannot see must be reported](unseen-script-must-be-reported.md) -
   When a command runs a script whose body is not attached, the judge rates the
   harmless-looking command line and allows it, so the probe must follow the command
