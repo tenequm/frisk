@@ -1868,8 +1868,9 @@ func gitDo(t *testing.T, args ...string) {
 	}
 }
 
-// gitRepos adds to gitRepo one staged and one untracked file in repo, and a
-// clean second repository "other" on its default branch trunk.
+// gitRepos adds to gitRepo one staged and one untracked file in repo, a branch
+// topic that exists only on origin, and a clean second repository "other" on
+// its default branch trunk.
 func gitRepos(t *testing.T) string {
 	t.Helper()
 	root := gitRepo(t)
@@ -1881,6 +1882,7 @@ func gitRepos(t *testing.T) string {
 	}
 	for _, args := range [][]string{
 		{"-C", repo, "add", "staged.txt"},
+		{"-C", repo, "update-ref", "refs/remotes/origin/topic", "HEAD"},
 		{"init", "-q", "-b", "trunk", other},
 		{"-C", other, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "init"},
 		{"-C", other, "remote", "add", "origin", "git@git.example.com:team/other.git"},
@@ -2100,6 +2102,49 @@ func TestGitRecords(t *testing.T) {
 				`{"class":"discard","forced":true,"state":"unknown","subcommand":"clean","uncommitted_files":"unknown","untracked_files":"unknown"}]`,
 			"reset:discard,push:remote,clean:discard",
 		},
+		{
+			"checkout of a local branch is local", "git checkout main",
+			`[{"class":"local","state":"current","subcommand":"checkout"}]`,
+			"checkout:local",
+		},
+		{
+			"checkout of a branch on exactly one remote is local", "git checkout topic",
+			`[{"class":"local","state":"current","subcommand":"checkout"}]`,
+			"checkout:local",
+		},
+		{
+			"checkout of a path is a discard", "git checkout staged.txt",
+			`[{"class":"discard","state":"current","subcommand":"checkout","uncommitted_files":1,"untracked_files":1}]`,
+			"checkout:discard",
+		},
+		{
+			"checkout of neither a branch nor a path stays unknown", "git checkout nothing",
+			`[{"class":"unknown","state":"current","subcommand":"checkout"}]`,
+			"checkout:unknown",
+		},
+		{
+			"checkout in a directory that does not resolve stays unknown", "cd $DIR && git checkout main",
+			`[{"class":"unknown","state":"unknown","subcommand":"checkout"}]`,
+			"checkout:unknown",
+		},
+		{
+			"checkout of a branch leaves a pull as it is", "git checkout main && git pull",
+			`[{"class":"local","state":"current","subcommand":"checkout"},` +
+				`{"class":"remote","deletes_ref":false,"forced":false,"state":"current","subcommand":"pull"}]`,
+			"checkout:local,pull:remote",
+		},
+		{
+			"checkout of a branch makes a push that goes by the branch unknown", "git checkout main && git push",
+			`[{"class":"local","state":"current","subcommand":"checkout"},` +
+				`{"class":"remote","deletes_ref":false,"destination":"unknown","destination_is_default":"unknown","forced":false,"remote":"unknown","state":"unknown","subcommand":"push"}]`,
+			"checkout:local,push:remote",
+		},
+		{
+			"checkout of a branch leaves a push that names its remote and branch current", "git checkout main && git push origin main",
+			`[{"class":"local","state":"current","subcommand":"checkout"},` +
+				`{"class":"remote","deletes_ref":false,"destination":"main","destination_is_default":"yes","forced":false,"remote":"github.com/owner/repo","state":"current","subcommand":"push"}]`,
+			"checkout:local,push:remote",
+		},
 		{"gh command gets facts and no record", "gh pr create --fill", "", ""},
 		{"non-git command", "terraform plan", "", ""},
 	}
@@ -2156,6 +2201,20 @@ func TestGitRecords(t *testing.T) {
 		want := `{"commands":[{"class":"discard","state":"current","subcommand":"reset","uncommitted_files":"unknown","untracked_files":"unknown"}]}`
 		if string(data) != want {
 			t.Fatalf("git state = %s, want %s", data, want)
+		}
+	})
+
+	// Last: the file it adds would change the counts above.
+	t.Run("checkout of a word that is both a branch and a path stays unknown", func(t *testing.T) {
+		if err := os.WriteFile(filepath.Join(root, "repo", "main"), []byte("x\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, capture := fakeJevCapture(t, jevAnswer{Choice: "ask", Confidence: 0.90})
+		v := decide(cfg, "git checkout main && git push origin main", filepath.Join(root, "repo"), testLogger)
+		_, req := capture.request()
+		push, _ := json.Marshal(req.State.Git["commands"])
+		if v.Git != "checkout:unknown,push:remote" || !strings.Contains(string(push), `"remote":"unknown","state":"unknown","subcommand":"push"`) {
+			t.Fatalf("records = %q, commands = %s", v.Git, push)
 		}
 	})
 }
@@ -2239,6 +2298,7 @@ func TestGitMoves(t *testing.T) {
 		"git remote add up https://example.com/o/r.git":         true,
 		"git remote remove up":                                  true,
 		"git clone https://example.com/o/r.git":                 true,
+		"git init":                                              true,
 		"git remote -v":                                         false,
 		"git remote get-url origin":                             false,
 		"git switch -c feat/x":                                  false,
@@ -2298,6 +2358,13 @@ func TestDescribeGit(t *testing.T) {
 		{"git ls-files", "ls-files read"},
 		{"git rev-parse --abbrev-ref HEAD", "rev-parse read"},
 		{"git grep -n TODO", "grep read"},
+		{"git shortlog -sn --all", "shortlog read"},
+		{"git for-each-ref refs/heads", "for-each-ref read"},
+		{"git count-objects -v", "count-objects read"},
+		{"git name-rev HEAD", "name-rev read"},
+		{"git diff-tree --no-commit-id -r HEAD", "diff-tree read"},
+		{"git check-ignore -v build", "check-ignore read"},
+		{"git verify-commit HEAD", "verify-commit read"},
 		{"git branch", "branch read"},
 		{"git branch -avv", "branch read"},
 		{"git branch --list 'feat/*'", "branch read"},
@@ -2348,6 +2415,9 @@ func TestDescribeGit(t *testing.T) {
 		{"git worktree add ../wt feat/x", "worktree local"},
 		{"git worktree remove ../wt", "worktree local"},
 		{"git bisect start", "bisect local"},
+		{"git mv old.go new.go", "mv local"},
+		{"git mv -f old.go new.go", "mv local forced"},
+		{"git init", "init local"},
 
 		// class discard
 		{"git reset --hard", "reset discard hard"},

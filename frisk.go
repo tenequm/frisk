@@ -1562,16 +1562,17 @@ const (
 	gitExec    = "exec"    // can run another program or reach credentials
 	gitUnknown = "unknown"
 
-	gitHead   = "HEAD"
-	flagExec  = "--exec"
-	subBranch = "branch"
-	subCommit = "commit"
-	subPush   = "push"
-	subRemote = "remote"
-	subRebase = "rebase"
-	subReset  = "reset"
-	subStash  = "stash"
-	subTag    = "tag"
+	gitHead     = "HEAD"
+	flagExec    = "--exec"
+	subBranch   = "branch"
+	subCheckout = "checkout"
+	subCommit   = "commit"
+	subPush     = "push"
+	subRemote   = "remote"
+	subRebase   = "rebase"
+	subReset    = "reset"
+	subStash    = "stash"
+	subTag      = "tag"
 )
 
 // gitSub is one subcommand's row. An empty class means the arguments decide
@@ -1590,12 +1591,15 @@ var gitSubs = map[string]gitSub{
 	"show": {class: gitRead}, "blame": {class: gitRead}, "ls-files": {class: gitRead},
 	"ls-tree": {class: gitRead}, "rev-parse": {class: gitRead}, "rev-list": {class: gitRead},
 	"show-ref": {class: gitRead}, "describe": {class: gitRead}, "cat-file": {class: gitRead},
-	"merge-base": {class: gitRead}, "grep": {}, "reflog": {},
+	"merge-base": {class: gitRead}, "shortlog": {class: gitRead}, "for-each-ref": {class: gitRead},
+	"count-objects": {class: gitRead}, "name-rev": {class: gitRead}, "diff-tree": {class: gitRead},
+	"check-ignore": {class: gitRead}, "verify-commit": {class: gitRead}, "grep": {}, "reflog": {},
 
 	"add": {class: gitLocal}, subCommit: {class: gitLocal, vals: "mFCct"},
 	"merge": {class: gitLocal}, "cherry-pick": {class: gitLocal}, "revert": {class: gitLocal},
+	"mv": {class: gitLocal, force: true}, "init": {class: gitLocal, rewires: true},
 	subRebase: {vals: "x"}, "bisect": {moves: true}, subReset: {}, "restore": {vals: "s"},
-	"switch": {vals: "cC", force: true, moves: true}, "checkout": {vals: "bB", force: true, moves: true},
+	"switch": {vals: "cC", force: true, moves: true}, subCheckout: {vals: "bB", force: true, moves: true},
 	subStash: {vals: "m"}, subBranch: {vals: "u", force: true, moves: true}, subTag: {vals: "mFu", force: true},
 	"worktree": {vals: "bB", force: true, moves: true}, "clean": {vals: "e", force: true}, "rm": {force: true},
 
@@ -1665,6 +1669,7 @@ type gitCommand struct {
 
 	remote      string // push: the remote operand, "" when the words name none
 	destination string // push: a branch, gitHead, "" with no refspec, or gitUnknown
+	ambiguous   string // checkout: the lone word that may name a branch or a path
 }
 
 // gitArgs is what follows the subcommand, split at "--".
@@ -1794,6 +1799,9 @@ func (g *gitCommand) describeArgs(words []string) {
 		sub == subStash && slices.Contains(a.operands[:min(1, len(a.operands))], subBranch) ||
 		sub == subRebase && len(a.operands) > 1)
 	g.rewires = g.class != gitRead && row.rewires
+	if sub == subCheckout && g.class == gitUnknown && len(a.operands) == 1 {
+		g.ambiguous = a.operands[0]
+	}
 	switch sub {
 	case subBranch:
 		g.deletesRef = a.has("-d", "-D", "--delete")
@@ -1897,7 +1905,7 @@ func gitArgClass(sub string, a gitArgs) string {
 		return pick(a.has("-n", "--dry-run"), gitRead, gitDiscard)
 	case "rm":
 		return pick(a.has("-f", "--force"), gitDiscard, gitLocal)
-	case "checkout":
+	case subCheckout:
 		// A ref name cannot start with "." or "/" or end in "/", so such an
 		// operand is a path; any other lone operand may be a branch or a file.
 		path := strings.HasPrefix(first, ".") || strings.HasPrefix(first, "/") || strings.HasSuffix(first, "/")
@@ -1994,6 +2002,16 @@ type pushTarget struct{ remote, destination, isDefault string }
 // that cannot be read is omitted or unknown, never guessed; commands without
 // git or gh get nothing. The string is the records in short, for the log.
 func gitFacts(segments, env [][]string, cwd string) (map[string]any, string) {
+	ctx, cancel := context.WithTimeout(context.Background(), gitFactsTimeout)
+	defer cancel()
+	// frisk only reads: no index refresh is written back, and a repository
+	// cannot have git status start its fsmonitor program.
+	git := func(dir string, args ...string) (string, bool) {
+		args = append([]string{"-C", dir, "--no-optional-locks", "-c", "core.fsmonitor=false"}, args...)
+		out, err := exec.CommandContext(ctx, verbGit, args...).Output() //nolint:gosec // argv without a shell; a word from the command passes gitRef first
+		return strings.TrimSpace(string(out)), err == nil
+	}
+
 	dir := shellDir{path: cwd, known: cwd != ""}
 	var targets []gitTarget
 	var base *shellDir
@@ -2009,6 +2027,11 @@ func gitFacts(segments, env [][]string, cwd string) (map[string]any, string) {
 				at.path, at.known = at.resolve(d)
 			}
 			at.known = at.known && !cmd.retargeted
+			// Settled here, so what the later segments lose follows the class
+			// the repository gives it rather than unknown.
+			if at.known && cmd.ambiguous != "" {
+				cmd.settleCheckout(at.path, git)
+			}
 			// State is not followed across segments. A push's facts go stale
 			// once a segment may have changed a remote, and once one may have
 			// moved the branch if the push leaves its remote or destination to
@@ -2030,16 +2053,6 @@ func gitFacts(segments, env [][]string, cwd string) (map[string]any, string) {
 	}
 	if base == nil {
 		return nil, ""
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), gitFactsTimeout)
-	defer cancel()
-	// frisk only reads: no index refresh is written back, and a repository
-	// cannot have git status start its fsmonitor program.
-	git := func(dir string, args ...string) (string, bool) {
-		args = append([]string{"-C", dir, "--no-optional-locks", "-c", "core.fsmonitor=false"}, args...)
-		out, err := exec.CommandContext(ctx, verbGit, args...).Output()
-		return strings.TrimSpace(string(out)), err == nil
 	}
 	facts := map[string]any{}
 	if base.known {
@@ -2075,6 +2088,32 @@ func gitFacts(segments, env [][]string, cwd string) (map[string]any, string) {
 		facts["commands"] = commands
 	}
 	return facts, strings.Join(summary, ",")
+}
+
+// settleCheckout decides "git checkout <word>", which the words leave open,
+// by what the repository holds: a branch git would switch to (local, or on
+// exactly one remote) or a path it would overwrite. Both or neither stays unknown.
+func (g *gitCommand) settleCheckout(dir string, git gitRunner) {
+	w := g.ambiguous
+	if !gitRef.MatchString(w) {
+		return
+	}
+	out, ok := git(dir, "for-each-ref", "--format=%(refname)", "refs/heads/"+w, "refs/remotes/*/"+w)
+	if !ok {
+		return
+	}
+	// The heads pattern also matches branches under "<word>/".
+	refs := strings.Split(out, "\n")
+	tracking := len(slices.DeleteFunc(slices.Clone(refs), func(ref string) bool { return !strings.HasPrefix(ref, "refs/remotes/") }))
+	branch := slices.Contains(refs, "refs/heads/"+w) || tracking == 1
+	_, err := os.Lstat(filepath.Join(dir, w)) //nolint:gosec // only whether the path exists, which is what git itself checks
+	switch {
+	case branch && errors.Is(err, fs.ErrNotExist):
+		g.class = gitLocal
+	case !branch && err == nil:
+		g.class = gitDiscard
+	default:
+	}
 }
 
 // record renders one git command for the judge: what its words say, then

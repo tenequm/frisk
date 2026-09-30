@@ -151,6 +151,13 @@ runs in (`-C`, or the directory a literal `cd` led to).
 | `uncommitted_files`, `untracked_files` | class `discard` | counts from one `git status --porcelain`, or `unknown` when it does not answer in time |
 | `state` | always | `current`, or `unknown` when what this record reads from the repository may not hold when the segment runs |
 
+`git checkout <word>` is the one class the repository settles: when the
+directory resolves, the word is looked up. A local branch, or a branch on
+exactly one remote, with no path of that name in the working tree makes it
+`local`; a path and no such branch makes it `discard`; both or neither stays
+`unknown`. What later segments lose follows the settled class, so
+`git checkout main && git pull` reads `local`, `remote`.
+
 `state` is `unknown` when the directory cannot be resolved or the command is
 aimed at another repository (`--git-dir`, `GIT_DIR`, ...). State is not
 followed across segments either, so an earlier git segment of the same command
@@ -158,8 +165,8 @@ can make it `unknown`, by what the record depends on:
 
 - a push's fields depend on the remotes, and on the checked-out branch and
   its upstream when the push leaves its remote or destination to them (no
-  remote, no refspec, or `HEAD`). An earlier `remote` or `clone` that is not a
-  read, or any segment of class `exec` or `unknown`, may have changed a remote
+  remote, no refspec, or `HEAD`). An earlier `remote`, `clone` or `init` that
+  is not a read, or any segment of class `exec` or `unknown`, may have changed a remote
   and invalidates every push after it. An earlier `switch`, `checkout`,
   `branch`, `worktree` or `bisect` that is not a read, a `-u` /
   `--set-upstream`, a `stash branch`, or a rebase given the branch to rebase
@@ -256,14 +263,15 @@ rule it reaches the judge like any other command.
 - the subcommand, found behind git's own global options (`-C`, `-c`,
   `--git-dir`, `--work-tree`, `--no-pager`, `--bare`, ...). An option git
   would reject, or a first word that is not a plain name, leaves it `unknown`.
-- a class, from a table of about forty subcommands: `read`, `local` (changes
+- a class, from a table of some fifty subcommands: `read`, `local` (changes
   refs, index or objects, which the reflog recovers), `discard` (can destroy
   uncommitted work), `remote` (talks to or changes a remote), `exec` (can run
   another program or reach credentials), and `unknown` for everything else.
   Where the arguments decide (`reset`, `checkout`, `restore`, `stash`,
   `branch`, `tag`, `config`, `worktree`, `clean`, ...) they are read, and
   `unknown` is the answer when they do not settle it: `git checkout main` may
-  switch branches or overwrite a file named `main`.
+  switch branches or overwrite a file named `main`, and only the repository
+  can say which (see the record).
 - flags, with short and long spellings as one: forced (`-f`, `--force`,
   `--force-with-lease`, a `+` refspec), deletes a ref (`-d`, `-D`, `--delete`,
   a `:dst` refspec, `--prune`, `--mirror`), `--no-verify` (`-n` on commit),
