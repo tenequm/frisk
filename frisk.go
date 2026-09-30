@@ -190,8 +190,8 @@ var credentialPattern = regexp.MustCompile(
 )
 
 // base64Run finds long base64-alphabet runs, which also match paths and
-// identifiers. Those measure under 4.3 bits/char; 99.7% of random 40-char
-// base64 measures above 4.4.
+// identifiers. Identifiers measure under 4.3 bits/char and 99.7% of random
+// 40-char base64 above 4.4; long paths can reach 4.4, so pathLike rules them out.
 var base64Run = regexp.MustCompile(`[A-Za-z0-9+/]{40,}={0,2}`)
 
 const minSecretEntropy = 4.4
@@ -201,7 +201,7 @@ func credentialShaped(data []byte) bool {
 		return true
 	}
 	return slices.ContainsFunc(base64Run.FindAll(data, -1), func(run []byte) bool {
-		return shannonEntropy(run) >= minSecretEntropy
+		return !pathLike(string(run)) && shannonEntropy(run) >= minSecretEntropy
 	})
 }
 
