@@ -1530,6 +1530,404 @@ func truncate(s string, limit int) string {
 	return string(runes[:limit]) + "..."
 }
 
+// Git classes say what an invocation can do, never whether it should run:
+// that is the user's config.
+const (
+	gitRead    = "read"    // reports and changes nothing
+	gitLocal   = "local"   // changes refs, index or objects, which the reflog recovers
+	gitDiscard = "discard" // can destroy uncommitted work
+	gitRemote  = "remote"  // talks to or changes a remote
+	gitExec    = "exec"    // can run another program or reach credentials
+	gitUnknown = "unknown"
+
+	gitHead   = "HEAD"
+	flagExec  = "--exec"
+	subBranch = "branch"
+	subCommit = "commit"
+	subPush   = "push"
+	subRemote = "remote"
+	subReset  = "reset"
+	subTag    = "tag"
+)
+
+// gitSub is one subcommand's row. An empty class means the arguments decide
+// it, in gitArgClass. vals are the short flags that take a value, so the word
+// after one is neither a flag nor an operand.
+type gitSub struct {
+	class string
+	vals  string
+	force bool // -f and --force override a safety check here
+}
+
+var gitSubs = map[string]gitSub{
+	"status": {class: gitRead}, "log": {class: gitRead}, "diff": {class: gitRead},
+	"show": {class: gitRead}, "blame": {class: gitRead}, "ls-files": {class: gitRead},
+	"ls-tree": {class: gitRead}, "rev-parse": {class: gitRead}, "rev-list": {class: gitRead},
+	"show-ref": {class: gitRead}, "describe": {class: gitRead}, "cat-file": {class: gitRead},
+	"merge-base": {class: gitRead}, "grep": {}, "reflog": {},
+
+	"add": {class: gitLocal}, subCommit: {class: gitLocal, vals: "mFCct"},
+	"merge": {class: gitLocal}, "cherry-pick": {class: gitLocal}, "revert": {class: gitLocal},
+	"rebase": {vals: "x"}, "bisect": {}, subReset: {}, "restore": {vals: "s"},
+	"switch": {vals: "cC", force: true}, "checkout": {vals: "bB", force: true},
+	"stash": {vals: "m"}, subBranch: {vals: "u", force: true}, subTag: {vals: "mFu", force: true},
+	"worktree": {vals: "bB", force: true}, "clean": {vals: "e", force: true}, "rm": {force: true},
+
+	subPush: {class: gitRemote, vals: "o", force: true}, "fetch": {class: gitRemote, force: true},
+	"pull": {class: gitRemote, force: true}, "ls-remote": {class: gitRemote},
+	"clone": {vals: "ubco"}, subRemote: {},
+
+	"config": {vals: "f"}, "submodule": {}, "difftool": {class: gitExec},
+	"mergetool": {class: gitExec}, "filter-branch": {class: gitExec},
+	"credential": {class: gitExec}, "daemon": {class: gitExec},
+}
+
+// A global option takes no value, one that may be the next word, or one that
+// is only ever attached with "=".
+const (
+	globalPlain = iota
+	globalValue
+	globalAttached
+)
+
+// gitGlobals are git's own options, which come before the subcommand.
+var gitGlobals = map[string]int{
+	"-C": globalValue, "-c": globalValue, "--git-dir": globalValue, "--work-tree": globalValue,
+	"--namespace": globalValue, "--config-env": globalValue, "--attr-source": globalValue,
+	"--exec-path": globalAttached,
+	"--no-pager":  globalPlain, "-P": globalPlain, "-p": globalPlain, "--paginate": globalPlain,
+	"--bare": globalPlain, "--no-replace-objects": globalPlain, "--no-lazy-fetch": globalPlain,
+	"--no-optional-locks": globalPlain, "--no-advice": globalPlain, "--literal-pathspecs": globalPlain,
+	"--glob-pathspecs": globalPlain, "--noglob-pathspecs": globalPlain, "--icase-pathspecs": globalPlain,
+}
+
+var (
+	// gitExecFlags name a program for git to run, on any subcommand.
+	gitExecFlags = []string{flagExec, "--upload-pack", "--receive-pack", "--extcmd", "--open-files-in-pager"}
+	// gitExecEnv variables swap config or a program git runs, as -c does;
+	// gitRepoEnv variables aim git at a repository other than the directory's.
+	gitExecEnv = regexp.MustCompile(`^GIT_(SSH|SSH_COMMAND|PROXY_COMMAND|PAGER|EDITOR|SEQUENCE_EDITOR|EXTERNAL_DIFF|ASKPASS|EXEC_PATH|TEMPLATE_DIR|CONFIG[A-Z0-9_]*)=`)
+	gitRepoEnv = regexp.MustCompile(`^GIT_(DIR|WORK_TREE|COMMON_DIR|INDEX_FILE|OBJECT_DIRECTORY|NAMESPACE)=`)
+	// gitWord is a subcommand spelled plainly; gitRef a ref or remote name with
+	// nothing the shell expands and no leading "-" git could read as an option.
+	gitWord = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
+	gitRef  = regexp.MustCompile(`^[\w.@][\w./@+-]*$`)
+
+	// pushPlain flags leave where a push goes to its operands. pushWide ones
+	// push more than the refspec names. Any other flag may take an operand as
+	// its value, so neither the remote nor the destination is reported.
+	pushPlain = []string{
+		"-u", "--set-upstream", "-f", "--force", "--force-with-lease", "--force-if-includes",
+		"--no-verify", "--verify", "-n", "--dry-run", "-q", "--quiet", "-v", "--verbose",
+		"--progress", "--porcelain", "--atomic", "-d", "--delete", "-o",
+	}
+	pushWide = []string{"--all", "--branches", "--mirror", "--tags", "--follow-tags", "--prune"}
+)
+
+// gitCommand describes one git invocation from its words alone.
+type gitCommand struct {
+	subcommand string   // gitUnknown when the words do not name one
+	class      string   // one of the git classes
+	dirs       []string // -C operands in order, each relative to the one before
+	retargeted bool     // --git-dir and the like: the directory no longer names the repository
+	override   bool     // -c or another option that swaps config or the programs git runs
+
+	forced, noVerify, deletesRef, hard, amend bool
+
+	remote      string // push: the remote operand, "" when the words name none
+	destination string // push: a branch, gitHead, "" with no refspec, or gitUnknown
+}
+
+// gitArgs is what follows the subcommand, split at "--".
+type gitArgs struct {
+	flags    map[string]bool // short flags unbundled, long flags without "=value"
+	operands []string        // before "--"
+	paths    []string        // after "--"
+	split    bool            // "--" was given
+}
+
+func (a gitArgs) has(names ...string) bool {
+	return slices.ContainsFunc(names, func(name string) bool { return a.flags[name] })
+}
+
+func parseGitArgs(words []string, vals string) gitArgs {
+	a := gitArgs{flags: map[string]bool{}}
+	for i := 0; i < len(words); i++ {
+		w := words[i]
+		switch {
+		case w == "--":
+			a.split, a.paths = true, words[i+1:]
+			return a
+		case strings.HasPrefix(w, "--"):
+			name, _, _ := strings.Cut(w, "=")
+			a.flags[name] = true
+		case len(w) > 1 && w[0] == '-':
+			for j := 1; j < len(w); j++ {
+				a.flags["-"+w[j:j+1]] = true
+				if strings.IndexByte(vals, w[j]) < 0 {
+					continue
+				}
+				if j == len(w)-1 {
+					i++
+				}
+				break
+			}
+		default:
+			a.operands = append(a.operands, w)
+		}
+	}
+	return a
+}
+
+// describeGit reads one command segment as a git invocation. It opens no
+// repository and decides nothing: a word it cannot place leaves a field unknown.
+func describeGit(seg []string) (gitCommand, bool) {
+	inner, _, err := unwrap(seg)
+	if err != nil || len(inner) == 0 || filepath.Base(inner[0]) != verbGit {
+		return gitCommand{}, false
+	}
+	g := gitCommand{subcommand: gitUnknown, class: gitUnknown}
+	for _, w := range seg[:len(seg)-len(inner)] {
+		g.override = g.override || gitExecEnv.MatchString(w)
+		g.retargeted = g.retargeted || gitRepoEnv.MatchString(w)
+	}
+	args := inner[1:]
+	i := 0
+	for ; i < len(args) && strings.HasPrefix(args[i], "-"); i++ {
+		name, value, attached := strings.Cut(args[i], "=")
+		kind, known := gitGlobals[name]
+		if attached && (!strings.HasPrefix(name, "--") || kind == globalPlain) {
+			known = false
+		}
+		if kind == globalValue && !attached {
+			i++
+			known = known && i < len(args)
+			if known {
+				value = args[i]
+			}
+		}
+		// git rejects an option it does not know, so nothing after it is a subcommand.
+		if !known {
+			i = len(args)
+			break
+		}
+		switch name {
+		case "-C":
+			g.dirs = append(g.dirs, value)
+		case "-c", "--config-env":
+			g.override = true
+		case "--exec-path":
+			g.override = g.override || attached
+		case "--git-dir", "--work-tree", "--namespace", "--bare":
+			g.retargeted = true
+		default:
+		}
+	}
+	if i < len(args) && gitWord.MatchString(args[i]) {
+		g.subcommand = args[i]
+		g.describeArgs(args[i+1:])
+	}
+	if g.override {
+		g.class = gitExec
+	}
+	return g, true
+}
+
+func (g *gitCommand) describeArgs(words []string) {
+	sub := g.subcommand
+	row, known := gitSubs[sub]
+	if strings.HasPrefix(sub, "credential-") {
+		row, known = gitSubs["credential"], true
+	}
+	if !known {
+		return
+	}
+	a := parseGitArgs(words, row.vals)
+	g.class = row.class
+	if g.class == "" {
+		g.class = gitArgClass(sub, a)
+	}
+	switch {
+	case a.has(gitExecFlags...):
+		g.class = gitExec
+	case g.class == gitRead && a.has("--output"):
+		g.class = gitUnknown
+	default:
+	}
+
+	g.forced = row.force && a.has("-f", "--force") || a.has("--force-with-lease")
+	g.noVerify = a.has("--no-verify") || sub == subCommit && a.has("-n")
+	g.hard = sub == subReset && a.has("--hard")
+	g.amend = sub == subCommit && a.has("--amend")
+	switch sub {
+	case subBranch:
+		g.deletesRef = a.has("-d", "-D", "--delete")
+		g.forced = g.forced || a.has("-D", "-M", "-C")
+	case subTag:
+		g.deletesRef = a.has("-d", "--delete")
+	case subPush, "fetch", "pull":
+		g.describeRefspecs(a)
+	default:
+	}
+}
+
+// describeRefspecs reads the remote and refspec operands of push, fetch and
+// pull. Only a push reports where it goes, and only for the shapes it can
+// read without git's refspec and push.default rules.
+func (g *gitCommand) describeRefspecs(a gitArgs) {
+	operands := slices.Concat(a.operands, a.paths)
+	push := g.subcommand == subPush
+	for _, spec := range operands[min(1, len(operands)):] {
+		g.forced = g.forced || strings.HasPrefix(spec, "+")
+		g.deletesRef = g.deletesRef || push && strings.HasPrefix(strings.TrimPrefix(spec, "+"), ":")
+	}
+	if !push {
+		return
+	}
+	g.deletesRef = g.deletesRef || a.has("-d", "--delete", "--prune", "--mirror")
+	g.forced = g.forced || a.has("--mirror")
+
+	if len(operands) > 0 {
+		g.remote = gitUnknown
+		if !strings.ContainsAny(operands[0], "$`*?[{") {
+			g.remote = operands[0]
+		}
+	}
+	switch {
+	case a.has(pushWide...) || len(operands) > 2:
+		g.destination = gitUnknown
+	case len(operands) == 2:
+		g.destination = refspecDestination(operands[1])
+	default:
+	}
+	for name := range a.flags {
+		if !slices.Contains(pushPlain, name) && !slices.Contains(pushWide, name) {
+			g.remote, g.destination = gitUnknown, gitUnknown
+		}
+	}
+}
+
+// refspecDestination names the branch a single push refspec updates: "x",
+// "+x", "src:x" and ":x" all name x, and a bare HEAD stays gitHead.
+func refspecDestination(spec string) string {
+	spec = strings.TrimPrefix(spec, "+")
+	if _, dst, ok := strings.Cut(spec, ":"); ok {
+		spec = dst
+	}
+	spec = strings.TrimPrefix(spec, "refs/heads/")
+	switch {
+	case spec == "@":
+		return gitHead
+	case !gitRef.MatchString(spec):
+		return gitUnknown
+	default:
+		return spec
+	}
+}
+
+// gitArgClass settles the subcommands whose effect depends on their
+// arguments, and answers unknown when the arguments do not settle it.
+func gitArgClass(sub string, a gitArgs) string {
+	first := ""
+	if len(a.operands) > 0 {
+		first = a.operands[0]
+	}
+	is := func(names ...string) bool { return slices.Contains(names, first) }
+	pick := func(cond bool, yes, no string) string {
+		if cond {
+			return yes
+		}
+		return no
+	}
+	switch sub {
+	case "grep":
+		return pick(a.has("-O"), gitExec, gitRead)
+	case "reflog":
+		return pick(is("", "show", "exists"), gitRead, gitUnknown)
+	case "rebase":
+		return pick(a.has("-x"), gitExec, gitLocal)
+	case "bisect":
+		return pick(is("run"), gitExec, pick(is("start", "good", "bad", "new", "old", "skip", subReset), gitLocal, gitUnknown))
+	case "submodule":
+		return pick(is("foreach"), gitExec, gitUnknown)
+	case "clone":
+		return pick(a.has("-u", "-c", "--config", "--template"), gitExec, gitRemote)
+	case subReset:
+		return pick(a.has("--hard"), gitDiscard, pick(a.has("--merge", "--keep"), gitUnknown, gitLocal))
+	case "restore":
+		return pick(a.has("--staged", "-S") && !a.has("--worktree", "-W"), gitLocal, gitDiscard)
+	case "switch":
+		return pick(a.has("-f", "--force", "--discard-changes"), gitDiscard, gitLocal)
+	case "clean":
+		return pick(a.has("-n", "--dry-run"), gitRead, gitDiscard)
+	case "rm":
+		return pick(a.has("-f", "--force"), gitDiscard, gitLocal)
+	case "checkout":
+		// A ref name cannot start with "." or "/" or end in "/", so such an
+		// operand is a path; any other lone operand may be a branch or a file.
+		path := strings.HasPrefix(first, ".") || strings.HasPrefix(first, "/") || strings.HasSuffix(first, "/")
+		switch {
+		case a.has("-f", "--force", "-p", "--patch", "--ours", "--theirs", "--pathspec-from-file") || len(a.paths) > 0 || path:
+			return gitDiscard
+		case a.has("-b", "-B", "--orphan", "--detach", "-t", "--track"):
+			return gitLocal
+		case len(a.operands) > 1:
+			return gitDiscard
+		default:
+			return pick(a.split && len(a.operands) == 1, gitLocal, gitUnknown)
+		}
+	case "stash":
+		switch {
+		case is("", subPush, "save", "apply", "pop", subBranch, "create", "store"):
+			return gitLocal
+		case is("list", "show"):
+			return gitRead
+		default:
+			return pick(is("drop", "clear"), gitDiscard, gitUnknown)
+		}
+	case subBranch:
+		switch {
+		case a.has("-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C", "--copy", "-f", "--force",
+			"-u", "--set-upstream-to", "--unset-upstream", "--edit-description", "-t", "--track", "--no-track"):
+			return gitLocal
+		case a.has("-l", "--list", "-a", "--all", "-r", "--remotes", "--show-current", "--contains", "--no-contains",
+			"--merged", "--no-merged", "--points-at", "-v", "--verbose", "--format", "--sort", "--column"):
+			return gitRead
+		default:
+			return pick(first == "", gitRead, gitLocal)
+		}
+	case subTag:
+		lists := a.has("-l", "--list", "-n", "--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "-v", "--verify")
+		return pick(!a.has("-d", "--delete") && (lists || first == ""), gitRead, gitLocal)
+	case "worktree":
+		switch {
+		case is("list"):
+			return gitRead
+		case is("remove"):
+			return pick(a.has("-f", "--force"), gitDiscard, gitLocal)
+		default:
+			return pick(is("add", "prune", "move", "lock", "unlock", "repair"), gitLocal, gitUnknown)
+		}
+	case subRemote:
+		if is("", "get-url") {
+			return gitRead
+		}
+		return pick(is("add", "set-url", "remove", "rm", "rename", "show", "prune", "update", "set-head", "set-branches"), gitRemote, gitUnknown)
+	case "config":
+		switch {
+		case a.has("--add", "--unset", "--unset-all", "--replace-all", "--rename-section", "--remove-section", "-e", "--edit"),
+			is("set", "unset", "rename-section", "remove-section", "edit"):
+			return gitExec
+		case a.has("--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list", "-l"), is("get", "list"), len(a.operands) == 1:
+			return gitRead
+		default:
+			return pick(len(a.operands) > 1, gitExec, gitUnknown)
+		}
+	default:
+		return gitUnknown
+	}
+}
+
 // gitFacts reports what a git or gh command would act on, read from the
 // directory that command runs in. A field that cannot be read is omitted,
 // never guessed; commands without git or gh get nothing.

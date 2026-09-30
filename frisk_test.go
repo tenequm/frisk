@@ -1876,6 +1876,293 @@ func TestRemoteSlug(t *testing.T) {
 	}
 }
 
+// gitSummary renders a description on one line: subcommand, class, then only
+// the flags and fields that are set.
+func gitSummary(g gitCommand) string {
+	parts := []string{g.subcommand, g.class}
+	for _, flag := range []struct {
+		name string
+		on   bool
+	}{
+		{"override", g.override},
+		{"retargeted", g.retargeted},
+		{"forced", g.forced},
+		{"no-verify", g.noVerify},
+		{"deletes", g.deletesRef},
+		{"hard", g.hard},
+		{"amend", g.amend},
+	} {
+		if flag.on {
+			parts = append(parts, flag.name)
+		}
+	}
+	if len(g.dirs) > 0 {
+		parts = append(parts, "dirs="+strings.Join(g.dirs, ","))
+	}
+	if g.remote != "" {
+		parts = append(parts, "remote="+g.remote)
+	}
+	if g.destination != "" {
+		parts = append(parts, "dest="+g.destination)
+	}
+	return strings.Join(parts, " ")
+}
+
+func TestDescribeGit(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		command string
+		want    string // "" means not a git invocation
+	}{
+		// class read
+		{"git status", "status read"},
+		{"git log --oneline -5", "log read"},
+		{"git diff HEAD~1", "diff read"},
+		{"git show HEAD", "show read"},
+		{"git blame frisk.go", "blame read"},
+		{"git ls-files", "ls-files read"},
+		{"git rev-parse --abbrev-ref HEAD", "rev-parse read"},
+		{"git grep -n TODO", "grep read"},
+		{"git branch", "branch read"},
+		{"git branch -avv", "branch read"},
+		{"git branch --list 'feat/*'", "branch read"},
+		{"git branch --contains abc123", "branch read"},
+		{"git tag", "tag read"},
+		{"git tag -l 'v*'", "tag read"},
+		{"git stash list", "stash read"},
+		{"git stash show -p", "stash read"},
+		{"git config --get user.name", "config read"},
+		{"git config -l", "config read"},
+		{"git config user.name", "config read"},
+		{"git config get user.name", "config read"},
+		{"git worktree list", "worktree read"},
+		{"git remote -v", "remote read"},
+		{"git remote get-url origin", "remote read"},
+		{"git reflog", "reflog read"},
+		{"git clean -n", "clean read"},
+		{"git clean --dry-run -d", "clean read"},
+
+		// class local
+		{"git add -A", "add local"},
+		{"git commit -m msg", "commit local"},
+		{"git merge feat/x", "merge local"},
+		{"git rebase main", "rebase local"},
+		{"git cherry-pick abc123", "cherry-pick local"},
+		{"git revert HEAD", "revert local"},
+		{"git branch feat/x", "branch local"},
+		{"git branch -m old new", "branch local"},
+		{"git branch -u origin/main", "branch local"},
+		{"git switch main", "switch local"},
+		{"git switch -c feat/x", "switch local"},
+		{"git checkout -b feat/x", "checkout local"},
+		{"git checkout -b feat/x origin/main", "checkout local"},
+		{"git checkout --orphan fresh start", "checkout local"},
+		{"git checkout -t origin/feat/x", "checkout local"},
+		{"git checkout main --", "checkout local"},
+		{"git stash", "stash local"},
+		{"git stash push -m wip", "stash local"},
+		{"git stash -m wip", "stash local"},
+		{"git stash -u", "stash local"},
+		{"git stash pop", "stash local"},
+		{"git tag v1.0.0", "tag local"},
+		{"git tag -a v1.0.0 -m release", "tag local"},
+		{"git reset HEAD~1", "reset local"},
+		{"git reset --soft HEAD~1", "reset local"},
+		{"git restore --staged frisk.go", "restore local"},
+		{"git rm --cached big.bin", "rm local"},
+		{"git worktree add ../wt feat/x", "worktree local"},
+		{"git worktree remove ../wt", "worktree local"},
+		{"git bisect start", "bisect local"},
+
+		// class discard
+		{"git reset --hard", "reset discard hard"},
+		{"git reset --hard origin/main", "reset discard hard"},
+		{"git clean -fd", "clean discard forced"},
+		{"git clean -fdx", "clean discard forced"},
+		{"git checkout -- frisk.go", "checkout discard"},
+		{"git checkout .", "checkout discard"},
+		{"git checkout ./frisk.go", "checkout discard"},
+		{"git checkout HEAD~1 frisk.go", "checkout discard"},
+		{"git checkout main -- frisk.go", "checkout discard"},
+		{"git checkout -f main", "checkout discard forced"},
+		{"git checkout -p", "checkout discard"},
+		{"git restore frisk.go", "restore discard"},
+		{"git restore --staged --worktree frisk.go", "restore discard"},
+		{"git restore -s HEAD~1 frisk.go", "restore discard"},
+		{"git switch --discard-changes main", "switch discard"},
+		{"git switch -f main", "switch discard forced"},
+		{"git stash drop", "stash discard"},
+		{"git stash clear", "stash discard"},
+		{"git worktree remove --force ../wt", "worktree discard forced"},
+		{"git rm -f frisk.go", "rm discard forced"},
+
+		// class remote
+		{"git fetch origin", "fetch remote"},
+		{"git fetch origin +refs/heads/*:refs/remotes/origin/*", "fetch remote forced"},
+		{"git pull", "pull remote"},
+		{"git pull --rebase origin main", "pull remote"},
+		{"git clone https://example.com/o/r.git", "clone remote"},
+		{"git ls-remote origin", "ls-remote remote"},
+		{"git remote add up https://example.com/o/r.git", "remote remote"},
+		{"git remote set-url origin https://example.com/o/r.git", "remote remote"},
+		{"git remote remove up", "remote remote"},
+
+		// class exec
+		{"git rebase --exec 'make test' main", "rebase exec"},
+		{"git rebase -x 'make test' main", "rebase exec"},
+		{"git bisect run ./test.sh", "bisect exec"},
+		{"git submodule foreach 'git pull'", "submodule exec"},
+		{"git difftool HEAD~1", "difftool exec"},
+		{"git mergetool", "mergetool exec"},
+		{"git filter-branch --tree-filter 'rm -f x' HEAD", "filter-branch exec"},
+		{"git config user.name someone", "config exec"},
+		{"git config --global --unset user.name", "config exec"},
+		{"git config set user.name someone", "config exec"},
+		{"git config -e", "config exec"},
+		{"git credential fill", "credential exec"},
+		{"git credential-store get", "credential-store exec"},
+		{"git daemon --export-all", "daemon exec"},
+		{"git push --receive-pack=/tmp/x origin main", "push exec remote=unknown dest=unknown"},
+		{"git fetch --upload-pack /tmp/x origin", "fetch exec"},
+		{"git clone -c core.fsmonitor=/tmp/x https://example.com/o/r.git", "clone exec"},
+		{"git clone --template=/tmp/t https://example.com/o/r.git", "clone exec"},
+		{"git grep -O TODO", "grep exec"},
+		{"GIT_SSH_COMMAND='ssh -i k' git fetch", "fetch exec override"},
+		{"env GIT_EXTERNAL_DIFF=/tmp/x git diff", "diff exec override"},
+
+		// class unknown
+		{"git checkout main", "checkout unknown"},
+		{"git checkout", "checkout unknown"},
+		{"git reset --keep HEAD~1", "reset unknown"},
+		{"git stash frob", "stash unknown"},
+		{"git config", "config unknown"},
+		{"git worktree", "worktree unknown"},
+		{"git submodule update --init", "submodule unknown"},
+		{"git reflog expire --expire=now --all", "reflog unknown"},
+		{"git diff --output=/tmp/x", "diff unknown"},
+		{"git bisect visualize", "bisect unknown"},
+		{"git remote frob", "remote unknown"},
+
+		// global options
+		{"git -C /repo status", "status read dirs=/repo"},
+		{"git -C a -C b status", "status read dirs=a,b"},
+		{"git -c user.name=x commit -m y", "commit exec override"},
+		{"git --config-env=core.pager=HOME log", "log exec override"},
+		{"git --config-env core.pager=HOME log", "log exec override"},
+		{"git --exec-path=/tmp/x status", "status exec override"},
+		{"git --git-dir=/x/.git status", "status read retargeted"},
+		{"git --git-dir /x/.git status", "status read retargeted"},
+		{"git --work-tree=/x status", "status read retargeted"},
+		{"git --namespace=n push", "push remote retargeted"},
+		{"git --bare rev-parse HEAD", "rev-parse read retargeted"},
+		{"GIT_DIR=/x/.git git status", "status read retargeted"},
+		{"env GIT_WORK_TREE=/x git status", "status read retargeted"},
+		{"git --no-pager log", "log read"},
+		{"git -P log", "log read"},
+		{"git -p log", "log read"},
+		{"git --paginate log", "log read"},
+		{"git --no-optional-locks --no-replace-objects --literal-pathspecs status", "status read"},
+		{"git --attr-source HEAD status", "status read"},
+		{"git --no-pager -C /repo -c a.b=c push -f", "push exec override forced dirs=/repo"},
+		{"git --frobnicate status", "unknown unknown"},
+		{"git -C", "unknown unknown"},
+		{"git -C=/repo status", "unknown unknown"},
+		{"git --no-pager=1 status", "unknown unknown"},
+		{"git --version", "unknown unknown"},
+
+		// flags, short and long spellings unified
+		{"git push --force", "push remote forced"},
+		{"git push -f", "push remote forced"},
+		{"git push --force-with-lease", "push remote forced"},
+		{"git push --force-with-lease=main:abc123 origin main", "push remote forced remote=origin dest=main"},
+		{"git push -uf origin feat/x", "push remote forced remote=origin dest=feat/x"},
+		{"git branch -f feat/x HEAD~1", "branch local forced"},
+		{"git branch -D feat/x", "branch local forced deletes"},
+		{"git branch -d feat/x", "branch local deletes"},
+		{"git branch --delete feat/x", "branch local deletes"},
+		{"git branch -rd origin/feat/x", "branch local deletes"},
+		{"git tag -d v1.0.0", "tag local deletes"},
+		{"git tag -f v1.0.0", "tag local forced"},
+		{"git commit --no-verify -m msg", "commit local no-verify"},
+		{"git commit -n -m msg", "commit local no-verify"},
+		{"git commit -nm msg", "commit local no-verify"},
+		{"git commit -anm msg", "commit local no-verify"},
+		{"git commit -m -n", "commit local"},
+		{"git commit --amend --no-edit", "commit local amend"},
+		{"git push --no-verify origin feat/x", "push remote no-verify remote=origin dest=feat/x"},
+		{"git push -n origin feat/x", "push remote remote=origin dest=feat/x"},
+		{"git merge --no-verify feat/x", "merge local no-verify"},
+		{"git log -f", "log read"},
+
+		// push shapes
+		{"git push", "push remote"},
+		{"git push origin", "push remote remote=origin"},
+		{"git push origin main", "push remote remote=origin dest=main"},
+		{"git push origin feat/x:main", "push remote remote=origin dest=main"},
+		{"git push -u origin feat/x", "push remote remote=origin dest=feat/x"},
+		{"git push --set-upstream origin feat/x", "push remote remote=origin dest=feat/x"},
+		{"git push -u", "push remote"},
+		{"git push origin HEAD", "push remote remote=origin dest=HEAD"},
+		{"git push origin @", "push remote remote=origin dest=HEAD"},
+		{"git push origin HEAD:refs/heads/main", "push remote remote=origin dest=main"},
+		{"git push origin +main", "push remote forced remote=origin dest=main"},
+		{"git push origin :old", "push remote deletes remote=origin dest=old"},
+		{"git push origin --delete old", "push remote deletes remote=origin dest=old"},
+		{"git push -d origin old", "push remote deletes remote=origin dest=old"},
+		{"git push -o ci.skip origin main", "push remote remote=origin dest=main"},
+		{"git push -- origin main", "push remote remote=origin dest=main"},
+		{"git push https://example.com/o/r.git main", "push remote remote=https://example.com/o/r.git dest=main"},
+		{"git push --all origin", "push remote remote=origin dest=unknown"},
+		{"git push --mirror origin", "push remote forced deletes remote=origin dest=unknown"},
+		{"git push origin --tags", "push remote remote=origin dest=unknown"},
+		{"git push --prune origin main", "push remote deletes remote=origin dest=unknown"},
+		{"git push origin main dev", "push remote remote=origin dest=unknown"},
+		{"git push origin main +dev", "push remote forced remote=origin dest=unknown"},
+		{`git push origin "$BRANCH"`, "push remote remote=origin dest=unknown"},
+		{`git push "$REMOTE" main`, "push remote remote=unknown dest=main"},
+		{"git push origin 'main; rm -rf x'", "push remote remote=origin dest=unknown"},
+		{"git push --repo=up", "push remote remote=unknown dest=unknown"},
+		{"git push --push-option ci.skip origin main", "push remote remote=unknown dest=unknown"},
+
+		// adversarial
+		{"git -c alias.status='!sh' status", "status exec override"},
+		{"git status -- --hard", "status read"},
+		{"git reset -- --hard", "reset local"},
+		{"git commit -m x -- --amend", "commit local"},
+		{"git commit -m '--amend --no-verify'", "commit local"},
+		{"git -- status", "unknown unknown"},
+		{"git --no-pager -- push", "unknown unknown"},
+		{"git status -- push", "status read"},
+		{"git frobnicate", "frobnicate unknown"},
+		{"git co main", "co unknown"},
+		{"git 'push now'", "unknown unknown"},
+		{"git $SUB origin main", "unknown unknown"},
+		{"git", "unknown unknown"},
+		{"time git push -f", "push remote forced"},
+		{"/usr/bin/git status", "status read"},
+		{"ls -la", ""},
+		{"gh pr list", ""},
+		{"echo git push -f", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.command, func(t *testing.T) {
+			t.Parallel()
+			var seg []string
+			for _, w := range tokenize(tt.command).stmts[0].words {
+				seg = append(seg, w.text)
+			}
+			g, ok := describeGit(seg)
+			got := ""
+			if ok {
+				got = gitSummary(g)
+			}
+			if got != tt.want {
+				t.Fatalf("describeGit(%q) = %q, want %q", tt.command, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestJevUnreachableIsSilence(t *testing.T) {
 	prev := jevEndpoint
 	jevEndpoint = "http://127.0.0.1:1"

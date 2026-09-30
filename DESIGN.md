@@ -196,6 +196,45 @@ under `ask` (every unwanted prompt in live traffic sat at 0.31-0.47 with allow
 and ask nearly tied; below it Claude Code's own flow decides), the script cap,
 the model pin in config (a threshold is a fact about one model version).
 
+## Git
+
+frisk reads a git invocation and describes it. It never decides one: no git
+command is allowed, asked or denied by the core, and with no matching config
+rule it reaches the judge like any other command.
+
+`describeGit` takes one command segment and answers from its words alone:
+
+- the subcommand, found behind git's own global options (`-C`, `-c`,
+  `--git-dir`, `--work-tree`, `--no-pager`, `--bare`, ...). An option git
+  would reject, or a first word that is not a plain name, leaves it `unknown`.
+- a class, from a table of about forty subcommands: `read`, `local` (changes
+  refs, index or objects, which the reflog recovers), `discard` (can destroy
+  uncommitted work), `remote` (talks to or changes a remote), `exec` (can run
+  another program or reach credentials), and `unknown` for everything else.
+  Where the arguments decide (`reset`, `checkout`, `restore`, `stash`,
+  `branch`, `tag`, `config`, `worktree`, `clean`, ...) they are read, and
+  `unknown` is the answer when they do not settle it: `git checkout main` may
+  switch branches or overwrite a file named `main`.
+- flags, with short and long spellings as one: forced (`-f`, `--force`,
+  `--force-with-lease`, a `+` refspec), deletes a ref (`-d`, `-D`, `--delete`,
+  a `:dst` refspec, `--prune`, `--mirror`), `--no-verify` (`-n` on commit),
+  `--hard`, `--amend`. Nothing after `--` is a flag, and a value such as the
+  message after `-m` is never read as one.
+- for `push`, the remote and the destination branch when the arguments are
+  nothing, `<remote>`, `<remote> <branch>` or `<remote> <src>:<dst>`. `--all`,
+  `--mirror`, `--tags`, several refspecs, a variable, or a flag outside a short
+  known list make them `unknown`.
+
+A `-c`, `--config-env` or `--exec-path=` option, or a variable such as
+`GIT_SSH_COMMAND` or `GIT_CONFIG_*` set for the command, makes the class
+`exec`: each swaps config or a program git runs. `--git-dir`, `--work-tree`,
+`--namespace`, `--bare` and variables such as `GIT_DIR` mark the command as
+aimed at a repository other than its directory's.
+
+Left out on purpose: git's refspec and `push.default` rules, a flag screen for
+every subcommand, aliases (an alias is an unknown subcommand, git config is
+not read), and repository state across the segments of one command.
+
 ## Logging and CLI
 
 Every decision - silences included - is one `slog` JSON record in
