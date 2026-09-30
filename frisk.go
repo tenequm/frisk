@@ -131,7 +131,8 @@ var denyFlags = map[string][]string{
 	"rg":    {"--pre", "--hostname-bin"},
 	"xxd":   {"-r"},
 	verbAwk: {"-f", "--file", "-i", "--include", "-l", "--load", "-E", "--exec"},
-	"yq":    {"-i", "--inplace"},
+	"yq":    {"-i", "--inplace", "-f", "--from-file"},
+	"jq":    {"-f", "--from-file"},
 	"tree":  {"-o", "-R"},
 	"less":  lessDenyFlags,
 	"more":  lessDenyFlags,
@@ -149,7 +150,7 @@ var lessDenyFlags = []string{
 // "-i.bak", and "-oFILE" all carry the flag.
 var clusterVerbs = map[string]bool{
 	verbSed: true, "sort": true, "fd": true, "xxd": true, verbAwk: true, "yq": true,
-	"tree": true, "less": true, "more": true, "date": true,
+	"jq": true, "tree": true, "less": true, "more": true, "date": true,
 }
 
 // kubeSecret matches the secret resource in a kubectl get: bare, plural,
@@ -157,10 +158,11 @@ var clusterVerbs = map[string]bool{
 var kubeSecret = regexp.MustCompile(`(?i)(^|,)secrets?([./,]|$)`)
 
 // programVerbs take a program text that can run commands or read the
-// environment, which no flag screen sees.
+// environment, which no flag screen sees. A jq module is program text from a
+// file, like -f.
 var programVerbs = map[string]*regexp.Regexp{
 	verbAwk: regexp.MustCompile(`(?i)system|\||environ`),
-	"jq":    regexp.MustCompile(`(^|[^.\w$])env\b|\$ENV\b`),
+	"jq":    regexp.MustCompile(`(^|[^.\w$])env\b|\$ENV\b|\b(import|include)\s*"`),
 	"yq":    regexp.MustCompile(`(^|[^.\w$])(str)?env\b|\$ENV\b`),
 }
 
