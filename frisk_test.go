@@ -3186,6 +3186,9 @@ func TestCredentialShapedSkipsPaths(t *testing.T) {
 				t.Fatalf("credentialShaped(%q) = %v, want %v", tt.data, got, tt.want)
 			}
 		})
+	}
+}
+
 func TestGitRuleNormalization(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -3208,7 +3211,11 @@ func TestGitRuleNormalization(t *testing.T) {
 		{"git commit -m *", "git commit -m x --no-verify", true, false},
 		{"git commit -m *", "git commit -m x --amend", true, false},
 		{"git commit -m *", "git commit -m x --unknown y", true, false},
-		{"git commit -m *", "git commit -m", true, false},
+		// A missing value leaves the old positional reading; git refuses the command itself.
+		{"git commit -m *", "git commit -m", true, true},
+		{"git status *", "git status -sb", true, true},
+		{"git push *", "git push -xf origin main", true, false},
+		{"git commit -m *", "git commit -Snm x", true, false},
 		{"git commit -F *", "git commit --file f -q", true, true},
 		{"git commit -C *", "git commit --reuse-message HEAD", true, true},
 		{"git push --force *", "git push origin main -fu", false, true},
