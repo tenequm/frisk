@@ -46,12 +46,20 @@ Conventions:
   judge.decisions lists which of allow, ask and deny the judge may issue; a user
   who lists only allow and deny gets no judge prompts, and the withheld verdicts
   stay countable in the log.
+- [Core describes git, config decides](core-describes-git-config-decides.md) -
+  frisk sends the judge a trusted record for each git command (class, forcing,
+  push destination, files a discard would lose) and ships no git policy; the
+  user's judge prose is written against the record's fields.
 
 ## Findings
 
 - [Judge prose must name routine work](judge-prose-must-name-routine-work.md) - Jev
   applies criteria literally, so allow prose that only describes read-only
   inspection turns ordinary development into prompts and blocks.
+- [Secret rules must name the destination, not the act](secret-rules-name-the-destination.md) -
+  Judge prose that forbids handling or moving secrets blocks routine transfers
+  between a user's own stores; prose that forbids a secret becoming readable, or
+  reaching a named kind of outside destination, does not.
 - [The hook sees the command, not the conversation](hook-sees-no-conversation.md) -
   Actions whose safety depends on what the user asked for cannot be settled from
   command text, and they surface as low-confidence verdicts.

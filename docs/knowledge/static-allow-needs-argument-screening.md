@@ -36,7 +36,7 @@ closed.[^audit][^fix][^tokenizer]
 | Brace list or glob qualifier | `find . {-delete,-print}`, zsh `ls *(e:'id':)` | One word becomes several, or runs code, after the screens ran |
 | Reader of the environment | `printenv`, `env`, `echo $GITHUB_TOKEN`, `gh pr list --jq env` | Prints secrets held in variables |
 | Variable in argument position | `fd . $ARGS`, `ls $1` | The value can be a flag, a credential path or several words |
-| Quoting read differently from the shell | an escaped `"` inside double quotes, a backslash-newline inside a flag, `$'-x'` | The commands or flags that follow were taken for quoted text |
+| Quoting read differently from the shell | an escaped `"` inside double quotes, a backslash-newline inside a flag, `$'-x'`, a `'` inside a `#` comment | The commands or flags that follow were taken for quoted text |
 
 # Rule
 
