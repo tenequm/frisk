@@ -677,7 +677,11 @@ func tokenize(command string) parsedCommand {
 			}
 		default:
 			globbed = globbed || strings.IndexByte("*?[{", c) >= 0
-			p.opaque = p.opaque || c == '(' || c == ')'
+			// A parenthesis is a subshell, an array, or a zsh glob qualifier,
+			// which can run code: "*(e:'cmd':)".
+			if c == '(' || c == ')' {
+				p.opaque, p.unsound = true, true
+			}
 			write(c, true)
 		}
 	}
@@ -821,6 +825,10 @@ func (p parsedCommand) segments() [][]string {
 // a "$" that ends the word or precedes plain punctuation, as in "a$|b$", is literal.
 var expansion = regexp.MustCompile(`\$[^\s|)\]}/.,;:%\\?$#!]`)
 
+// braceExpansion turns one word into several before any screen sees them:
+// "{-delete,-print}" becomes two flags and "{a,.env}" a credential path.
+var braceExpansion = regexp.MustCompile(`\{[^{}]*(,|\.\.)[^{}]*\}`)
+
 // staticSegments is the static tier's view: segments with literal variables
 // substituted, so every screen runs on the word the shell will see. It reports
 // false when the command is unsound or a word keeps an expansion, whose value
@@ -831,7 +839,8 @@ func (p parsedCommand) staticSegments() ([][]string, bool) {
 	for j, st := range p.stmts {
 		for k, w := range st.words {
 			text := p.substitute(vars, j, w)
-			sound = sound && !expansion.MatchString(text) && (!w.glob || !credentialGlob.MatchString(text))
+			sound = sound && !expansion.MatchString(text) &&
+				(!w.glob || !credentialGlob.MatchString(text) && !braceExpansion.MatchString(text))
 			if k >= st.cmd {
 				segs[j][k-st.cmd] = strings.ReplaceAll(text, "\x00", "$")
 			}
