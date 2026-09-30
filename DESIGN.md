@@ -28,8 +28,9 @@ parse into pipeline segments (|, &&, ||, ;, newline)
    and trips no screen (core ships no rules; bails on
     $(), backticks, (), heredocs, &, # comments, brace
     lists, variables the command does not set to a
-    literal, and redirects other than stream merges,
-    /dev/null or literal writes covered by Edit rules; inside single quotes or escaped, all of
+    literal or that are not $HOME or $TMPDIR, and
+    redirects other than stream merges, /dev/null or
+    literal writes covered by Edit rules; inside single quotes or escaped, all of
     these are text) -> "allow"
 4. judge (needs jev.keyCmd): one Choice question
      allow + confidence >= 0.75 -> "allow"
@@ -231,7 +232,13 @@ stage of that statement's pipeline, as in `cat <<EOF | bash`. An operand of
 `.` reading one of those paths counts as that shell. Fed to anything
 else it is text: the probe takes no script and no `cd` from it, while
 `permissions.deny` and `permissions.ask` rules still match its lines.
-`$NAME` and `${NAME}` resolve only for a variable the command itself assigns
+`$HOME`, `${HOME}`, `$TMPDIR` and `${TMPDIR}` resolve from the hook process
+(home via `os.UserHomeDir`, TMPDIR via its environment), including in literal
+assignments. Empty values or values containing whitespace, glob characters,
+quotes, backslashes or `$` stay unresolved. Any write to HOME or TMPDIR, or
+to the existing expansion variables, disables all resolution. The probe uses
+the same substitution. Other `$NAME` and `${NAME}` references resolve only
+for a variable the command itself assigns
 exactly once, as its own statement, to a plain literal, before any control
 flow and ahead of the use (`S=/tmp/x; cd "$S" && python3 run.py`); anything
 less certain, and any command with a subshell, substitution, heredoc, `eval`,
