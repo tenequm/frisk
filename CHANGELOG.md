@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.4](https://github.com/tenequm/frisk/compare/v0.1.3...v0.1.4) - 2026-09-30
+
+### <!-- 2 -->🐛 Bug Fixes
+- **release:** replace a leftover draft's notes when a release is retried ([1cbe909](https://github.com/tenequm/frisk/commit/1cbe909b36b04c5737dca497400863ba69ad480a))
+
+**Full Changelog**: https://github.com/tenequm/frisk/compare/v0.1.3...v0.1.4
+
 ## [0.1.3](https://github.com/tenequm/frisk/compare/v0.1.2...v0.1.3) - 2026-09-30
 
 ### <!-- 2 -->🐛 Bug Fixes
