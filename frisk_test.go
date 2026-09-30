@@ -646,6 +646,7 @@ func fakeJevAnswers(t *testing.T, answers map[string]any) (*config, *jevCapture)
 		capture.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"model":   "jev-1.13.0",
+			"usage":   map[string]int{"input_tokens": 812, "output_tokens": 9},
 			"answers": answers,
 		})
 	}))
@@ -699,16 +700,29 @@ func TestJudgeRecordsProbabilities(t *testing.T) {
 	}
 
 	var buf strings.Builder
+	v.Entry = "check"
 	logVerdict(slog.New(slog.NewJSONHandler(&buf, nil)), v, "terraform plan")
 	var rec struct {
-		Probs map[string]float64 `json:"probs"`
-		Model string             `json:"model"`
+		Probs  map[string]float64 `json:"probs"`
+		Model  string             `json:"model"`
+		Entry  string             `json:"entry"`
+		Input  int                `json:"input_tokens"`
+		Output int                `json:"output_tokens"`
 	}
 	if err := json.Unmarshal([]byte(buf.String()), &rec); err != nil {
 		t.Fatalf("log not JSON: %v: %s", err, buf.String())
 	}
 	if rec.Model != "jev-1.13.0" || rec.Probs["ask"] != 0.04 || len(rec.Probs) != 4 {
 		t.Fatalf("log record = %s", buf.String())
+	}
+	if rec.Entry != "check" || rec.Input != 812 || rec.Output != 9 {
+		t.Fatalf("entry/usage missing from log record: %s", buf.String())
+	}
+
+	buf.Reset()
+	logVerdict(slog.New(slog.NewJSONHandler(&buf, nil)), verdict{Tier: "static"}, "ls")
+	if strings.Contains(buf.String(), "tokens") || strings.Contains(buf.String(), "entry") {
+		t.Fatalf("unset entry and usage must be omitted: %s", buf.String())
 	}
 }
 

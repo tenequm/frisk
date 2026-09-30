@@ -365,6 +365,8 @@ type verdict struct {
 	AskRule       jevAnswer
 	DenyRule      jevAnswer
 	Tool          string
+	Entry         string    // "hook" or "check"
+	Usage         *jevUsage // nil when the judge did not run or reported none
 }
 
 func main() {
@@ -437,7 +439,7 @@ func runHook(cfg *config, cfgErr error, stdin io.Reader, stdout io.Writer, lg *s
 	} else {
 		return 0
 	}
-	v.Tool = in.ToolName
+	v.Tool, v.Entry = in.ToolName, "hook"
 	logVerdict(lg, v, subject)
 	if v.Decision == "" {
 		return 0
@@ -462,6 +464,7 @@ func runCheck(cfg *config, cfgErr error, command string, stdout io.Writer, lg *s
 	}
 	cwd, _ := os.Getwd()
 	v := decide(cfg, command, cwd, lg)
+	v.Entry = "check"
 	logVerdict(lg, v, command)
 	decision := v.Decision
 	if decision == "" {
@@ -1108,6 +1111,7 @@ func judge(cfg *config, command, cwd string, segments [][]string, lg *slog.Logge
 	ans := res.Decision
 	v.Confidence, v.Probabilities, v.Model = ans.Confidence, ans.Probabilities, res.Model
 	v.AskRule, v.DenyRule = res.AskRule, res.DenyRule
+	v.Usage = res.Usage
 
 	// The floor forms show confidence, which is what the floor tests; the
 	// plain forms show the split when the response carries one.
@@ -1649,7 +1653,13 @@ type jevAnswer struct {
 // Answers stay raw so a malformed attribution answer cannot fail the decision.
 type jevResponse struct {
 	Model   string                     `json:"model"`
+	Usage   *jevUsage                  `json:"usage"`
 	Answers map[string]json.RawMessage `json:"answers"`
+}
+
+type jevUsage struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
 }
 
 type jevResult struct {
@@ -1657,6 +1667,7 @@ type jevResult struct {
 	AskRule  jevAnswer // zero when absent or malformed
 	DenyRule jevAnswer
 	Model    string
+	Usage    *jevUsage
 }
 
 // ruleQuestion asks which single rule fits, one option per prose item. It
@@ -1735,7 +1746,7 @@ func askJev(jc jevConfig, rules judgeConfig, state map[string]any) (jevResult, e
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&parsed); err != nil {
 		return jevResult{}, fmt.Errorf("decoding jev response: %w", err)
 	}
-	res := jevResult{Model: parsed.Model}
+	res := jevResult{Model: parsed.Model, Usage: parsed.Usage}
 	if err := json.Unmarshal(parsed.Answers["decision"], &res.Decision); err != nil {
 		return jevResult{}, fmt.Errorf("decoding jev decision: %w", errJevMalformed)
 	}
@@ -1855,6 +1866,12 @@ func logVerdict(lg *slog.Logger, v verdict, command string) {
 			probe = "none"
 		}
 		attrs = append(attrs, "probe", probe, "scripts", v.Scripts)
+	}
+	if v.Entry != "" {
+		attrs = append(attrs, "entry", v.Entry)
+	}
+	if v.Usage != nil {
+		attrs = append(attrs, "input_tokens", v.Usage.InputTokens, "output_tokens", v.Usage.OutputTokens)
 	}
 	if v.AskRule.Choice != "" {
 		attrs = append(attrs, "ask_rule", v.AskRule.Choice, "ask_rule_confidence", v.AskRule.Confidence)
