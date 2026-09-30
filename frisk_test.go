@@ -3426,6 +3426,25 @@ func TestStaticLoopsAndWrites(t *testing.T) {
 			t.Fatal("allowed a write to the gate's own config:", command)
 		}
 	}
+	// Resolved, because macOS temp dirs sit behind the /var symlink, which the
+	// write check refuses to follow.
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	anywhere := &config{Permissions: permissionsConfig{Allow: append(slices.Clone(cfg.Permissions.Allow), "Edit("+home+"/**)")}}
+	for _, target := range []string{
+		".bashrc", ".zshrc", ".gitconfig", ".mcp.json", "proj/lefthook.yml", "proj/.pre-commit-config.yaml",
+		"proj/.vscode/settings.json", ".cargo/config.toml", ".config/git/config", "proj/.Git/hooks/pre-push",
+	} {
+		command := "echo x >> " + filepath.Join(home, target)
+		if got := decide(anywhere, command, home, nil); got.Decision == decisionAllow {
+			t.Fatal("allowed a write to a path Claude Code protects:", command)
+		}
+	}
+	if got := decide(anywhere, "echo x > "+filepath.Join(home, "proj", "notes.txt"), home, nil); got.Decision != decisionAllow {
+		t.Fatalf("an ordinary file under the rule must settle, got %q %q", got.Decision, got.Reason)
+	}
 	dir := t.TempDir()
 	target := filepath.Join(dir, "link")
 	if err := os.Symlink(t.TempDir(), target); err != nil {
