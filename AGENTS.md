@@ -68,12 +68,23 @@ judgement call, and none of it is manual:
   gh api repos/tenequm/frisk --jq '{title: .squash_merge_commit_title, message: .squash_merge_commit_message}'
   ```
 
-Who owns what, when changing any of it: release-please computes the version,
-opens the release PR and cuts the tag (`.github/release-please-config.json`);
+Who owns what, when changing any of it: release-please computes the version and
+opens the release PR, and nothing else (`.github/release-please-config.json`);
 git-cliff renders `CHANGELOG.md` and the GitHub release body
-(`.github/cliff.toml`); GoReleaser builds and appends the artifacts
-(`ops/config/goreleaser.yaml`). release-please runs with `skip-changelog`, so it
-and git-cliff never write the same file. No file carries the version:
+(`.github/cliff.toml`); GoReleaser builds the artifacts, then creates the GitHub
+release and the tag (`ops/config/goreleaser.yaml`). release-please runs with
+`skip-changelog`, so it and git-cliff never write the same file, and with
+`skip-github-release`, so it never tags.
+
+The tag comes last. A release is due when the manifest on `main` names a version
+with no tag. The `release` job then tags in its own checkout only, builds, signs
+and notarizes everything, and GitHub creates the real tag when GoReleaser
+publishes the release; the cask is pushed after that. A failure before the
+publish leaves no tag, no release and no cask, and re-running the job retries.
+The job ends by relabelling the merged release PR `autorelease: tagged`: while
+one is still `autorelease: pending`, release-please opens no new release PR.
+
+No file carries the version:
 `go build` stamps the tag into the binary and `frisk version` prints it. Two
 gates enforce what used to be documented: the PR title and note
 (`release-note.yml`), and the `word(` shape that makes release-please silently

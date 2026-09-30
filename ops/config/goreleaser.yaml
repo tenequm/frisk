@@ -1,5 +1,5 @@
-# GoReleaser builds the cross-platform `frisk` binary and publishes it to the
-# GitHub release (created by release-please) plus a Homebrew cask.
+# GoReleaser builds the cross-platform `frisk` binary, then creates the GitHub
+# release (and with it the tag) and pushes a Homebrew cask.
 version: 2
 
 project_name: frisk
@@ -53,14 +53,13 @@ notarize:
         wait: true
         timeout: 20m
 
-# release-please already created the GitHub release; append the built artifacts.
+# The tag is local-only while this runs (see the release job in ci.yml), so
+# nothing is tagged until every artifact is built. target_commitish tells GitHub
+# which commit to tag when the release is published, and the release stays a
+# draft while the artifacts upload. The body is git-cliff's, passed in with
+# --release-notes, so GoReleaser generates no changelog of its own.
 release:
-  mode: append
-
-# git-cliff owns CHANGELOG.md and the release body; `release.mode: append` above
-# is what lets GoReleaser add its artifacts below that body without replacing it.
-changelog:
-  disable: true
+  target_commitish: "{{ .Commit }}"
 
 # A pre-compiled binary is a cask in modern Homebrew (the `brews` formula section
 # is deprecated). GH_RELEASE_TOKEN can push to the separate tap repo.
