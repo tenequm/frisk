@@ -54,6 +54,10 @@ dropped unread, so a quote inside it cannot hide the lines after it from the
 rules. A command with a comment is never allowed statically, because a shell
 that does not recognise comments would run that text.
 
+An allow rule never settles a `git commit` that skips hooks: `--no-verify`,
+`-n` alone or bundled (`-qn`), or `core.hooksPath` through `-c` or
+`--config-env` fall through to the judge whatever rule matches.
+
 `judge.decisions` lists which of `allow`, `ask`, `deny` the judge may issue;
 unset means all three. An empty list or any other value is a malformed config.
 

@@ -1057,6 +1057,45 @@ func TestDecideStaticTiers(t *testing.T) {
 	}
 }
 
+func TestCommitSkippingHooksNeverStatic(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		command  string
+		decision string
+	}{
+		{"plain commit", "git commit -m msg", decisionAllow},
+		{"quiet commit", "git commit -q -m msg", decisionAllow},
+		{"bundled value flag", "git commit -qm nonsense", decisionAllow},
+		{"attached message with an n", "git commit -mnote", decisionAllow},
+		{"untracked mode no", "git commit -uno -m msg", decisionAllow},
+		{"message file", "git commit -q -F /tmp/msg.txt", decisionAllow},
+		{"log count is not a commit", "git log -n 5", decisionAllow},
+		{"no-verify", "git commit --no-verify -m msg", ""},
+		{"no-verify after the message", "git commit -m msg --no-verify", ""},
+		{"abbreviated no-verify", "git commit --no-verif -m msg", ""},
+		{"short flag", "git commit -n -m msg", ""},
+		{"bundled after quiet", "git commit -qn -m msg", ""},
+		{"bundled before the message flag", "git commit -nm msg", ""},
+		{"bundled in the middle", "git commit -anqm msg", ""},
+		{"behind -C", "git -C repo commit -n -m msg", ""},
+		{"behind a global option", "git --no-pager commit -n -m msg", ""},
+		{"in a chain", "cd repo && git add . && git commit -qn -m msg", ""},
+		{"hooks path through -c", "git -c core.hooksPath=/dev/null commit -m msg", ""},
+		{"hooks path through config-env", "git --config-env=core.hooksPath=X commit -m msg", ""},
+	}
+	// The widest rule a user could write: the screen must hold under it.
+	cfg := &config{Permissions: permissionsConfig{Allow: []string{defaultsMarker, "git *"}}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if v := decide(cfg, tt.command, t.TempDir(), testLogger); v.Decision != tt.decision {
+				t.Fatalf("decide(%q) = %q (%s), want %q", tt.command, v.Decision, v.Tier, tt.decision)
+			}
+		})
+	}
+}
+
 func TestAllowListWithoutDefaultsReplacesBuiltins(t *testing.T) {
 	t.Parallel()
 	cfg := &config{Permissions: permissionsConfig{Allow: []string{"just check"}}}
