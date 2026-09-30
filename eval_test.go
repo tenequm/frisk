@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -28,8 +29,23 @@ import (
 // FRISK_EVAL_LIVE=1 replays against the config dir named by FRISK_EVAL_XDG
 // with the judge on. That calls a paid API once per fixture the static tiers
 // do not settle.
+//
+// Every run also writes the report plus one line per fixture to a file in the
+// system temp dir, so piping the test output through tail loses nothing.
 
-const tierNoJudge = "no-judge"
+const (
+	// Named apart from frisk.go's own constants: the eval reads these off the
+	// CLI line and must keep compiling when the internals are renamed.
+	evalTierNoJudge = "no-judge"
+	evalTierJudge   = "judge"
+
+	// evalScopeStatic: the expectation is about the static tiers alone. Once they
+	// decline, whatever the judge then decides is not this fixture's subject.
+	evalScopeStatic = "static"
+	// evalScopeConfig: the expectation needs a rule that only
+	// testdata/eval-config.json carries, so it is ungradable under another config.
+	evalScopeConfig = "eval-config"
+)
 
 var evalDecisions = []string{"allow", "ask", "deny", "silent"}
 
@@ -48,6 +64,18 @@ type evalFixture struct {
 	Classifier string     `json:"classifier"`
 	Category   string     `json:"category"`
 	Expect     string     `json:"expect"`
+	Scope      string     `json:"scope"`
+}
+
+type evalOutput struct {
+	report  string
+	summary string
+}
+
+type evalRun struct {
+	mode string
+	// evalConfig: the config in force is testdata/eval-config.json.
+	evalConfig bool
 }
 
 type evalResult struct {
@@ -64,12 +92,18 @@ func TestEvalFixtures(t *testing.T) {
 	if out, err := exec.CommandContext(t.Context(), "go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
-	mode, configHome := "static", staticConfigHome(t)
+	evalConfig, err := os.ReadFile(filepath.Join("testdata", "eval-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, configHome := evalRun{mode: "static", evalConfig: true}, staticConfigHome(t, evalConfig)
 	if os.Getenv("FRISK_EVAL_LIVE") == "1" {
-		mode, configHome = "live", os.Getenv("FRISK_EVAL_XDG")
+		configHome = os.Getenv("FRISK_EVAL_XDG")
 		if configHome == "" {
 			t.Fatal("FRISK_EVAL_LIVE=1 needs FRISK_EVAL_XDG set to the config dir holding frisk/config.json")
 		}
+		liveConfig, _ := os.ReadFile(filepath.Join(configHome, "frisk", "config.json"))
+		run = evalRun{mode: "live", evalConfig: bytes.Equal(liveConfig, evalConfig)}
 	}
 	// The state dir is always a scratch one, so replays never land in the real frisk.log.
 	env := append(os.Environ(), "XDG_CONFIG_HOME="+configHome, "XDG_STATE_HOME="+t.TempDir())
@@ -79,29 +113,46 @@ func TestEvalFixtures(t *testing.T) {
 	results := make([]evalResult, 0, len(fixtures))
 	for _, f := range fixtures {
 		r := replay(t, bin, env, materialize(t, sandbox, f), f)
-		r.grade = verdictGrade(f.Expect, r.decision)
-		// Without the judge a script case that fell through proves nothing
-		// beyond "not allowed statically"; only that expectation is gradable.
-		if mode == "static" && len(f.Files) > 0 && r.tier == tierNoJudge && f.Expect != "silent" {
-			r.grade = "skip"
-		}
+		r.grade = run.grade(r)
 		results = append(results, r)
 	}
 
-	t.Log("\n" + evalReport(mode, results))
+	out := evalReport(run, results)
+	t.Log("\n" + out.report)
 	for _, r := range results {
 		if r.grade == "FAIL" {
 			t.Errorf("%s: expect %s, got %s (%s)", r.fixture.ID, r.fixture.Expect, r.decision, r.tier)
 		}
 	}
-}
 
-func staticConfigHome(t *testing.T) string {
-	t.Helper()
-	data, err := os.ReadFile(filepath.Join("testdata", "eval-config.json"))
-	if err != nil {
+	saved := filepath.Join(os.TempDir(), "frisk-eval-"+run.mode+"-"+time.Now().Format("20060102T150405")+".txt")
+	if err := os.WriteFile(saved, []byte(out.report+"\n"+fixtureLines(results)), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// Last on purpose: `just eval | tail -1` still shows the verdict and where the rest is.
+	t.Logf("%s; full report: %s", out.summary, saved)
+}
+
+// grade applies the fixture's scope, then compares decisions.
+func (run evalRun) grade(r evalResult) string {
+	f := r.fixture
+	deferred := r.tier == evalTierNoJudge || r.tier == evalTierJudge
+	switch {
+	case f.Scope == evalScopeConfig && !run.evalConfig:
+		return "skip-config"
+	case f.Scope == evalScopeStatic && deferred:
+		return verdictGrade(f.Expect, "silent")
+	// Without the judge a script case that fell through proves nothing
+	// beyond "not allowed statically"; only that expectation is gradable.
+	case run.mode == "static" && len(f.Files) > 0 && r.tier == evalTierNoJudge && f.Expect != "silent":
+		return "skip"
+	default:
+		return verdictGrade(f.Expect, r.decision)
+	}
+}
+
+func staticConfigHome(t *testing.T, data []byte) string {
+	t.Helper()
 	home := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(home, "frisk"), 0o700); err != nil {
 		t.Fatal(err)
@@ -201,7 +252,9 @@ func verdictGrade(expect, got string) string {
 	}
 }
 
-func evalReport(mode string, results []evalResult) string {
+// evalReport returns the full report and the one-line verdict repeated at the
+// very end of the test output.
+func evalReport(run evalRun, results []evalResult) evalOutput {
 	var b strings.Builder
 	tiers := map[string][]time.Duration{}
 	buckets := map[string]map[string]int{}
@@ -227,7 +280,8 @@ func evalReport(mode string, results []evalResult) string {
 		}
 	}
 
-	fmt.Fprintf(&b, "frisk eval: mode=%s fixtures=%d\n", mode, len(results))
+	fmt.Fprintf(&b, "frisk eval: mode=%s fixtures=%d config=%s\n", run.mode, len(results),
+		map[bool]string{true: "testdata/eval-config.json", false: "live config (differs from eval-config)"}[run.evalConfig])
 
 	b.WriteString("\ntier coverage and wall time per call (spawn-inclusive: each call is a fresh process)\n")
 	fmt.Fprintf(&b, "  %-10s %5s %6s %9s %9s %9s\n", "tier", "n", "share", "p50", "p90", "p99")
@@ -235,7 +289,7 @@ func evalReport(mode string, results []evalResult) string {
 	for _, tier := range slices.Sorted(maps.Keys(tiers)) {
 		times := tiers[tier]
 		slices.Sort(times)
-		if tier != tierNoJudge && tier != "judge" {
+		if tier != evalTierNoJudge && tier != evalTierJudge {
 			withoutJudge += len(times)
 		}
 		fmt.Fprintf(&b, "  %-10s %5d %5.1f%% %9s %9s %9s\n", tier, len(times), share(len(times), len(results)),
@@ -262,15 +316,29 @@ func evalReport(mode string, results []evalResult) string {
 		fmt.Fprintf(&b, " %6d\n", total)
 	}
 
-	fmt.Fprintf(&b, "\nclassifier denied, frisk allowed: %d\n", len(deniedAllowed))
+	denied := fmt.Sprintf("classifier denied, frisk allowed: %d", len(deniedAllowed))
+	fmt.Fprintf(&b, "\n%s\n", denied)
 	for _, r := range deniedAllowed {
 		fmt.Fprintf(&b, "  %s [%s] %s: %s\n", r.fixture.ID, r.fixture.Category, r.tier, clip(r.fixture.Command))
 	}
 
-	fmt.Fprintf(&b, "\nexpectations: pass %d, weak %d, FAIL %d, skipped (need the judge) %d, no expectation %d\n",
-		grades["pass"], grades["weak"], grades["FAIL"], grades["skip"], grades[""])
+	expectations := fmt.Sprintf(
+		"expectations: pass %d, weak %d, FAIL %d, skipped (need the judge) %d, skipped (rule only in eval-config) %d, no expectation %d",
+		grades["pass"], grades["weak"], grades["FAIL"], grades["skip"], grades["skip-config"], grades[""])
+	fmt.Fprintf(&b, "\n%s\n", expectations)
 	for _, r := range notable {
 		fmt.Fprintf(&b, "  %s %s: expect %s, got %s (%s) %s\n", r.grade, r.fixture.ID, r.fixture.Expect, r.decision, r.tier, clip(r.reason))
+	}
+	return evalOutput{report: b.String(), summary: expectations + "; " + denied}
+}
+
+// fixtureLines is the per-fixture record that only the saved file carries.
+func fixtureLines(results []evalResult) string {
+	var b strings.Builder
+	b.WriteString("fixtures (id, grade, decision, tier, wall time, reason)\n")
+	for _, r := range results {
+		fmt.Fprintf(&b, "%s\t%s\t%s\t%s\t%s\t%s\n", r.fixture.ID, cmp.Or(r.grade, "-"), r.decision, r.tier,
+			r.elapsed.Round(10*time.Microsecond), r.reason)
 	}
 	return b.String()
 }

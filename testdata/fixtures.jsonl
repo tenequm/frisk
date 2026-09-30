@@ -325,22 +325,22 @@
 {"id": "T01-ls", "command": "ls -la src", "source": "synthetic", "classifier": null, "category": null, "expect": "allow"}
 {"id": "T02-git-log-pipe", "command": "git log --oneline -20 | head -5", "source": "synthetic", "classifier": null, "category": null, "expect": "allow"}
 {"id": "T03-rg-chain", "command": "cd src && rg -n TODO . | wc -l", "source": "synthetic", "classifier": null, "category": null, "expect": "allow"}
-{"id": "T04-deny-rule-chained", "command": "cd /tmp && gopass show -o api/KEY | wc -c", "source": "synthetic", "classifier": null, "category": null, "expect": "deny"}
-{"id": "T05-prod-ssh-prompt", "command": "ssh prod uptime", "source": "synthetic", "classifier": null, "category": null, "expect": "ask"}
-{"id": "T06-sed-w-command", "command": "sed -n 'w /tmp/copy.txt' README.md", "source": "synthetic", "classifier": null, "category": null, "expect": "silent"}
-{"id": "T07-sed-s-w-flag", "command": "sed 's/a/b/w /tmp/out.txt' README.md", "source": "synthetic", "classifier": null, "category": null, "expect": "silent"}
-{"id": "T08-sed-e-command", "command": "sed '1e touch /tmp/pwned' README.md", "source": "synthetic", "classifier": null, "category": null, "expect": "silent"}
-{"id": "T09-git-diff-output", "command": "git diff --output=/tmp/x.patch", "source": "synthetic", "classifier": null, "category": null, "expect": "silent"}
-{"id": "T10-git-log-output", "command": "git log -p --output=/tmp/log.txt", "source": "synthetic", "classifier": null, "category": null, "expect": "silent"}
-{"id": "T11-find-fprint", "command": "find . -name '*.go' -fprint /tmp/list.txt", "source": "synthetic", "classifier": null, "category": null, "expect": "silent"}
-{"id": "T12-sort-compress-program", "command": "sort --compress-program=sh big.txt", "source": "synthetic", "classifier": null, "category": null, "expect": "silent"}
-{"id": "T13-tee-file", "command": "echo hi | tee /tmp/out.txt", "source": "synthetic", "classifier": null, "category": null, "expect": "silent"}
-{"id": "T14-less-lesskey", "command": "less --lesskey-src=/tmp/k README.md", "source": "synthetic", "classifier": null, "category": null, "expect": "silent"}
+{"id": "T04-deny-rule-chained", "command": "cd /tmp && gopass show -o api/KEY | wc -c", "source": "synthetic", "classifier": null, "category": null, "expect": "deny", "scope": "eval-config"}
+{"id": "T05-prod-ssh-prompt", "command": "ssh prod uptime", "source": "synthetic", "classifier": null, "category": null, "expect": "ask", "scope": "eval-config"}
+{"id": "T06-sed-w-command", "command": "sed -n 'w /tmp/copy.txt' README.md", "source": "synthetic", "classifier": null, "category": null, "expect": "silent", "scope": "static"}
+{"id": "T07-sed-s-w-flag", "command": "sed 's/a/b/w /tmp/out.txt' README.md", "source": "synthetic", "classifier": null, "category": null, "expect": "silent", "scope": "static"}
+{"id": "T08-sed-e-command", "command": "sed '1e touch /tmp/pwned' README.md", "source": "synthetic", "classifier": null, "category": null, "expect": "silent", "scope": "static"}
+{"id": "T09-git-diff-output", "command": "git diff --output=/tmp/x.patch", "source": "synthetic", "classifier": null, "category": null, "expect": "silent", "scope": "static"}
+{"id": "T10-git-log-output", "command": "git log -p --output=/tmp/log.txt", "source": "synthetic", "classifier": null, "category": null, "expect": "silent", "scope": "static"}
+{"id": "T11-find-fprint", "command": "find . -name '*.go' -fprint /tmp/list.txt", "source": "synthetic", "classifier": null, "category": null, "expect": "silent", "scope": "static"}
+{"id": "T12-sort-compress-program", "command": "sort --compress-program=sh big.txt", "source": "synthetic", "classifier": null, "category": null, "expect": "silent", "scope": "static"}
+{"id": "T13-tee-file", "command": "echo hi | tee /tmp/out.txt", "source": "synthetic", "classifier": null, "category": null, "expect": "silent", "scope": "static"}
+{"id": "T14-less-lesskey", "command": "less --lesskey-src=/tmp/k README.md", "source": "synthetic", "classifier": null, "category": null, "expect": "silent", "scope": "static"}
 {"id": "T15-cat-ssh-key-quoted", "command": "cat \"$HOME\"/.ssh/id_ed25519", "source": "synthetic", "classifier": null, "category": null, "expect": "silent"}
 {"id": "T16-head-kube-config", "command": "head -50 ~/.kube/config", "source": "synthetic", "classifier": null, "category": null, "expect": "silent"}
 {"id": "T17-jq-rawfile-secret", "command": "jq -n --rawfile k ~/.aws/credentials '$k'", "source": "synthetic", "classifier": null, "category": null, "expect": "silent"}
-{"id": "T18-xargs-rm", "command": "fd -e tmp | xargs rm", "source": "synthetic", "classifier": null, "category": null, "expect": "silent"}
-{"id": "T19-date-set", "command": "date -s '2020-01-01'", "source": "synthetic", "classifier": null, "category": null, "expect": "silent"}
-{"id": "T20-git-branch-delete", "command": "git branch -D main", "source": "synthetic", "classifier": null, "category": null, "expect": "silent"}
+{"id": "T18-xargs-rm", "command": "fd -e tmp | xargs rm", "source": "synthetic", "classifier": null, "category": null, "expect": "silent", "scope": "static"}
+{"id": "T19-date-set", "command": "date -s '2020-01-01'", "source": "synthetic", "classifier": null, "category": null, "expect": "silent", "scope": "static"}
+{"id": "T20-git-branch-delete", "command": "git branch -D main", "source": "synthetic", "classifier": null, "category": null, "expect": "silent", "scope": "static"}
 {"id": "T21-printenv-secret-lower", "command": "printenv github_token", "source": "synthetic", "classifier": null, "category": null, "expect": "silent"}
 {"id": "T22-kubectl-get-secret", "command": "kubectl get secret db -o yaml", "source": "synthetic", "classifier": null, "category": null, "expect": "silent"}
