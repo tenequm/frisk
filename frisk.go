@@ -76,6 +76,7 @@ const (
 	verbPrint = "printf"
 	verbSed   = "sed"
 	verbUVRun = "uv run"
+	verbXXD   = "xxd"
 )
 
 // defaultsMarker splices builtins into a judge list; a list without it
@@ -85,21 +86,24 @@ const defaultsMarker = "$defaults"
 
 // denyFlags turn an otherwise read-only verb into a writer or executor.
 var denyFlags = map[string][]string{
-	"find":  {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls"},
-	verbSed: {"-i", "-I", "--in-place", "-f", "--file"},
-	"sort":  {"-o", "--output", "--compress-program"},
-	verbGit: {"-c", "--upload-pack", "--receive-pack", "--output"},
-	"date":  {"-s", "--set"},
-	"fd":    {"-x", "--exec", "-X", "--exec-batch"},
-	"rg":    {"--pre", "--hostname-bin"},
-	"xxd":   {"-r"},
-	verbAwk: {"-f", "--file", "-i", "--include", "-l", "--load", "-E", "--exec"},
-	"yq":    {"-i", "--inplace", "-f", "--from-file"},
-	"jq":    {"-f", "--from-file"},
-	"tree":  {"-o", "-R"},
-	"less":  lessDenyFlags,
-	"more":  lessDenyFlags,
-	verbGH:  {"-t", "--show-token"},
+	"find":    {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls"},
+	"cloc":    {"--out", "--report-file"},
+	"go":      {"-vettool", "--vettool", "-toolexec", "--toolexec"},
+	verbSed:   {"-i", "-I", "--in-place", "-f", "--file"},
+	"sort":    {"-o", "--output", "--compress-program"},
+	verbGit:   {"-c", "--upload-pack", "--receive-pack", "--output"},
+	"date":    {"-s", "--set"},
+	"fd":      {"-x", "--exec", "-X", "--exec-batch"},
+	"rg":      {"--pre", "--hostname-bin"},
+	verbXXD:   {"-r"},
+	verbAwk:   {"-f", "--file", "-i", "--include", "-l", "--load", "-E", "--exec"},
+	"yq":      {"-i", "--inplace", "-f", "--from-file", "-s", "--split-exp"},
+	"jq":      {"-f", "--from-file"},
+	"kubectl": {"--kubeconfig"},
+	"tree":    {"-o", "-R"},
+	"less":    lessDenyFlags,
+	"more":    lessDenyFlags,
+	verbGH:    {"-t", "--show-token"},
 	// printf -v assigns a variable, which would carry a hijacking name past
 	// the assignment screen.
 	verbPrint: {"-v"},
@@ -115,7 +119,7 @@ var lessDenyFlags = []string{
 // clusterVerbs take short flags bundled or with attached values, so "-ni",
 // "-i.bak", and "-oFILE" all carry the flag.
 var clusterVerbs = map[string]bool{
-	verbSed: true, "sort": true, "fd": true, "xxd": true, verbAwk: true, "yq": true,
+	verbSed: true, "sort": true, "fd": true, verbXXD: true, verbAwk: true, "yq": true,
 	"jq": true, "tree": true, "less": true, "more": true, "date": true, verbPrint: true,
 }
 
@@ -134,7 +138,7 @@ var programVerbs = map[string]*regexp.Regexp{
 	verbAwk: regexp.MustCompile(`(?i)system|\||environ|[<>@]`),
 	"jq":    jqProgram,
 	verbGH:  jqProgram,
-	"yq":    regexp.MustCompile(`(^|[^.\w$])(str)?env\b|\$ENV\b`),
+	"yq":    regexp.MustCompile(`(^|[^.\w$])(str)?env\b|\$ENV\b|\bload(_(str|props|xml|base64))?\s*\(`),
 }
 
 // hijackEnv names variables that make the shell or an allowed verb run
@@ -686,7 +690,7 @@ func tokenize(command string) parsedCommand {
 			}
 			flushStatement(next)
 			if c == '\n' && len(docs) > 0 {
-				rest := p.heredocBodies(docs, command[i+1:])
+				rest := p.heredocBodies(docs, command[i+1:], sep)
 				docs, i = nil, len(command)-len(rest)-1
 			}
 		case c == '&':
@@ -783,7 +787,7 @@ func wordEnd(s string, j int) bool {
 // heredocBodies consumes the bodies that open s, one per pending operator, and
 // returns what follows the last terminator line. An unterminated body runs to
 // the end of the command.
-func (p *parsedCommand) heredocBodies(docs []heredoc, s string) string {
+func (p *parsedCommand) heredocBodies(docs []heredoc, s, pendingSeparator string) string {
 	owners := len(p.stmts)
 	for _, d := range docs {
 		body := s
@@ -804,6 +808,10 @@ func (p *parsedCommand) heredocBodies(docs []heredoc, s string) string {
 		data := true
 		for j := d.owner; j < owners && (j == d.owner || p.stmts[j].sep == "|"); j++ {
 			data = data && !shellReadsStdin(p.stmts[j].tokens())
+		}
+		if data && pendingSeparator == "|" {
+			continuation := tokenize(s).stmts
+			data = len(continuation) == 0 || !shellReadsStdin(continuation[0].tokens())
 		}
 		// Tokenized apart, so a stray quote in the body cannot swallow the
 		// commands after it, and kept so deny and ask rules still see it.
@@ -885,6 +893,10 @@ func (p parsedCommand) staticSegments() ([][]string, bool) {
 				(!w.glob || !credentialGlob.MatchString(text) && !braceExpansion.MatchString(text))
 			if k >= st.cmd {
 				segs[j][k-st.cmd] = strings.ReplaceAll(text, "\x00", "$")
+				if k > st.cmd && w.glob && strings.IndexByte("*?[", text[0]) >= 0 {
+					_, screenedVerb := denyFlags[segs[j][0]]
+					sound = sound && !screenedVerb
+				}
 				continue
 			}
 			// An assignment is matched against no rule, so the screens an
@@ -1137,19 +1149,44 @@ func matchAny(rules []string, segments [][]string) string {
 // statement of assignments, which staticSegments has screened and which runs
 // nothing; a command made of those alone has no rule behind it.
 func allSegmentsAllowed(rules []string, segments [][]string) (string, bool) {
-	var matched string
+	var matched, dir string
 	for _, seg := range segments {
 		if len(seg) == 0 {
 			continue
 		}
-		if hasDeniedFlag(seg) || riskyArgs(seg) {
+		if hasDeniedFlag(seg) || riskyArgs(seg) || credentialUnder(dir, seg[1:]) {
 			return "", false
 		}
 		if matched = matchAny(rules, [][]string{seg}); matched == "" {
 			return "", false
 		}
+		if seg[0] == "cd" {
+			dir = cdTarget(dir, seg[1:])
+		}
 	}
 	return matched, matched != ""
+}
+
+// cdTarget follows a cd as far as the words allow: "" when the target is not
+// named, as in "cd -".
+func cdTarget(dir string, args []string) string {
+	i := slices.IndexFunc(args, func(arg string) bool { return !strings.HasPrefix(arg, "-") })
+	if i < 0 {
+		return ""
+	}
+	if strings.HasPrefix(args[i], "/") || strings.HasPrefix(args[i], "~") {
+		return args[i]
+	}
+	return filepath.Join(dir, args[i])
+}
+
+// credentialUnder reports a relative operand that names a credential file once
+// joined to the directory an earlier cd entered: "cd ~/.aws && cat credentials".
+func credentialUnder(dir string, args []string) bool {
+	return dir != "" && slices.ContainsFunc(args, func(arg string) bool {
+		relative := arg != "" && strings.IndexByte("-/~", arg[0]) < 0
+		return relative && credentialPath.MatchString(filepath.Join(dir, arg))
+	})
 }
 
 func hasDeniedFlag(seg []string) bool {
@@ -1195,6 +1232,14 @@ func riskyArgs(seg []string) bool {
 		}
 	}
 	switch seg[0] {
+	case "go":
+		return len(args) > 1 && args[0] == "env" && (slices.Contains(args[1:], "-w") || slices.Contains(args[1:], "-u"))
+	case "uniq", verbXXD:
+		return len(slices.DeleteFunc(slices.Clone(args), func(arg string) bool { return strings.HasPrefix(arg, "-") })) > 1
+	case "export", "declare", "typeset", "readonly", "local":
+		return slices.ContainsFunc(args, func(arg string) bool {
+			return assignmentPattern.MatchString(arg) && (hijackEnv.MatchString(arg) || credentialPath.MatchString(arg) || expansion.MatchString(arg))
+		})
 	case "printenv":
 		return slices.ContainsFunc(args, secretEnvName.MatchString)
 	case verbSed:

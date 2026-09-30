@@ -1111,6 +1111,17 @@ func TestDecideStaticTiers(t *testing.T) {
 		{"two assignments stay static", "A=src B=docs; ls $A $B", decisionAllow, "static"},
 		{"assignment on its own line stays static", "F=README.md\nwc -l $F", decisionAllow, "static"},
 		{"assignment alone has no rule", "X=1", "", "no-judge"},
+		{"credential directory cd never static", "cd ~/.aws && cat credentials", "", "no-judge"},
+		{"kube directory cd never static", "cd ~/.kube && cat config", "", "no-judge"},
+		{"gh directory cd never static", "cd ~/.config/gh && cat hosts.yml", "", "no-judge"},
+		{"ssh directory cd never static", "cd ~/.ssh; cat id_ed25519", "", "no-judge"},
+		{"cd to the parent of a credential directory never static", "cd ~/.config && cat gh/hosts.yml", "", "no-judge"},
+		{"cd below a credential directory never static", "cd ~/.aws/cli && cat ../credentials", "", "no-judge"},
+		{"cd in two steps never static", "cd ~ && cd .aws && cat credentials", "", "no-judge"},
+		{"relative cd never static", "cd .kube; cat config", "", "no-judge"},
+		{"aws config after cd stays static", "cd ~/.aws && cat config", decisionAllow, "static"},
+		{"cd back stays static", "cd ~/.aws && cd - && cat credentials.example", decisionAllow, "static"},
+		{"project directory cd stays static", "cd ~/Projects/x && cat README.md", decisionAllow, "static"},
 		{"assignments alone have no rule", "X=1; Y=2", "", "no-judge"},
 		{"flag through a variable never static", "A=-x; fd . $A rm", "", "no-judge"},
 		{"long flag through a variable never static", "A=--pre=sh; rg $A foo", "", "no-judge"},
@@ -1157,7 +1168,28 @@ func TestDecideStaticTiers(t *testing.T) {
 		{"node env stays static", "NODE_ENV=test ls", decisionAllow, "static"},
 		{"python unbuffered stays static", "PYTHONUNBUFFERED=1 ls", decisionAllow, "static"},
 		{"term stays static", "TERM=dumb ls", decisionAllow, "static"},
+		{"go vet tool never static", "go vet -vettool=/tmp/evil ./...", "", "no-judge"},
+		{"go vet tool with two dashes never static", "go vet --vettool=/tmp/evil ./...", "", "no-judge"},
+		{"go vet toolexec never static", "go vet -toolexec /tmp/evil ./...", "", "no-judge"},
+		{"go env write never static", "go env -w GOFLAGS=x", "", "no-judge"},
+		{"go env unset never static", "go env -u GOFLAGS", "", "no-judge"},
+		{"go vet stays static", "go vet ./...", decisionAllow, "static"},
+		{"go env lookup stays static", "go env GOPATH", decisionAllow, "static"},
+		{"go env json stays static", "go env -json", decisionAllow, "static"},
+		{"uniq output operand never static", "uniq in out", "", "no-judge"},
+		{"xxd output operand never static", "xxd in out", "", "no-judge"},
+		{"cloc output never static", "cloc --out=f .", "", "no-judge"},
+		{"cloc report file never static", "cloc --report-file=f .", "", "no-judge"},
+		{"yq split output never static", "yq -s '.name' f.yaml", "", "no-judge"},
+		{"uniq count stays static", "uniq -c f", decisionAllow, "static"},
+		{"xxd read stays static", "xxd f", decisionAllow, "static"},
+		{"cloc read stays static", "cloc .", decisionAllow, "static"},
 		{"yq read stays static", "yq .a f.yaml", decisionAllow, "static"},
+		{"yq load never static", `yq 'load("/home/me/.netrc")' f.yaml`, "", "no-judge"},
+		{"yq load str never static", `yq 'load_str("notes.txt")' f.yaml`, "", "no-judge"},
+		{"yq load props never static", `yq 'load_props("app.properties")' f.yaml`, "", "no-judge"},
+		{"yq load xml never static", `yq 'load_xml("app.xml")' f.yaml`, "", "no-judge"},
+		{"yq load base64 never static", `yq 'load_base64("blob")' f.yaml`, "", "no-judge"},
 		{"yq in-place never static", "yq -i .a=1 f.yaml", "", "no-judge"},
 		{"yq env never static", "yq '.a = strenv(X)' f.yaml", "", "no-judge"},
 		{"jq env field stays static", "jq .spec.env f.json", decisionAllow, "static"},
@@ -1182,6 +1214,9 @@ func TestDecideStaticTiers(t *testing.T) {
 		{"less log file never static", "less -o log f.txt", "", "no-judge"},
 		{"sw_vers stays static", "sw_vers -productVersion", decisionAllow, "static"},
 		{"find name stays static", "find . -name '*.go'", decisionAllow, "static"},
+		{"find leading glob never static", "find * -type f", "", "no-judge"},
+		{"ls leading glob stays static", "ls *", decisionAllow, "static"},
+		{"cat suffix glob stays static", "cat *.md", decisionAllow, "static"},
 		{"find type stays static", "find . -type f -newer x", decisionAllow, "static"},
 		{"find -fls never static", "find . -fls out", "", "no-judge"},
 		{"find -fprint0 never static", "find . -fprint0 out", "", "no-judge"},
@@ -1324,6 +1359,8 @@ func TestDecideStaticTiers(t *testing.T) {
 		{"kubectl get secret by name never static", "kubectl -n prod get secret/db", "", "no-judge"},
 		{"kubectl get secret in list never static", "kubectl get pods,secrets -A", "", "no-judge"},
 		{"kubectl get pods stays static", "kubectl get pods", decisionAllow, "static"},
+		{"kubectl attached kubeconfig never static", "kubectl get pods --kubeconfig=/tmp/evil.yaml", "", "no-judge"},
+		{"kubectl kubeconfig never static", "kubectl get pods --kubeconfig /tmp/evil.yaml", "", "no-judge"},
 		{"kubectl describe secret stays static", "kubectl describe secret x", decisionAllow, "static"},
 		{"kubectl get sealedsecrets stays static", "kubectl get sealedsecrets", decisionAllow, "static"},
 	}
@@ -1333,6 +1370,31 @@ func TestDecideStaticTiers(t *testing.T) {
 			v := decide(cfg, tt.command, t.TempDir(), testLogger)
 			if v.Decision != tt.decision || v.Tier != tt.tier {
 				t.Fatalf("decide(%q) = (%q, %q), want (%q, %q)", tt.command, v.Decision, v.Tier, tt.decision, tt.tier)
+			}
+		})
+	}
+}
+
+func TestAssignmentBuiltinScreens(t *testing.T) {
+	t.Parallel()
+	allow := append(exampleAllow(t), "export *", "declare *", "typeset *", "readonly *", "local *")
+	cfg := &config{Permissions: permissionsConfig{Allow: allow}}
+	tests := []struct {
+		name    string
+		command string
+	}{
+		{"export", "export PATH=/tmp/evil; ls"},
+		{"declare", "declare HOME=~/.ssh; ls"},
+		{"typeset", "typeset X=~/.netrc; ls"},
+		{"readonly", "readonly BASH_ENV=/tmp/evil; ls"},
+		{"local", "local KUBECONFIG=/tmp/evil; ls"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			v := decide(cfg, tt.command, t.TempDir(), testLogger)
+			if v.Decision != "" || v.Tier != "no-judge" {
+				t.Fatalf("decide(%q) = (%q, %q), want (%q, %q)", tt.command, v.Decision, v.Tier, "", "no-judge")
 			}
 		})
 	}
@@ -2801,6 +2863,7 @@ func TestProbeScripts(t *testing.T) {
 		{"heredoc read by a wrapped shell is probed", "proj", "timeout 60 dash -s <<'EOF'\npython3 stats.py\nEOF", probeAttached, []string{"proj/stats.py"}},
 		{"heredoc read by a redirected shell is probed", "proj", "sh <<EOF > out.log\npython3 stats.py\nEOF", probeMissing, []string{"proj/stats.py"}},
 		{"heredoc piped into a shell is probed", "proj", "cat <<EOF | bash\npython3 stats.py\nEOF", probeAttached, []string{"proj/stats.py"}},
+		{"heredoc pipeline continued after terminator is probed", "proj", "cat <<EOF |\npython3 stats.py\nEOF\nbash", probeAttached, []string{"proj/stats.py"}},
 		{"heredoc piped through a filter into a shell is probed", "proj", "cat <<EOF | grep -v skip | sh -s\npython3 stats.py\nEOF", probeAttached, []string{"proj/stats.py"}},
 		{"heredoc piped into a sudo shell is probed", "proj", "cat <<EOF | sudo -E bash\npython3 stats.py\nEOF", probeAttached, []string{"proj/stats.py"}},
 		{"heredoc piped into tee is text", "proj", "cat <<EOF | tee out.txt\npython3 stats.py\nEOF", "", nil},
