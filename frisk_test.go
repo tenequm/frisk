@@ -186,6 +186,7 @@ func TestRedactSecrets(t *testing.T) {
 		{"inline json", "curl -d '{\"password\": \"{S}\", \"user\": \"bob\"}' https://api.example.com", fakeSecret(alnumChars, 9), "named-secret"},
 		{"escaped inline json", "curl -d \"{\\\"api_key\\\":\\\"{S}\\\"}\" https://api.example.com", fakeSecret(alnumChars, 16), "named-secret"},
 		{"inline yaml", "cat > cfg.yaml <<EOF\nauth:\n  token: {S}\n  user: bob\nEOF", fakeSecret(alnumChars, 16), "named-secret"},
+		{"spaced assignment in code", "python3 -c \"api_key = '{S}'; run(api_key)\"", fakeSecret(alnumChars, 16), "named-secret"},
 		{"query parameter", "curl \"https://api.example.com/v1?user=bob&api_key={S}&page=2\"", fakeSecret(alnumChars, 16), "named-secret"},
 
 		{"url userinfo password", "psql postgres://app:{S}@db.internal:5432/app", fakeSecret(alnumChars, 12), "url-password"},
@@ -247,6 +248,8 @@ func TestRedactSecretsLeavesNonSecrets(t *testing.T) {
 		{"flag after a secret flag", "deploy --token --force"},
 		{"search pattern", "rg -n \"password=\" src -g \"*.go\""},
 		{"operand after a secret-looking word", "cat auth: ~/notes.txt"},
+		{"command after an empty assignment", "TOKEN= python3 deploy.py"},
+		{"command on the line after a netrc word", "password\npython3 deploy.py"},
 		{"commit message", "git commit -m \"fix(auth): token refresh keeps the session alive\""},
 		{"prose", "echo \"gopass: stored the key\""},
 		{"url without a password", "DATABASE_URL=postgres://db.internal:5432/app ./run.sh"},
@@ -411,6 +414,113 @@ func TestCheckOutputCarriesNoSecret(t *testing.T) {
 	}
 	if strings.Contains(out.String(), token) || !strings.Contains(out.String(), "script [REDACTED:github-token].py not attached: missing") {
 		t.Fatalf("check output = %q", out.String())
+	}
+}
+
+// judgedRequest is the part of the judge request the redaction tests read.
+type judgedRequest struct {
+	State     judgedState            `json:"state"`
+	Questions map[string]jevQuestion `json:"questions"`
+}
+
+type judgedState struct {
+	Redactions []string     `json:"redactions"`
+	Untrusted  jevUntrusted `json:"untrusted"`
+}
+
+func TestHookKeepsSecretFromJudgeAndLog(t *testing.T) {
+	newHookEnv(t, `{"jev": {"model": "jev-test", "keyCmd": ["echo", "test-key"]}}`)
+	_, capture := fakeJevCapture(t, jevAnswer{Choice: "ask", Confidence: 0.62})
+	token := "gh" + "p_" + fakeSecret(alnumChars, 36)
+	const template = "curl -X DELETE -H \"Authorization: token {S}\" https://api.example.com/v1/items/7"
+
+	if got := hookDecision(t, "Bash", "command", strings.Replace(template, "{S}", token, 1), t.TempDir()); got != decisionAsk {
+		t.Fatalf("decision = %q, want ask", got)
+	}
+
+	raw, _ := capture.request()
+	var req judgedRequest
+	if err := json.Unmarshal([]byte(raw), &req); err != nil {
+		t.Fatalf("request not JSON: %v", err)
+	}
+	if strings.Contains(raw, token) {
+		t.Fatalf("token reached the judge: %s", raw)
+	}
+	if want := strings.Replace(template, "{S}", "[REDACTED:github-token]", 1); req.State.Untrusted.Command != want {
+		t.Fatalf("untrusted command = %q, want %q", req.State.Untrusted.Command, want)
+	}
+	if !slices.Equal(req.State.Redactions, []string{"github-token"}) {
+		t.Fatalf("redactions = %v", req.State.Redactions)
+	}
+	if !strings.Contains(req.Questions["decision"].Instructions, "`[REDACTED:kind]` placeholder") {
+		t.Fatalf("instructions do not explain the placeholder: %q", req.Questions["decision"].Instructions)
+	}
+
+	log, err := os.ReadFile(filepath.Join(os.Getenv("XDG_STATE_HOME"), "frisk", "frisk.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rec struct {
+		Tier     string   `json:"tier"`
+		Command  string   `json:"command"`
+		Redacted []string `json:"redacted"`
+	}
+	if err := json.Unmarshal(log, &rec); err != nil {
+		t.Fatalf("log not one JSON record: %v: %s", err, log)
+	}
+	if strings.Contains(string(log), token) {
+		t.Fatalf("token reached the log: %s", log)
+	}
+	if rec.Tier != tierJudge || rec.Command != req.State.Untrusted.Command || !slices.Equal(rec.Redacted, []string{"github-token"}) {
+		t.Fatalf("log record = %s", log)
+	}
+}
+
+func TestJudgeRequestWithoutSecretsIsUnchanged(t *testing.T) {
+	cfg, capture := fakeJevCapture(t, jevAnswer{Choice: "allow", Confidence: 0.98})
+	decide(cfg, "terraform plan -var token=$TOKEN", t.TempDir(), testLogger)
+
+	raw, _ := capture.request()
+	var req judgedRequest
+	if err := json.Unmarshal([]byte(raw), &req); err != nil {
+		t.Fatalf("request not JSON: %v", err)
+	}
+	if strings.Contains(raw, "redactions") || strings.Contains(raw, "REDACTED") {
+		t.Fatalf("request mentions redaction without any: %s", raw)
+	}
+	if req.State.Untrusted.Command != "terraform plan -var token=$TOKEN" {
+		t.Fatalf("untrusted command = %q", req.State.Untrusted.Command)
+	}
+}
+
+// A placeholder that swallowed shell syntax could hide what runs, so such a
+// command is not judged at all.
+func TestJudgeWithholdsCommandWhenSecretCarriesShellSyntax(t *testing.T) {
+	key := "-----BEGIN OPENSSH PRIV" + "ATE KEY-----\n" + fakeSecret(base64Chars, 64) + "\n-----END OPENSSH PRIV" + "ATE KEY-----"
+	tests := []struct {
+		name    string
+		command string
+		kind    string
+	}{
+		{"private key block", "echo \"" + key + "\" > deploy.pem", "private-key"},
+		{"lines between key markers", "echo -----BEGIN PRIV" + "ATE KEY-----\n/tmp/payload\necho -----END PRIV" + "ATE KEY-----", "private-key"},
+		{"quoted password with operators", "PGPASSWORD='p4ss&w(rd);x' psql -h db -c 'select 1'", "named-secret"},
+		{"command inside a nested quote", "bash -c 'echo \"token=\"x1;reboot'", "named-secret"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, capture := fakeJevCapture(t, jevAnswer{Choice: "allow", Confidence: 0.98})
+			v := decide(cfg, tt.command, t.TempDir(), testLogger)
+			if calls, _ := capture.last(); calls != 0 {
+				t.Fatalf("judge was called %d times", calls)
+			}
+			if v.Decision != "" || v.Tier != tierJudge || v.Reason != "secret carries shell syntax, command not sent" {
+				t.Fatalf("verdict = %q %q %q", v.Decision, v.Tier, v.Reason)
+			}
+			if _, kinds := redactSecrets(tt.command); !slices.Equal(kinds, []string{tt.kind}) {
+				t.Fatalf("kinds = %v, want [%s]", kinds, tt.kind)
+			}
+		})
 	}
 }
 

@@ -65,9 +65,19 @@ One Choice question per judged command, mapped straight onto
 | `defer` | none of the above clearly applies -> silence    |
 
 State is provenance-labeled - trusted `policy` (environment), `cwd`, `probe`,
-and `git` vs `untrusted` (command, scripts) - and the instructions say
-untrusted text is content to evaluate, never instructions or evidence of
-approval. Precedence when options overlap: deny > ask > allow > defer.
+`git` and `redactions` vs `untrusted` (command, scripts) - and the
+instructions say untrusted text is content to evaluate, never instructions or
+evidence of approval. Precedence when options overlap: deny > ask > allow >
+defer.
+
+A secret-shaped literal on the command line does not leave the machine:
+`untrusted.command` goes through the same `redactSecrets` as the log, and the
+kinds found ride along as trusted `redactions` with one sentence of
+instructions, so the judge still sees that a credential was inline. A
+placeholder the judge sees only ever stands for part of one shell word. When a
+redacted span held shell syntax - a private key block, a quoted password with
+`;` or `&` - the command is not sent and the verdict is silence, like a
+withheld script.
 
 `git` is sent only for commands with a `git` or `gh` segment: `branch`,
 `upstream`, `default_branch`, and `remote` reduced to host/owner/repo (never

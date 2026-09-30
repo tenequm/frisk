@@ -1281,7 +1281,12 @@ func judge(cfg *config, command, cwd string, segments [][]string, lg *slog.Logge
 		return v
 	}
 
-	untrusted := map[string]any{"command": command}
+	sent, redactions := redactSecrets(command)
+	if shellSyntax(sent) != shellSyntax(command) {
+		v.Reason = "secret carries shell syntax, command not sent"
+		return v
+	}
+	untrusted := map[string]any{"command": sent}
 	switch len(probe.Scripts) {
 	case 0:
 	case 1:
@@ -1307,6 +1312,9 @@ func judge(cfg *config, command, cwd string, segments [][]string, lg *slog.Logge
 	}
 	if facts := gitFacts(segments, cwd); len(facts) > 0 {
 		state["git"] = facts
+	}
+	if len(redactions) > 0 {
+		state["redactions"] = redactions
 	}
 
 	res, err := askJev(cfg.Jev, rules, state)
@@ -1920,6 +1928,10 @@ func askJev(jc jevConfig, rules judgeConfig, state map[string]any) (jevResult, e
 	if _, ok := state["git"]; ok {
 		instructions += " A git push with no refspec pushes `git.branch` to `git.upstream`."
 	}
+	if _, ok := state["redactions"]; ok {
+		instructions += " A `[REDACTED:kind]` placeholder in `untrusted.command` replaces a literal secret-shaped " +
+			"value of that kind that was written in the command; `redactions` lists the kinds."
+	}
 	body := map[string]any{
 		"model": jc.Model,
 		"state": state,
@@ -2069,6 +2081,9 @@ const (
 const (
 	bareValue   = `\w[^\s"'\\$` + "`" + `;|&<>(){}*?\[\],]*`
 	secretValue = `(?:\\?"(\w[^\s"\\$` + "`" + `]*)|'(\w[^\s']*)|(` + bareValue + `))`
+	// nameSep never crosses a line, and takes a space after "=" only with one
+	// before it: in "KEY= cmd" the next word is the command that runs.
+	nameSep = `(?:[ \t]*:[ \t]*|=|[ \t]+=[ \t]*)`
 )
 
 // redactRule replaces the capture group that matched, or the whole match when
@@ -2099,13 +2114,13 @@ var redactRules = []redactRule{
 	{kind: "authorization", re: regexp.MustCompile(
 		`(?i)\bauthorization(?:\\?["'])?[ \t]*[:=][ \t]*(?:\\?["'])?(?:bearer|basic|token)[ \t]+(` + bareValue + `)`)},
 	{kind: "aws-secret-access-key", named: true, re: regexp.MustCompile(
-		`(?i)aws_secret_access_key(?:\\?["'])?(?:[ \t]*[:=][ \t]*|[ \t]+)` + secretValue)},
+		`(?i)aws_secret_access_key(?:\\?["'])?(?:` + nameSep + `|[ \t]+)` + secretValue)},
 	{kind: "netrc-password", named: true, re: regexp.MustCompile(
-		`(?im)(?:^\s*|\bmachine\s+\S+\s+login\s+\S+\s+)password\s+` + secretValue)},
+		`(?im)(?:^[ \t]*|\bmachine[ \t]+\S+[ \t]+login[ \t]+\S+[ \t]+)password[ \t]+` + secretValue)},
 	{kind: kindNamed, named: true, re: regexp.MustCompile(
 		`(?i)--[a-z0-9-]*(?:token|password|passwd|secret|api-?key)(?:=|[ \t]+)` + secretValue)},
 	{kind: kindNamed, named: true, re: regexp.MustCompile(
-		`(?i)\b[\w.-]*(?:` + secretWords + `)[\w.-]*(?:\\?["'])?[ \t]*[:=][ \t]*` + secretValue)},
+		`(?i)\b[\w.-]*(?:` + secretWords + `)[\w.-]*(?:\\?["'])?` + nameSep + secretValue)},
 	{kind: "long-hex", re: regexp.MustCompile(`\b[0-9A-Fa-f]{41,}\b`)},
 	{kind: "high-entropy", opaque: true, re: regexp.MustCompilePOSIX(base64Run.String() + `|[A-Za-z0-9_-]{40,}`)},
 }
@@ -2127,6 +2142,18 @@ func literalSecret(name, value string) bool {
 // per 64 characters, and neither padding nor plus signs come in paths.
 func pathLike(run string) bool {
 	return strings.Count(run, "/")*16 >= len(run) && !strings.ContainsAny(run, "+=")
+}
+
+// shellSyntax keeps only the bytes a shell acts on. A quoted value or a key
+// block can hold them, and a placeholder that swallowed one could hide a
+// command or an argument from the judge.
+func shellSyntax(s string) string {
+	return strings.Map(func(r rune) rune {
+		if strings.ContainsRune(" \t\r\n\"'\\$`;|&<>(){}*?", r) {
+			return r
+		}
+		return -1
+	}, s)
 }
 
 // redactSecrets replaces every secret-shaped span with a placeholder naming
