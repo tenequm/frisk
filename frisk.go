@@ -1999,17 +1999,12 @@ func gitFacts(segments, env [][]string, cwd string) (map[string]any, string) {
 	var base *shellDir
 	moved, rewired, changed := false, false, false
 	for i, seg := range segments {
-		if len(seg) == 0 || dir.step(seg) {
-			continue
-		}
-		inner, _, err := unwrap(seg)
-		if err != nil || len(inner) == 0 {
+		if len(seg) > 0 && dir.step(seg) {
 			continue
 		}
 		at := dir
-		switch filepath.Base(inner[0]) {
-		case verbGit:
-			cmd, _ := describeGit(slices.Concat(env[i], seg))
+		cmd, isGit := describeGit(slices.Concat(env[i], seg))
+		if isGit {
 			for _, d := range cmd.dirs {
 				at.path, at.known = at.resolve(d)
 			}
@@ -2017,18 +2012,19 @@ func gitFacts(segments, env [][]string, cwd string) (map[string]any, string) {
 			// State is not followed across segments. A push's facts go stale
 			// once a segment may have changed a remote, and once one may have
 			// moved the branch if the push leaves its remote or destination to
-			// the branch; a discard's counts once anything but a read has run.
+			// the branch.
 			byBranch := cmd.remote == "" || cmd.destination == "" || cmd.destination == gitHead
 			stale := cmd.subcommand == subPush && (rewired || moved && byBranch) || cmd.class == gitDiscard && changed
 			targets = append(targets, gitTarget{cmd: cmd, dir: at.path, current: at.known && !stale})
 			moved = moved || cmd.moves
 			rewired = rewired || cmd.rewires || cmd.class == gitExec || cmd.class == gitUnknown
-			changed = changed || cmd.class != gitRead
-		case verbGH:
-		default:
-			continue
 		}
-		if base == nil {
+		// A discard's counts hold only while nothing but a cd or a git read has
+		// run before it: any other segment, or a redirect, may have written a file.
+		redirects := slices.ContainsFunc(seg, func(w string) bool { return strings.Contains(w, ">") })
+		changed = changed || !isGit || cmd.class != gitRead || redirects
+		inner, _, err := unwrap(seg)
+		if base == nil && (isGit || err == nil && len(inner) > 0 && filepath.Base(inner[0]) == verbGH) {
 			base = &at
 		}
 	}

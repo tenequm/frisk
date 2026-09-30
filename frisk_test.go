@@ -2062,6 +2062,38 @@ func TestGitRecords(t *testing.T) {
 			"stash:local,reset:discard",
 		},
 		{
+			"a cd leaves a discard's counts current", "cd ../repo && git reset --hard",
+			`[{"class":"discard","state":"current","subcommand":"reset","uncommitted_files":1,"untracked_files":1}]`,
+			"reset:discard",
+		},
+		{
+			"a git read leaves a discard's counts current", "git status && git reset --hard",
+			`[{"class":"read","state":"current","subcommand":"status"},` +
+				`{"class":"discard","state":"current","subcommand":"reset","uncommitted_files":1,"untracked_files":1}]`,
+			"status:read,reset:discard",
+		},
+		{
+			"a write before a discard makes its counts unknown", "echo x > f && git reset --hard",
+			`[{"class":"discard","state":"unknown","subcommand":"reset","uncommitted_files":"unknown","untracked_files":"unknown"}]`,
+			"reset:discard",
+		},
+		{
+			"a new file before a clean makes its counts unknown", "touch n && git clean -fd",
+			`[{"class":"discard","forced":true,"state":"unknown","subcommand":"clean","uncommitted_files":"unknown","untracked_files":"unknown"}]`,
+			"clean:discard",
+		},
+		{
+			"any other command before a discard makes its counts unknown", "make build; git checkout -- .",
+			`[{"class":"discard","state":"unknown","subcommand":"checkout","uncommitted_files":"unknown","untracked_files":"unknown"}]`,
+			"checkout:discard",
+		},
+		{
+			"a redirected git read makes a discard's counts unknown", "git status > out.txt && git reset --hard",
+			`[{"class":"read","state":"current","subcommand":"status"},` +
+				`{"class":"discard","state":"unknown","subcommand":"reset","uncommitted_files":"unknown","untracked_files":"unknown"}]`,
+			"status:read,reset:discard",
+		},
+		{
 			"a push's facts survive a discard, the counts do not survive a push", "git reset --hard && git push origin main && git clean -fd",
 			`[{"class":"discard","state":"current","subcommand":"reset","uncommitted_files":1,"untracked_files":1},` +
 				`{"class":"remote","deletes_ref":false,"destination":"main","destination_is_default":"yes","forced":false,"remote":"github.com/owner/repo","state":"current","subcommand":"push"},` +

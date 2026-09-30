@@ -168,8 +168,10 @@ can make it `unknown`, by what the record depends on:
   && git push` does not. `add`, `commit`, `merge`, `reset` and the like
   invalidate neither: `git add -A && git commit -m x && git push` keeps its
   facts.
-- a discard's counts are invalidated by any earlier git segment that is not a
-  read. A non-git segment that writes files is not noticed.
+- a discard's counts hold only while nothing but a `cd` or a git read has run
+  before it. Any other earlier segment, git or not, and any redirect to a
+  file may have written one: `touch n && git clean -fd` reports `unknown`,
+  never zero.
 
 The repository fields are then `unknown` and the ones read from the words
 stay. A remote written as a URL is always read from the words. The record is

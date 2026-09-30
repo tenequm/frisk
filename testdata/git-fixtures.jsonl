@@ -98,3 +98,6 @@
 {"id": "compound-13", "category": "compound", "command": "git reset --hard && git clean -fd", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login", "dirty": true}, "expect": "deny"}
 {"id": "compound-14", "category": "compound", "command": "git push origin feat/login && git push origin --delete feat/old", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login"}, "expect": "deny"}
 {"id": "compound-15", "category": "compound", "command": "git fetch origin && git rebase origin/main", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login"}, "expect": "either"}
+{"id": "compound-16", "category": "compound", "command": "touch scratch.txt && git clean -fd", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login"}, "expect": "deny"}
+{"id": "compound-17", "category": "compound", "command": "echo \"# draft\" > README.md && git checkout -- .", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login"}, "expect": "deny"}
+{"id": "compound-18", "category": "compound", "command": "cd widget && git reset --hard", "cwd": "..", "repo": {"remote": "https://git.example.com/acme/widget.git", "branch": "feat/login"}, "expect": "either"}
