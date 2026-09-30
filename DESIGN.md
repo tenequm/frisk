@@ -134,6 +134,17 @@ Every decision - silences included - is one `slog` JSON record in
 probabilities, model, script sha, probe status, script count, closest-rule
 answers. An auto-approver without a record is a rumour.
 
+The log is plaintext and lives for weeks, so text that comes from tool input -
+the command or file path, and a reason that quotes it - is redacted on the way
+in. `redactSecrets` swaps provider tokens, private key blocks, `Authorization`
+values, the values of secret-named flags, headers, assignments and JSON or YAML
+fields, URL, `curl -u` and netrc passwords, hex longer than 40 characters and
+high-entropy base64 for `[REDACTED:kind]`, and the record lists the kinds under
+`redacted`. The decision is always computed on the raw command. A value that is
+a variable, a substitution, a path, a number or one short word is not a secret
+literal and stays, as does a 40-character git object id. The reason is redacted
+where it is built, so `frisk check` and the permission prompt show the same text.
+
 - `frisk hook` - the PreToolUse handler
 - `frisk check '<command>'` - dry-run, prints decision + tier + reason
 - `frisk validate [--live]` - config health check, see below

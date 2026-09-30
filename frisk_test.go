@@ -106,6 +106,314 @@ func TestParseCommand(t *testing.T) {
 	}
 }
 
+const (
+	alnumChars  = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+	base64Chars = alnumChars + "+/"
+	urlChars    = alnumChars + "-_"
+	hexChars    = "0123456789abcdef"
+)
+
+// fakeSecret builds a token body at run time, so the source holds no
+// secret-shaped literal for gitleaks to flag. It starts with a letter.
+func fakeSecret(alphabet string, n int) string {
+	b := make([]byte, n)
+	x := uint32(n)
+	for i := range b {
+		x = x*1664525 + 1013904223
+		b[i] = alphabet[int(x>>16)%len(alphabet)]
+	}
+	b[0] = 'w'
+	return string(b)
+}
+
+func TestRedactSecrets(t *testing.T) {
+	t.Parallel()
+	type redactCase struct {
+		name     string
+		template string // {S} marks where the secret goes
+		secret   string
+		kind     string
+	}
+	keyOpen := "-----BEGIN OPENSSH PRIV" + "ATE KEY-----\n" + fakeSecret(base64Chars, 64) + "\n" + fakeSecret(base64Chars, 40) + "=="
+	keyClosed := keyOpen + "\n-----END OPENSSH PRIV" + "ATE KEY-----"
+	jwt := "ey" + "J" + fakeSecret(urlChars, 20) + ".ey" + "J" + fakeSecret(urlChars, 40) + "." + fakeSecret(urlChars, 43)
+	tests := []redactCase{
+		{"github classic token", "GH_TOKEN={S} gh pr list", "gh" + "p_" + fakeSecret(alnumChars, 36), "github-token"},
+		{"github oauth token in a url", "git clone https://x-access-token:{S}@github.com/o/r.git", "gh" + "o_" + fakeSecret(alnumChars, 36), "github-token"},
+		{"github user token", "echo {S}", "gh" + "u_" + fakeSecret(alnumChars, 36), "github-token"},
+		{"github server token", "echo {S}", "gh" + "s_" + fakeSecret(alnumChars, 36), "github-token"},
+		{"github refresh token", "echo {S}", "gh" + "r_" + fakeSecret(alnumChars, 36), "github-token"},
+		{"github fine-grained token", "gh auth login --with-token <<< {S}", "github" + "_pat_" + fakeSecret(alnumChars+"_", 82), "github-token"},
+		{"aws access key id", "aws configure set aws_access_key_id {S}", "AK" + "IA" + strings.ToUpper(fakeSecret(hexChars, 16)), "aws-access-key-id"},
+		{"aws temporary key id", "export AWS_ACCESS_KEY_ID={S}", "AS" + "IA" + strings.ToUpper(fakeSecret(hexChars, 16)), "aws-access-key-id"},
+		{"aws secret key argument", "aws configure set aws_secret_access_key {S} --profile ci", fakeSecret(base64Chars, 40), "aws-secret-access-key"},
+		{"aws secret key in ini", "printf 'aws_secret_access_key = {S}\\n' >> creds", fakeSecret(base64Chars, 40), "aws-secret-access-key"},
+		{"aws secret key in env", "AWS_SECRET_ACCESS_KEY={S} aws s3 ls", fakeSecret(base64Chars, 40), "aws-secret-access-key"},
+		{"slack token", "curl -d token={S} https://slack.com/api/auth.test", "xo" + "xb-" + fakeSecret(hexChars, 12) + "-" + fakeSecret(alnumChars, 24), "slack-token"},
+		{"openai style key", "OPENAI_API_KEY={S} python3 app.py", "s" + "k-" + fakeSecret(alnumChars, 48), "api-key"},
+		{"anthropic style key", "curl -H \"x-api-key: {S}\" https://api.example.com/v1/messages", "s" + "k-ant-api03-" + fakeSecret(urlChars, 40), "api-key"},
+		{"stripe secret key", "stripe charges list --api-key {S}", "s" + "k_live_" + fakeSecret(alnumChars, 24), "stripe-key"},
+		{"stripe restricted key", "STRIPE_KEY={S} ./sync.sh", "r" + "k_live_" + fakeSecret(alnumChars, 24), "stripe-key"},
+		{"google api key", "curl \"https://maps.example.com/api?key={S}&q=x\"", "AI" + "za" + fakeSecret(urlChars, 35), "google-api-key"},
+		{"npm token", "npm config set //registry.npmjs.org/:_authToken {S}", "np" + "m_" + fakeSecret(alnumChars, 36), "npm-token"},
+		{"jwt", "curl -H \"Authorization: Bearer {S}\" https://api.example.com", jwt, "jwt"},
+		{"private key block", "echo \"{S}\" > deploy.pem", keyClosed, "private-key"},
+		{"truncated private key block", "echo \"{S}", keyOpen, "private-key"},
+
+		{"bearer header", "curl -H \"Authorization: Bearer {S}\" https://api.example.com/v1", fakeSecret(alnumChars, 24), "authorization"},
+		{"basic header", "curl -H 'Authorization: Basic {S}' https://api.example.com", fakeSecret(alnumChars, 18) + "==", "authorization"},
+		{"token header", "curl -H \"Authorization: token {S}\" https://api.example.com", fakeSecret(alnumChars, 24), "authorization"},
+		{"api key header", "curl -H \"X-Api-Key: {S}\" https://api.example.com", fakeSecret(alnumChars, 20), "named-secret"},
+		{"auth token header", "curl -H 'X-Auth-Token: {S}' https://api.example.com", fakeSecret(alnumChars, 20), "named-secret"},
+		{"--token value", "deploy --token {S} --region eu", fakeSecret(alnumChars, 14), "named-secret"},
+		{"--token=value", "deploy --token={S} --region eu", fakeSecret(alnumChars, 14), "named-secret"},
+		{"--password value", "deploy --password {S} --region eu", fakeSecret(alnumChars, 14), "named-secret"},
+		{"--password=value", "deploy --password={S} --region eu", fakeSecret(alnumChars, 14), "named-secret"},
+		{"--api-key value", "deploy --api-key {S} --region eu", fakeSecret(alnumChars, 14), "named-secret"},
+		{"--api-key=value", "deploy --api-key={S} --region eu", fakeSecret(alnumChars, 14), "named-secret"},
+		{"--secret value", "deploy --secret {S} --region eu", fakeSecret(alnumChars, 14), "named-secret"},
+		{"--secret=value", "deploy --secret={S} --region eu", fakeSecret(alnumChars, 14), "named-secret"},
+		{"--access-token value", "deploy --access-token {S} --region eu", fakeSecret(alnumChars, 14), "named-secret"},
+		{"--access-token=value", "deploy --access-token={S} --region eu", fakeSecret(alnumChars, 14), "named-secret"},
+		{"curl user password", "curl -" + "u deploy:{S} https://api.example.com", fakeSecret(alnumChars, 12), "user-password"},
+		{"quoted curl user password", "curl --" + "user \"deploy:{S}\" https://api.example.com", fakeSecret(alnumChars, 12), "user-password"},
+
+		{"env prefix", "DB_PASSWORD={S} ./migrate.sh", fakeSecret(alnumChars, 9), "named-secret"},
+		{"export", "export API_TOKEN={S} && make deploy", fakeSecret(alnumChars, 16), "named-secret"},
+		{"quoted export", "export API_TOKEN=\"{S}\"", fakeSecret(alnumChars, 16), "named-secret"},
+		{"docker env", "docker run -e SESSION_KEY={S} img", fakeSecret(alnumChars, 16), "named-secret"},
+		{"single-quoted value with shell syntax", "PGPASSWORD='{S}' psql -h db", "p4ss&w(rd)|x;y", "named-secret"},
+		{"inline json", "curl -d '{\"password\": \"{S}\", \"user\": \"bob\"}' https://api.example.com", fakeSecret(alnumChars, 9), "named-secret"},
+		{"escaped inline json", "curl -d \"{\\\"api_key\\\":\\\"{S}\\\"}\" https://api.example.com", fakeSecret(alnumChars, 16), "named-secret"},
+		{"inline yaml", "cat > cfg.yaml <<EOF\nauth:\n  token: {S}\n  user: bob\nEOF", fakeSecret(alnumChars, 16), "named-secret"},
+		{"query parameter", "curl \"https://api.example.com/v1?user=bob&api_key={S}&page=2\"", fakeSecret(alnumChars, 16), "named-secret"},
+
+		{"url userinfo password", "psql postgres://app:{S}@db.internal:5432/app", fakeSecret(alnumChars, 12), "url-password"},
+		{"url password without a user", "redis-cli -u redis://:{S}@cache:6379", fakeSecret(alnumChars, 12), "url-password"},
+		{"netrc line", "echo \"machine api.example.com login bob password {S}\" >> ~/.netrc", fakeSecret(alnumChars, 12), "netrc-password"},
+		{"netrc heredoc", "cat >> ~/.netrc <<EOF\nmachine api.example.com\nlogin bob\npassword {S}\nEOF", fakeSecret(alnumChars, 12), "netrc-password"},
+
+		{"long base64", "echo {S} | base64 -d > blob", fakeSecret(base64Chars, 44), "high-entropy"},
+		{"long base64url", "deploy --as {S}", fakeSecret(urlChars, 43), "high-entropy"},
+		{"long hex", "openssl enc -aes-256-cbc -K {S} -in f", fakeSecret(hexChars, 64)[1:], "long-hex"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			in := strings.Replace(tt.template, "{S}", tt.secret, 1)
+			want := strings.Replace(tt.template, "{S}", "[REDACTED:"+tt.kind+"]", 1)
+			got, kinds := redactSecrets(in)
+			if got != want || strings.Contains(got, tt.secret) {
+				t.Fatalf("redacted = %q, want %q", got, want)
+			}
+			if !slices.Equal(kinds, []string{tt.kind}) {
+				t.Fatalf("kinds = %v, want [%s]", kinds, tt.kind)
+			}
+			if again, more := redactSecrets(got); again != got || len(more) != 0 {
+				t.Fatalf("second pass = %q %v, want it unchanged", again, more)
+			}
+		})
+	}
+}
+
+func TestRedactSecretsLeavesNonSecrets(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		command string
+	}{
+		{"short sha", "git show 86a93b4"},
+		{"full git object id", "git cherry-pick " + fakeSecret(hexChars, 41)[1:]},
+		{"uuid", "kubectl get pod 5335bfe0-37d1-40d4-93f5-0bed98fa030c"},
+		{"long path", "cat /private/tmp/agent-501/-Users-dev-Projects-frisk/5335bfe0-37d1-40d4-93f5-0bed98fa030c/scratchpad/notes.md"},
+		{"long path made of words", "ls /Users/someone/Projects/website/content/articles/drafts/unpublished"},
+		{"path with a timestamp", "cat /home/dev/.local/state/tool/runs/20260917T232055Z9b19/record.json"},
+		{"long recipe name", "just test-integration-with-a-very-long-recipe-name-for-the-whole-suite"},
+		{"flag holding a variable", "deploy --token=$TOKEN --region eu"},
+		{"command substitution", "PASSWORD=$(gopass show db/prod) ./migrate.sh"},
+		{"braced variable", "export TOKEN=\"${GH_TOKEN}\""},
+		{"backtick substitution", "API_KEY=`cat key.txt` ./run.sh"},
+		{"header holding a variable", "curl -H \"Authorization: Bearer $API_TOKEN\" https://api.example.com"},
+		{"curl user from a variable", "curl -u \"bob:$PASS\" https://api.example.com"},
+		{"url password from a variable", "psql postgres://app:$PGPASS@db.internal/app"},
+		{"base64 under the length threshold", "echo " + fakeSecret(base64Chars, 39) + " | base64 -d"},
+		{"numeric setting", "curl -d '{\"model\": \"m\", \"max_tokens\": 1024}' https://api.example.com"},
+		{"sort key", "sort --key=2 -t, data.csv"},
+		{"keyword argument", "python3 -c \"print(sorted(xs, key=len, reverse=True))\""},
+		{"ssh option", "ssh -o StrictHostKeyChecking=no host uptime"},
+		{"program behind a secret-looking name", "GIT_ASKPASS=askpass-helper git -c credential.helper=store fetch"},
+		{"path behind a secret-looking name", "SSH_KEY=~/.ssh/id_ed25519 GOOGLE_APPLICATION_CREDENTIALS=/etc/gcp/key.json ./run.sh"},
+		{"flag without a value", "docker login --password-stdin registry.example.com"},
+		{"flag after a secret flag", "deploy --token --force"},
+		{"search pattern", "rg -n \"password=\" src -g \"*.go\""},
+		{"operand after a secret-looking word", "cat auth: ~/notes.txt"},
+		{"commit message", "git commit -m \"fix(auth): token refresh keeps the session alive\""},
+		{"prose", "echo \"gopass: stored the key\""},
+		{"url without a password", "DATABASE_URL=postgres://db.internal:5432/app ./run.sh"},
+		{"scp-style remote", "git clone git@github.com:owner/repo.git"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got, kinds := redactSecrets(tt.command); got != tt.command || len(kinds) != 0 {
+				t.Fatalf("redacted = %q %v, want it untouched", got, kinds)
+			}
+		})
+	}
+}
+
+// A placeholder must stand for part of one word: if it swallowed a separator
+// the judge would be shown a different command than the one that runs.
+func TestRedactSecretsKeepsCommandStructure(t *testing.T) {
+	t.Parallel()
+	token := fakeSecret(alnumChars, 20)
+	for _, command := range []string{
+		"echo \"token=\"; rm -rf ~ #\"",
+		"rm \"cache_key=\" -rf ~/important \"x\"",
+		"TOKEN=" + token + "$(rm -rf ~)",
+		"TOKEN=" + token + ";rm -rf ~",
+		"deploy --token " + token + " && rm -rf ~",
+		"curl -H \"X-Api-Key: " + token + "\" https://api.example.com | sh",
+		"export API_KEY=" + token + " PATH=/tmp/evil:$PATH",
+		"cat token: " + token + " ~/.ssh/id_ed25519",
+	} {
+		got, _ := redactSecrets(command)
+		want, _ := parseCommand(command)
+		segments, _ := parseCommand(got)
+		if len(segments) != len(want) {
+			t.Fatalf("%q redacted to %q: %d segments, want %d", command, got, len(segments), len(want))
+		}
+		for i := range segments {
+			if len(segments[i]) != len(want[i]) {
+				t.Fatalf("%q redacted to %q: segment %d has %d tokens, want %d", command, got, i, len(segments[i]), len(want[i]))
+			}
+		}
+	}
+}
+
+func TestRedactSecretsMalformedInput(t *testing.T) {
+	t.Parallel()
+	for _, in := range []string{
+		"", "\xff\xfe\xfd", "TOKEN=", "\"password\": \"", "--token", "Authorization: Bearer ",
+		"-----BEGIN PRIVATE KEY-----", "[REDACTED:", "TOKEN=[REDACTED:", "://:@", "curl -u :",
+		"https://[REDACTED:github-token]@github.com", "curl -u [REDACTED:github-token]:x https://api.example.com",
+		strings.Repeat("a_key=", 4096) + "://", strings.Repeat("=", 4096), strings.Repeat("eyJ.", 4096),
+		strings.Repeat("password ", 4096), fakeSecret(base64Chars, 64<<10), strings.Repeat("a", 64<<10),
+	} {
+		got, _ := redactSecrets(in)
+		if again, _ := redactSecrets(got); again != got {
+			t.Fatalf("not idempotent on %.40q: %.80q then %.80q", in, got, again)
+		}
+	}
+}
+
+func TestLogVerdictRedacts(t *testing.T) {
+	t.Parallel()
+	token := "gh" + "p_" + fakeSecret(alnumChars, 36)
+	password := fakeSecret(alnumChars, 12)
+	tests := []struct {
+		name     string
+		verdict  verdict
+		subject  string
+		redacted []string
+	}{
+		{"command", verdict{Reason: "no jev key configured"}, "GH_TOKEN=" + token + " psql postgres://app:" + password + "@db/app", []string{"github-token", "url-password"}},
+		{"file path", verdict{Reason: "no file rule matched", Tool: "Write"}, "/tmp/out/" + token + ".txt", []string{"github-token"}},
+		{"reason quoting the command", verdict{Reason: "jev ask (0.62); script " + token + ".py not attached: missing"}, "python3 " + token + ".py", []string{"github-token"}},
+		{"nothing to redact", verdict{Reason: "every segment is read-only: git status *"}, "git status", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var buf strings.Builder
+			logVerdict(slog.New(slog.NewJSONHandler(&buf, nil)), tt.verdict, tt.subject)
+			var rec struct {
+				Command  string   `json:"command"`
+				Reason   string   `json:"reason"`
+				Redacted []string `json:"redacted"`
+			}
+			if err := json.Unmarshal([]byte(buf.String()), &rec); err != nil {
+				t.Fatalf("log not JSON: %v: %s", err, buf.String())
+			}
+			if strings.Contains(buf.String(), token) || strings.Contains(buf.String(), password) {
+				t.Fatalf("secret reached the log: %s", buf.String())
+			}
+			if !slices.Equal(rec.Redacted, tt.redacted) {
+				t.Fatalf("redacted = %v, want %v: %s", rec.Redacted, tt.redacted, buf.String())
+			}
+			if (tt.redacted != nil) != strings.Contains(rec.Command+rec.Reason, "[REDACTED:") {
+				t.Fatalf("log record = %s", buf.String())
+			}
+		})
+	}
+}
+
+// The decision is made on the raw command; redaction only changes what is
+// written down afterwards.
+func TestRedactionLeavesDecisionsAlone(t *testing.T) {
+	const cfg = `{"permissions": {"deny": ["psql *"], "ask": ["deploy *"]}}`
+	newHookEnv(t, cfg)
+	token := "gh" + "p_" + fakeSecret(alnumChars, 36)
+	tests := []struct {
+		name, template, decision, tier string
+	}{
+		{"static allow", "rg -n {S} src", decisionAllow, "static"},
+		{"deny rule", "psql postgres://app:{S}@db/app", decisionDeny, "deny-rule"},
+		{"ask rule", "deploy --token {S}", decisionAsk, "ask-rule"},
+		{"no judge", "curl -H \"Authorization: Bearer {S}\" https://api.example.com", "", "no-judge"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			command := strings.Replace(tt.template, "{S}", token, 1)
+			if got := hookDecision(t, "Bash", "command", command, t.TempDir()); got != tt.decision {
+				t.Fatalf("decision = %q, want %q", got, tt.decision)
+			}
+			loaded, err := loadConfig()
+			if err != nil {
+				t.Fatal(err)
+			}
+			plain := decide(loaded, strings.Replace(tt.template, "{S}", "needle", 1), t.TempDir(), testLogger)
+			if plain.Decision != tt.decision || plain.Tier != tt.tier {
+				t.Fatalf("without a secret: %q %q, want %q %q", plain.Decision, plain.Tier, tt.decision, tt.tier)
+			}
+
+			log, err := os.ReadFile(filepath.Join(os.Getenv("XDG_STATE_HOME"), "frisk", "frisk.log"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			lines := strings.Split(strings.TrimSpace(string(log)), "\n")
+			var rec struct {
+				Tier     string   `json:"tier"`
+				Command  string   `json:"command"`
+				Redacted []string `json:"redacted"`
+			}
+			if err := json.Unmarshal([]byte(lines[len(lines)-1]), &rec); err != nil {
+				t.Fatalf("log not JSON: %v", err)
+			}
+			if strings.Contains(string(log), token) {
+				t.Fatalf("token reached the log: %s", log)
+			}
+			if rec.Tier != tt.tier || !slices.Equal(rec.Redacted, []string{"github-token"}) || !strings.Contains(rec.Command, "[REDACTED:github-token]") {
+				t.Fatalf("log record = %s", lines[len(lines)-1])
+			}
+		})
+	}
+}
+
+func TestCheckOutputCarriesNoSecret(t *testing.T) {
+	newHookEnv(t, `{"jev": {"model": "jev-test", "keyCmd": ["echo", "test-key"]}}`)
+	fakeJevCapture(t, jevAnswer{Choice: "ask", Confidence: 0.62})
+	token := "gh" + "p_" + fakeSecret(alnumChars, 36)
+
+	var out strings.Builder
+	if code := run([]string{"check", "python3 /nonexistent/" + token + ".py"}, strings.NewReader(""), &out); code != 0 {
+		t.Fatalf("exit = %d", code)
+	}
+	if strings.Contains(out.String(), token) || !strings.Contains(out.String(), "script [REDACTED:github-token].py not attached: missing") {
+		t.Fatalf("check output = %q", out.String())
+	}
+}
+
 type hookEnv struct {
 	home, cfgDir string
 }

@@ -1360,7 +1360,9 @@ func judge(cfg *config, command, cwd string, segments [][]string, lg *slog.Logge
 	if v.Decision != "" && !slices.Contains(cfg.Judge.decisions(), v.Decision) {
 		v.Decision, withheld = "", v.Decision+" withheld by judge.decisions"
 	}
-	v.Reason = joinReason(head, withheld, rule, probe.Missed)
+	// Redacted before the cap: a secret cut in half no longer has its shape.
+	missed, _ := redactSecrets(probe.Missed)
+	v.Reason = joinReason(head, withheld, rule, missed)
 	return v
 }
 
@@ -2055,17 +2057,132 @@ func newLogger() *slog.Logger {
 	return slog.New(slog.NewJSONHandler(f, nil))
 }
 
+const (
+	redactedPrefix = "[REDACTED:"
+	kindNamed      = "named-secret"
+)
+
+// A value starts with a word character, because a flag, path, expansion or
+// operator says where a secret lives or what runs and must stay visible.
+// Unquoted it ends at the first byte the shell could act on; after a quote,
+// which is \" for JSON in a shell string, it runs to whitespace or the quote.
+const (
+	bareValue   = `\w[^\s"'\\$` + "`" + `;|&<>(){}*?\[\],]*`
+	secretValue = `(?:\\?"(\w[^\s"\\$` + "`" + `]*)|'(\w[^\s']*)|(` + bareValue + `))`
+)
+
+// redactRule replaces the capture group that matched, or the whole match when
+// the pattern has none.
+type redactRule struct {
+	kind   string
+	re     *regexp.Regexp
+	named  bool // secret only by its name, so the value must pass literalSecret
+	opaque bool // secret only when it measures as random
+}
+
+// redactRules run in order, so a token with a known shape keeps its own kind
+// when it also sits behind a secret-looking name.
+var redactRules = []redactRule{
+	{kind: "private-key", re: regexp.MustCompile(
+		`(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|\z)`)},
+	{kind: "github-token", re: regexp.MustCompile(`\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{36,})`)},
+	{kind: "aws-access-key-id", re: regexp.MustCompile(`\b(?:AKIA|ASIA)[0-9A-Z]{16}\b`)},
+	{kind: "slack-token", re: regexp.MustCompile(`\bxox[a-z]-[A-Za-z0-9-]{10,}`)},
+	{kind: "stripe-key", re: regexp.MustCompile(`\b[sr]k_live_[A-Za-z0-9]{10,}`)},
+	{kind: "api-key", re: regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{20,}`)},
+	{kind: "google-api-key", re: regexp.MustCompile(`\bAIza[A-Za-z0-9_-]{35}`)},
+	{kind: "npm-token", re: regexp.MustCompile(`\bnpm_[A-Za-z0-9]{36}`)},
+	{kind: "jwt", re: regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*`)},
+	{kind: "url-password", re: regexp.MustCompile(`://[^/\s:@\[]*:([^\s"'\\$` + "`" + `;|&<>(){}/@]+)@`)},
+	{kind: "user-password", re: regexp.MustCompile(
+		`\bcurl\b[^\n]*?\s(?:-u|-U|--user|--proxy-user)(?:[ \t]+|=)(?:\\?["'])?[^\s:"'\\\[]+:([^\s"'\\$` + "`" + `;|&<>(){}]+)`)},
+	{kind: "authorization", re: regexp.MustCompile(
+		`(?i)\bauthorization(?:\\?["'])?[ \t]*[:=][ \t]*(?:\\?["'])?(?:bearer|basic|token)[ \t]+(` + bareValue + `)`)},
+	{kind: "aws-secret-access-key", named: true, re: regexp.MustCompile(
+		`(?i)aws_secret_access_key(?:\\?["'])?(?:[ \t]*[:=][ \t]*|[ \t]+)` + secretValue)},
+	{kind: "netrc-password", named: true, re: regexp.MustCompile(
+		`(?im)(?:^\s*|\bmachine\s+\S+\s+login\s+\S+\s+)password\s+` + secretValue)},
+	{kind: kindNamed, named: true, re: regexp.MustCompile(
+		`(?i)--[a-z0-9-]*(?:token|password|passwd|secret|api-?key)(?:=|[ \t]+)` + secretValue)},
+	{kind: kindNamed, named: true, re: regexp.MustCompile(
+		`(?i)\b[\w.-]*(?:` + secretWords + `)[\w.-]*(?:\\?["'])?[ \t]*[:=][ \t]*` + secretValue)},
+	{kind: "long-hex", re: regexp.MustCompile(`\b[0-9A-Fa-f]{41,}\b`)},
+	{kind: "high-entropy", opaque: true, re: regexp.MustCompilePOSIX(base64Run.String() + `|[A-Za-z0-9_-]{40,}`)},
+}
+
+var (
+	// programName marks names whose value is a command to run, such as
+	// GIT_ASKPASS or credential.helper: hiding it would hide what executes.
+	programName = regexp.MustCompile(`(?i)askpass|helper|process|command|cmd`)
+	// plainValue is a number or one short word: what max_tokens, sort_keys or
+	// a line of prose carries behind a secret-looking name.
+	plainValue = regexp.MustCompile(`^(?:\d+|[A-Za-z_.]{1,15})$`)
+)
+
+func literalSecret(name, value string) bool {
+	return !strings.Contains(value, "://") && !plainValue.MatchString(value) && !programName.MatchString(name)
+}
+
+// pathLike tells a path from base64 by its slashes: random base64 has one
+// per 64 characters, and neither padding nor plus signs come in paths.
+func pathLike(run string) bool {
+	return strings.Count(run, "/")*16 >= len(run) && !strings.ContainsAny(run, "+=")
+}
+
+// redactSecrets replaces every secret-shaped span with a placeholder naming
+// its kind and returns the kinds found.
+func redactSecrets(s string) (string, []string) {
+	var kinds []string
+	for _, rule := range redactRules {
+		var b strings.Builder
+		last := 0
+		for _, m := range rule.re.FindAllStringSubmatchIndex(s, -1) {
+			start, end := m[0], m[1]
+			for g := 2; g < len(m); g += 2 {
+				if m[g] >= 0 {
+					start, end = m[g], m[g+1]
+				}
+			}
+			span := s[start:end]
+			if strings.Contains(span, redactedPrefix) ||
+				rule.named && !literalSecret(s[m[0]:start], span) ||
+				rule.opaque && (pathLike(span) || shannonEntropy([]byte(span)) < minSecretEntropy) {
+				continue
+			}
+			b.WriteString(s[last:start])
+			b.WriteString(redactedPrefix + rule.kind + "]")
+			last = end
+		}
+		if last == 0 {
+			continue
+		}
+		b.WriteString(s[last:])
+		s = b.String()
+		if !slices.Contains(kinds, rule.kind) {
+			kinds = append(kinds, rule.kind)
+		}
+	}
+	return s, kinds
+}
+
 func logVerdict(lg *slog.Logger, v verdict, command string) {
 	decision := v.Decision
 	if decision == "" {
 		decision = "silent"
 	}
+	command, kinds := redactSecrets(command)
+	reason, reasonKinds := redactSecrets(v.Reason)
+	kinds = append(kinds, reasonKinds...)
+	slices.Sort(kinds)
 	attrs := []any{
 		"decision", decision,
 		"tier", v.Tier,
-		"reason", v.Reason,
+		"reason", reason,
 		"command", command,
 		"tool", v.Tool,
+	}
+	if len(kinds) > 0 {
+		attrs = append(attrs, "redacted", slices.Compact(kinds))
 	}
 	if v.Confidence > 0 {
 		attrs = append(attrs, "confidence", v.Confidence)
