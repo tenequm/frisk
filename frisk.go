@@ -52,9 +52,9 @@ const defaultsMarker = "$defaults"
 var builtinAllow = []string{
 	"basename *", "cat *", "cd *", "cloc *", "column *", "comm *", "cut *",
 	"date *", "df *", "diff *", "dig *", "dirname *", "du *", "dust *",
-	"echo *", "env", "false", "fd *", "file *", "grep *", "head *",
+	"echo *", "false", "fd *", "file *", "grep *", "head *",
 	"hostname", "id", "jq *", "less *", "ls *", "md5 *", "nl *", "paste *",
-	"printenv *", "printf *", "pwd", "readlink *", "realpath *", "rg *",
+	"printenv [A-Za-z_]*", "printf *", "pwd", "readlink *", "realpath *", "rg *",
 	"sed *", "shasum *", "sleep *", "sort *", "stat *", "tail *", "tee",
 	"test *", "tokei *", "tr *", "true", "type *", "uname *", "uniq *",
 	"uptime", "wc *", "which *", "whoami", "xxd *",
@@ -64,22 +64,36 @@ var builtinAllow = []string{
 	"git rev-list *", "git rev-parse *", "git show *", "git show-ref *",
 	"git status *", "git stash list", "git worktree list",
 	"git -C * blame *", "git -C * branch", "git -C * diff *", "git -C * log *",
-	"git -C * ls-files *", "git -C * ls-tree *", "git -C * remote *",
+	"git -C * ls-files *", "git -C * ls-tree *", "git -C * remote",
+	"git -C * remote -v", "git -C * remote get-url *", "git -C * remote show *",
 	"git -C * rev-list *", "git -C * rev-parse *", "git -C * show *",
 	"git -C * show-ref *", "git -C * status *",
 	"go env *", "go version", "go vet *",
 	"kubectl get *", "kubectl describe *", "kubectl logs *", "kubectl top *",
 	"kubectl version *", "kubectl config current-context",
-	"gopass ls *", "gopass find *", "gopass mounts",
+	"gopass ls *", "gopass mounts",
 }
 
-// denyFlags turn an otherwise read-only verb into a writer.
+// denyFlags turn an otherwise read-only verb into a writer or executor.
 var denyFlags = map[string][]string{
 	"find": {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf"},
-	"sed":  {"-i"},
-	"sort": {"-o", "--output"},
-	"git":  {"-c"},
+	"sed":  {"-i", "--in-place"},
+	"sort": {"-o", "--output", "--compress-program"},
+	"git":  {"-c", "--upload-pack", "--receive-pack"},
+	"fd":   {"-x", "--exec", "-X", "--exec-batch"},
+	"rg":   {"--pre", "--hostname-bin"},
+	"xxd":  {"-r"},
 }
+
+// clusterVerbs take short flags bundled or with attached values, so "-ni",
+// "-i.bak", and "-oFILE" all carry the flag.
+var clusterVerbs = map[string]bool{"sed": true, "sort": true, "fd": true, "xxd": true}
+
+// hijackEnv names environment variables that make an allowed verb run
+// another program or load foreign code or config.
+var hijackEnv = regexp.MustCompile(
+	`^(PATH|PAGER|GIT_(SSH|SSH_COMMAND|PROXY_COMMAND|PAGER|EXTERNAL_DIFF|ASKPASS|EXEC_PATH|CONFIG[A-Z0-9_]*)|SSH_ASKPASS|LESS(OPEN|CLOSE)|LD_[A-Z_]+|DYLD_[A-Z_]+|BASH_ENV|RIPGREP_CONFIG_PATH|KUBECONFIG|GOFLAGS)=`,
+)
 
 var builtinJudge = judgeConfig{
 	Environment: []string{
@@ -98,6 +112,28 @@ var builtinJudge = judgeConfig{
 
 var credentialPattern = regexp.MustCompile(
 	`(?i)-----BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|xox[bap]-|sk-[A-Za-z0-9]{20}|(api[_-]?key|secret|token|password)\s*[:=]\s*['"]?[A-Za-z0-9+/_-]{16}`,
+)
+
+// credentialPath marks tokens naming secret files: reading them is read-only
+// but never safe to wave through statically. Case-insensitive because the
+// macOS filesystem is. The key-file basename must not start with "." so jq
+// filters like ".data.key" stay static.
+var credentialPath = regexp.MustCompile(
+	`(?i)(^|[/=])(\.ssh|\.gnupg|\.config/gopass)(/|$)|(^|[/=])\.aws/credentials|(^|[/=])(id_(rsa|dsa|ecdsa|ed25519)|\.netrc|\.npmrc|\.pypirc|\.zshenv|\.envrc|\.env(\.[^/]+)?)$|(^|[/=])[^./][^/]*\.(pem|key|keychain-db)$`,
+)
+
+// credentialGlob screens unquoted glob and brace tokens, which credentialPath
+// sees unexpanded. Globs skip dotfiles unless a component starts with a
+// literal ".", so that shape covers every hidden credential directory.
+var credentialGlob = regexp.MustCompile(
+	`(?i)(^|/)\.[^/]*[*?[{]|\.ss|id_|\.aws|\.gnupg|gopass|\.pem|\.key|netrc|keychain`,
+)
+
+const secretWords = `SECRET|TOKEN|KEY|PASS|AUTH|CRED|COOKIE|SESSION|DSN|DATABASE_URL`
+
+var (
+	secretEnvName = regexp.MustCompile(`(?i)` + secretWords)
+	secretEnvRef  = regexp.MustCompile(`(?i)\$\{?\w*(` + secretWords + `)`)
 )
 
 var scriptInterpreters = map[string]bool{
@@ -145,11 +181,13 @@ type hookInput struct {
 }
 
 type verdict struct {
-	Decision   string // "" means silence
-	Tier       string
-	Reason     string
-	Confidence float64
-	ScriptSHA  string
+	Decision      string // "" means silence
+	Tier          string
+	Reason        string
+	Confidence    float64
+	Probabilities map[string]float64
+	Model         string
+	ScriptSHA     string
 }
 
 func main() {
@@ -251,8 +289,9 @@ func decide(cfg *config, command, cwd string, lg *slog.Logger) verdict {
 	return judge(cfg, command, cwd, segments, lg)
 }
 
-// The bool reports constructs that defeat static reasoning:
-// substitution, redirection, heredocs, backgrounding.
+// The bool reports constructs that defeat static reasoning: substitution,
+// redirection, heredocs, backgrounding, hijacking env assignments, and
+// unquoted globs that could expand onto credential paths.
 func parseCommand(command string) ([][]string, bool) {
 	var segments [][]string
 	unsound := strings.ContainsAny(command, "`<>") || strings.Contains(command, "$(")
@@ -260,16 +299,23 @@ func parseCommand(command string) ([][]string, bool) {
 	var tokens []string
 	var tok strings.Builder
 	var quote byte
+	globbed := false
 	flushToken := func() {
 		if tok.Len() > 0 {
+			if globbed && credentialGlob.MatchString(tok.String()) {
+				unsound = true
+			}
 			tokens = append(tokens, tok.String())
 			tok.Reset()
 		}
+		globbed = false
 	}
 	flushSegment := func() {
 		flushToken()
 		if len(tokens) > 0 {
-			segments = append(segments, stripAssignments(tokens))
+			seg, hijacked := stripAssignments(tokens)
+			unsound = unsound || hijacked
+			segments = append(segments, seg)
 			tokens = nil
 		}
 	}
@@ -303,6 +349,7 @@ func parseCommand(command string) ([][]string, bool) {
 		case c == ' ' || c == '\t':
 			flushToken()
 		default:
+			globbed = globbed || strings.IndexByte("*?[{", c) >= 0
 			tok.WriteByte(c)
 		}
 	}
@@ -315,11 +362,13 @@ func parseCommand(command string) ([][]string, bool) {
 
 var assignmentPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
 
-func stripAssignments(tokens []string) []string {
+func stripAssignments(tokens []string) ([]string, bool) {
+	hijacked := false
 	for len(tokens) > 0 && assignmentPattern.MatchString(tokens[0]) {
+		hijacked = hijacked || hijackEnv.MatchString(tokens[0])
 		tokens = tokens[1:]
 	}
-	return tokens
+	return tokens, hijacked
 }
 
 func matchAny(rules []string, segments [][]string) string {
@@ -343,7 +392,7 @@ func allSegmentsAllowed(allowRules []string, segments [][]string) (string, bool)
 		if len(seg) == 0 {
 			return "", false
 		}
-		if hasDeniedFlag(seg) {
+		if hasDeniedFlag(seg) || exposesSecrets(seg) {
 			return "", false
 		}
 		rule := ""
@@ -368,9 +417,32 @@ func hasDeniedFlag(seg []string) bool {
 	}
 	for _, tok := range seg[1:] {
 		for _, f := range flags {
-			if tok == f || strings.HasPrefix(tok, f+"=") {
+			if flagMatches(seg[0], tok, f) {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+func flagMatches(verb, tok, flag string) bool {
+	switch {
+	case strings.HasPrefix(flag, "--"):
+		// getopt_long and git accept any unambiguous prefix of a long option.
+		name, _, _ := strings.Cut(tok, "=")
+		return len(name) > 2 && strings.HasPrefix(flag, name)
+	case len(flag) == 2 && clusterVerbs[verb]:
+		return len(tok) > 1 && tok[0] == '-' && tok[1] != '-' && strings.IndexByte(tok[1:], flag[1]) >= 0
+	default:
+		return tok == flag || strings.HasPrefix(tok, flag+"=")
+	}
+}
+
+func exposesSecrets(seg []string) bool {
+	for _, tok := range seg[1:] {
+		if credentialPath.MatchString(tok) || secretEnvRef.MatchString(tok) ||
+			(seg[0] == "printenv" && secretEnvName.MatchString(tok)) {
+			return true
 		}
 	}
 	return false
@@ -438,12 +510,16 @@ func judge(cfg *config, command, cwd string, segments [][]string, lg *slog.Logge
 	}
 	state["untrusted"] = untrusted
 
-	answer, confidence, err := askJev(cfg.Jev, cfg.Judge, state)
+	ans, model, err := askJev(cfg.Jev, cfg.Judge, state)
 	if err != nil {
 		lg.Warn("jev call failed", "err", err.Error())
 		return verdict{Tier: tierJudge, Reason: "jev unavailable"}
 	}
-	v := verdict{Tier: tierJudge, Confidence: confidence, ScriptSHA: script.SHA}
+	answer, confidence := ans.Choice, ans.Confidence
+	v := verdict{
+		Tier: tierJudge, Confidence: confidence, Probabilities: ans.Probabilities,
+		Model: model, ScriptSHA: script.SHA,
+	}
 	switch answer {
 	case decisionAllow:
 		if confidence < allowConfidenceFloor {
@@ -522,11 +598,18 @@ func probeScript(segments [][]string, cwd string) (scriptProbe, error) {
 }
 
 type jevAnswer struct {
-	Choice     string  `json:"choice"`
-	Confidence float64 `json:"confidence"`
+	Choice        string             `json:"choice"`
+	Confidence    float64            `json:"confidence"`
+	Probabilities map[string]float64 `json:"probabilities"`
 }
 
-func askJev(jc jevConfig, judgeCfg judgeConfig, state map[string]any) (string, float64, error) {
+type jevResponse struct {
+	Model   string               `json:"model"`
+	Answers map[string]jevAnswer `json:"answers"`
+}
+
+// askJev returns the resolved model name alongside the answer, for the log.
+func askJev(jc jevConfig, judgeCfg judgeConfig, state map[string]any) (jevAnswer, string, error) {
 	timeout := defaultJevTimeout
 	if jc.TimeoutMs > 0 {
 		timeout = time.Duration(jc.TimeoutMs) * time.Millisecond
@@ -536,7 +619,7 @@ func askJev(jc jevConfig, judgeCfg judgeConfig, state map[string]any) (string, f
 
 	key, err := fetchKey(ctx, jc.KeyCmd)
 	if err != nil {
-		return "", 0, err
+		return jevAnswer{}, "", err
 	}
 
 	body := map[string]any{
@@ -560,38 +643,36 @@ func askJev(jc jevConfig, judgeCfg judgeConfig, state map[string]any) (string, f
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
-		return "", 0, fmt.Errorf("encoding jev request: %w", err)
+		return jevAnswer{}, "", fmt.Errorf("encoding jev request: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, jevEndpoint, bytes.NewReader(payload))
 	if err != nil {
-		return "", 0, fmt.Errorf("building jev request: %w", err)
+		return jevAnswer{}, "", fmt.Errorf("building jev request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+key)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", 0, fmt.Errorf("calling jev: %w", err)
+		return jevAnswer{}, "", fmt.Errorf("calling jev: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", 0, fmt.Errorf("jev status %d: %w", resp.StatusCode, errJevRequest)
+		return jevAnswer{}, "", fmt.Errorf("jev status %d: %w", resp.StatusCode, errJevRequest)
 	}
-	var parsed struct {
-		Answers map[string]jevAnswer `json:"answers"`
-	}
+	var parsed jevResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&parsed); err != nil {
-		return "", 0, fmt.Errorf("decoding jev response: %w", err)
+		return jevAnswer{}, "", fmt.Errorf("decoding jev response: %w", err)
 	}
 	ans, ok := parsed.Answers["decision"]
 	if !ok {
-		return "", 0, errJevMalformed
+		return jevAnswer{}, "", errJevMalformed
 	}
 	switch ans.Choice {
 	case decisionAllow, decisionAsk, decisionDeny, decisionDefer:
-		return ans.Choice, ans.Confidence, nil
+		return ans, parsed.Model, nil
 	default:
-		return "", 0, errJevMalformed
+		return jevAnswer{}, "", errJevMalformed
 	}
 }
 
@@ -675,6 +756,12 @@ func logVerdict(lg *slog.Logger, v verdict, command string) {
 	}
 	if v.Confidence > 0 {
 		attrs = append(attrs, "confidence", v.Confidence)
+	}
+	if len(v.Probabilities) > 0 {
+		attrs = append(attrs, "probs", v.Probabilities)
+	}
+	if v.Model != "" {
+		attrs = append(attrs, "model", v.Model)
 	}
 	if v.ScriptSHA != "" {
 		attrs = append(attrs, "script_sha256", v.ScriptSHA)
