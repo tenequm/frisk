@@ -37,6 +37,16 @@ test-cov:
     gotestsum --format testname -- -race -coverprofile=coverage.out -covermode=atomic ./...
     go tool cover -func=coverage.out
 
+# Replay testdata/fixtures.jsonl through the built binary, judge off
+[group('test')]
+eval:
+    gotestsum --format standard-verbose -- -tags eval -run TestEvalFixtures -count=1 .
+
+# Same replay against the real config with the judge on (paid API calls)
+[group('test')]
+eval-live:
+    FRISK_EVAL_LIVE=1 FRISK_EVAL_XDG="${XDG_CONFIG_HOME:-$HOME/.config}" gotestsum --format standard-verbose -- -tags eval -run TestEvalFixtures -count=1 -timeout 60m .
+
 # Build the binary
 [group('build')]
 build:
