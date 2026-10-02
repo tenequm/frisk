@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.2.1](https://github.com/tenequm/frisk/compare/v0.2.0...v0.2.1) - 2026-10-02
+
+### <!-- 1 -->🎉 New Features
+- **static:** settle literal heredocs and screened stdin reads ([302c13a](https://github.com/tenequm/frisk/commit/302c13abc0d333693746794e893351add13bacab))
+
+### <!-- 2 -->🐛 Bug Fixes
+- **redact:** treat a name as secret only when it ends in a secret word ([366c823](https://github.com/tenequm/frisk/commit/366c823e129d985385149ee3a443ecb9ce2fdfb2))
+
+**Full Changelog**: https://github.com/tenequm/frisk/compare/v0.2.0...v0.2.1
+
 ## [0.2.0](https://github.com/tenequm/frisk/compare/v0.1.4...v0.2.0) - 2026-09-30
 
 ### <!-- 0 -->🛠 Breaking Changes
