@@ -356,7 +356,9 @@ The log is plaintext and lives for weeks, so text that comes from tool input -
 the command or file path, and a reason that quotes it - is redacted on the way
 in. `redactSecrets` swaps provider tokens, private key blocks, `Authorization`
 values, the values of secret-named flags, headers, assignments and JSON or YAML
-fields, URL, `curl -u` and netrc passwords, hex longer than 40 characters and
+fields (a name is secret when it ends in a secret word, like `API_KEY` or
+`authToken`, or in one and a short qualifier, like `TOKEN_RO` or `KEY_BASE`,
+not when one sits inside it, like `session_id`, `author` or `max_tokens`), URL, `curl -u` and netrc passwords, hex longer than 40 characters and
 high-entropy base64 for `[REDACTED:kind]`, and the record lists the kinds under
 `redacted`. The decision is always computed on the raw command. A value that is
 a variable, a substitution, a path, a number or one short word is not a secret

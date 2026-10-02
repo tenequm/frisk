@@ -3461,6 +3461,14 @@ const (
 	nameSep = `(?:[ \t]*:[ \t]*|=|[ \t]+=[ \t]*)`
 )
 
+// secretNameEnd is what a name ends in when its value is the secret, as a
+// secret flag's name does: API_KEY and authToken, not session_id, author or
+// secretName. A plural names a count or a list (max_tokens, sort_keys,
+// imagePullSecrets), except credentials. A short qualifier may follow the
+// word, as in TOKEN_RO, PASSWORD_PROD, KEY_BASE or TOKEN_2.
+const secretNameEnd = `(?:SECRET|SECRET_?ID|TOKEN|KEY|PASSWORD|PASSWD|PASS|AUTH|CREDS?|CREDENTIALS?|COOKIE|SESSION|DSN|DATABASE_URL)` +
+	`(?:[_-](?:RO|RW|BASE|PROD|STAGING|DEV|TEST|OLD|NEW|\d+))?`
+
 // redactRule replaces the capture group that matched, or the whole match when
 // the pattern has none.
 type redactRule struct {
@@ -3495,7 +3503,7 @@ var redactRules = []redactRule{
 	{kind: kindNamed, named: true, re: regexp.MustCompile(
 		`(?i)--[a-z0-9-]*(?:token|password|passwd|secret|api-?key)(?:=|[ \t]+)` + secretValue)},
 	{kind: kindNamed, named: true, re: regexp.MustCompile(
-		`(?i)\b[\w.-]*(?:` + secretWords + `)[\w.-]*(?:\\?["'])?` + nameSep + secretValue)},
+		`(?i)\b[\w.-]*(?:` + secretNameEnd + `)(?:\\?["'])?` + nameSep + secretValue)},
 	{kind: "long-hex", re: regexp.MustCompile(`\b[0-9A-Fa-f]{41,}\b`)},
 	{kind: "high-entropy", opaque: true, re: regexp.MustCompilePOSIX(base64Run.String() + `|[A-Za-z0-9_-]{40,}`)},
 }

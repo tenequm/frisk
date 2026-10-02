@@ -306,6 +306,13 @@ func TestRedactSecrets(t *testing.T) {
 		{"inline yaml", "cat > cfg.yaml <<EOF\nauth:\n  token: {S}\n  user: bob\nEOF", fakeSecret(alnumChars, 16), "named-secret"},
 		{"spaced assignment in code", "python3 -c \"api_key = '{S}'; run(api_key)\"", fakeSecret(alnumChars, 16), "named-secret"},
 		{"query parameter", "curl \"https://api.example.com/v1?user=bob&api_key={S}&page=2\"", fakeSecret(alnumChars, 16), "named-secret"},
+		{"secret id", "VAULT_SECRET_ID={S} vault write auth/approle/login", fakeSecret(alnumChars, 16), "named-secret"},
+		{"credentials", "GOOGLE_CREDENTIALS='{S}' ./deploy.sh", fakeSecret(alnumChars, 16), "named-secret"},
+		{"name ending in a secret word", "psql \"host=db sslpassword={S}\"", fakeSecret(alnumChars, 12), "named-secret"},
+		{"read-only qualifier", "AZME_TOKEN_RO={S} ./sync.sh", fakeSecret(alnumChars, 16), "named-secret"},
+		{"environment qualifier", "DB_PASSWORD_PROD={S} ./migrate.sh", fakeSecret(alnumChars, 16), "named-secret"},
+		{"base qualifier", "SECRET_KEY_BASE={S} rails s", fakeSecret(alnumChars, 16), "named-secret"},
+		{"numbered qualifier", "GITHUB_TOKEN_2={S} ./release.sh", fakeSecret(alnumChars, 16), "named-secret"},
 
 		{"url userinfo password", "psql postgres://app:{S}@db.internal:5432/app", fakeSecret(alnumChars, 12), "url-password"},
 		{"url password without a user", "redis-cli -u redis://:{S}@cache:6379", fakeSecret(alnumChars, 12), "url-password"},
@@ -372,6 +379,15 @@ func TestRedactSecretsLeavesNonSecrets(t *testing.T) {
 		{"prose", "echo \"gopass: stored the key\""},
 		{"url without a password", "DATABASE_URL=postgres://db.internal:5432/app ./run.sh"},
 		{"scp-style remote", "git clone git@github.com:owner/repo.git"},
+		{"secret word inside a name", "pond sql \"select * from parts where session_id='5335bfe0-37d1-40d4-93f5-0bed98fa030c'\""},
+		{"secret word starting a name", "gh api \"repos/o/r/commits?author=alice@example.com\""},
+		{"secret word starting a dotted name", "gcloud logging read 'protoPayload.authenticationInfo.principalEmail=\"bob@example.com\"'"},
+		{"name after a secret word", "echo \"secretName: grafana-tls-cert\""},
+		{"plural count behind a slash", "sed -e 's/max_output_tokens:65000/max_output_tokens:32000/' run.sh"},
+		{"plural list", "jq '.sort_keys=a-b' f.json"},
+		{"secret word mid-name", "git grep -n 'CACHE_KEY_VERSION: 3-beta'"},
+		{"secret word mid-name with a qualifier-like tail", "rg 'token_endpoint_auth_method: client_secret_basic' cfg"},
+		{"secret word starting a query name", "curl 'https://accounts.example.com/o?authuser=bob@example.com'"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
