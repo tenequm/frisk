@@ -71,14 +71,15 @@ const (
 	decisionDeny  = "deny"
 	decisionDefer = "defer"
 
-	verbAwk   = "awk"
-	verbEnv   = "env"
-	verbGH    = "gh"
-	verbGit   = "git"
-	verbPrint = "printf"
-	verbSed   = "sed"
-	verbUVRun = "uv run"
-	verbXXD   = "xxd"
+	verbAwk    = "awk"
+	verbEnv    = "env"
+	verbGH     = "gh"
+	verbGit    = "git"
+	verbPrint  = "printf"
+	verbSed    = "sed"
+	verbSource = "source"
+	verbUVRun  = "uv run"
+	verbXXD    = "xxd"
 )
 
 // defaultsMarker splices builtins into a judge list; a list without it
@@ -545,23 +546,34 @@ type word struct {
 type statement struct {
 	sep   string // operator before it: "" for the first, else ";", "&&", "||", "|" or "&"
 	words []word
-	cmd   int  // index of the first word that is not a leading NAME=value
-	data  bool // a heredoc body line no shell reads: deny and ask rules match it, the probe skips it
+	cmd   int // index of the first word that is not a leading NAME=value
+	// data is a heredoc body line no shell reads: deny and ask rules match it,
+	// the probe skips it and the static tier reads it as running nothing.
+	data bool
 	// unsound marks a construct that defeats static reasoning about this
-	// statement: a substitution, a parenthesis, an unsupported redirect,
-	// a heredoc, backgrounding, $'...' quoting, or a hijacking assignment.
+	// statement: a substitution, a parenthesis, an unsupported redirect, a
+	// heredoc that is not literal or that a program may run, backgrounding,
+	// $'...' quoting, or a hijacking assignment.
 	unsound bool
 }
 
 // heredocOp matches "<<" or "<<-" with its delimiter, quoted in part or whole.
-var heredocOp = regexp.MustCompile(`^<<(-?)[ \t]*((?:'[^']*'|"[^"]*"|\\.|[^\s;|&<>()'"\\])+)`)
+var heredocOp = regexp.MustCompile(`^<<(-?)[ \t]*((?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s;|&<>()'"\\])+)`)
 
-var heredocUnquote = strings.NewReplacer(`'`, "", `"`, "", `\`, "")
+// literalDelim is the one delimiter shape the static tier trusts to keep a
+// body literal: frisk, bash and zsh cannot read its terminator apart.
+var literalDelim = regexp.MustCompile(`^(?:'[\w.-]+'|"[\w.-]+"|\\[\w.-]+)$`)
 
 type heredoc struct {
-	delim string
-	tabs  bool // "<<-" strips leading tabs from the terminator line
-	owner int  // index of the statement the body is fed to
+	delim   string
+	tabs    bool // "<<-" strips leading tabs from the terminator line
+	literal bool // nothing in the body expands
+	owner   int  // index of the statement the body is fed to, -1 when it has no words
+	// body is the range of the body's statements. Those from line on come
+	// after the operator's line, where a trailing "|" (piped) carries it.
+	body  [2]int
+	line  int
+	piped bool
 }
 
 // heredocAt reads the heredoc operator at s[i] and returns its length, or 0
@@ -572,7 +584,37 @@ func heredocAt(s string, i int) (heredoc, int) {
 	if m == nil || strings.HasSuffix(s[:i], "<") || strings.Count(s[:i], "((") > strings.Count(s[:i], "))") {
 		return heredoc{}, 0
 	}
-	return heredoc{delim: heredocUnquote.Replace(m[2]), tabs: m[1] != ""}, len(m[0])
+	return heredoc{delim: heredocDelim(m[2]), tabs: m[1] != "", literal: literalDelim.MatchString(m[2])}, len(m[0])
+}
+
+// heredocDelim removes quotes as bash and zsh do, keeping a backslash inside
+// single quotes or before a plain byte inside double quotes. "$'...'" escapes
+// and "$\"...\"", which the shells read apart, stay undecoded: literalDelim
+// refuses both.
+func heredocDelim(raw string) string {
+	var b strings.Builder
+	for i := 0; i < len(raw); i++ {
+		switch c := raw[i]; {
+		case c == '\\' && i+1 < len(raw):
+			i++
+			b.WriteByte(raw[i])
+		case c == '$' && i+1 < len(raw) && (raw[i+1] == '\'' || raw[i+1] == '"'):
+		case c == '\'':
+			text, _, _ := strings.Cut(raw[i+1:], "'")
+			b.WriteString(text)
+			i += len(text) + 1
+		case c == '"':
+			for i++; i < len(raw) && raw[i] != '"'; i++ {
+				if raw[i] == '\\' && i+1 < len(raw) && strings.IndexByte("$`\"\\", raw[i+1]) >= 0 {
+					i++
+				}
+				b.WriteByte(raw[i])
+			}
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 type parsedCommand struct {
@@ -589,7 +631,7 @@ type parsedCommand struct {
 func tokenize(command string) parsedCommand {
 	var p parsedCommand
 	var words []word
-	var docs []heredoc
+	var docs, read []heredoc // pending on this line, and with their bodies read
 	var tok, exp strings.Builder
 	var quote byte
 	globbed, quoted, bare, dollarQuote, sep := false, false, false, false, ""
@@ -610,6 +652,11 @@ func tokenize(command string) parsedCommand {
 		if len(words) == 0 {
 			// zsh runs $NULLCMD for a redirect that has no command.
 			p.unsound = p.unsound || unsound || redirected
+			for n := range docs {
+				if docs[n].owner == len(p.stmts) {
+					docs[n].owner = -1
+				}
+			}
 			unsound, redirected = false, false
 			if sep == "" || sep == ";" {
 				sep = next
@@ -689,15 +736,27 @@ func tokenize(command string) parsedCommand {
 				i++
 				continue
 			}
-			unsound = true
+			// A file read on stdin is an operand the static tier screens; a
+			// here-string, a dup, "<>" and process substitution are not.
+			if c == '<' && !quoted && (tok.Len() == 0 || tok.String() == "0") && i+1 < len(command) && strings.IndexByte("<>&(", command[i+1]) < 0 {
+				tok.Reset()
+				exp.Reset()
+				words = append(words, word{text: "\x01<", exp: "\x01<"})
+				redirected = true
+				continue
+			}
 			if d, n := heredocAt(command, i); n > 0 {
+				// settleHeredocs decides whether the owner stays sound, once
+				// every statement that may read the body exists.
 				p.opaque = true
 				flushToken()
 				d.owner = len(p.stmts)
 				docs = append(docs, d)
+				redirected = true
 				i += n - 1
 				continue
 			}
+			unsound = true
 			write(c, true)
 		case c == '|' || c == ';' || c == '\n':
 			next := ";"
@@ -710,7 +769,8 @@ func tokenize(command string) parsedCommand {
 			}
 			flushStatement(next)
 			if c == '\n' && len(docs) > 0 {
-				rest := p.heredocBodies(docs, command[i+1:], sep)
+				rest := p.heredocBodies(docs, command[i+1:], sep == "|")
+				read = append(read, docs...)
 				docs, i = nil, len(command)-len(rest)-1
 			}
 		case c == '&':
@@ -757,6 +817,7 @@ func tokenize(command string) parsedCommand {
 		}
 	}
 	flushStatement("")
+	p.settleHeredocs(read)
 	// A \x01 of the command's own would pass for a marker the static tier
 	// sets on a redirect or a cd.
 	if quote != 0 || len(docs) > 0 || strings.IndexByte(command, '\x01') >= 0 {
@@ -814,41 +875,80 @@ func wordEnd(s string, j int) bool {
 
 // heredocBodies consumes the bodies that open s, one per pending operator, and
 // returns what follows the last terminator line. An unterminated body runs to
-// the end of the command.
-func (p *parsedCommand) heredocBodies(docs []heredoc, s, pendingSeparator string) string {
-	owners := len(p.stmts)
-	for _, d := range docs {
+// the end of the command. piped reports an operator line that ends in "|".
+func (p *parsedCommand) heredocBodies(docs []heredoc, s string, piped bool) string {
+	line := len(p.stmts)
+	for n := range docs {
+		d := &docs[n]
 		body := s
 		s = ""
 		for rest := body; rest != ""; {
-			line, after, _ := strings.Cut(rest, "\n")
+			text, after, _ := strings.Cut(rest, "\n")
 			if d.tabs {
-				line = strings.TrimLeft(line, "\t")
+				text = strings.TrimLeft(text, "\t")
 			}
-			if line == d.delim {
+			if text == d.delim {
 				body, s = body[:len(body)-len(rest)], after
 				break
 			}
 			rest = after
 		}
-		// The shell that reads the body may sit further down the owner's
-		// pipeline, as in "cat <<EOF | bash".
-		data := true
-		for j := d.owner; j < owners && (j == d.owner || p.stmts[j].sep == "|"); j++ {
-			data = data && !shellReadsStdin(p.stmts[j].tokens())
-		}
-		if data && pendingSeparator == "|" {
-			continuation := tokenize(s).stmts
-			data = len(continuation) == 0 || !shellReadsStdin(continuation[0].tokens())
-		}
 		// Tokenized apart, so a stray quote in the body cannot swallow the
 		// commands after it, and kept so deny and ask rules still see it.
-		for _, st := range tokenize(body).stmts {
-			st.data = st.data || data
-			p.stmts = append(p.stmts, st)
-		}
+		d.body[0] = len(p.stmts)
+		p.stmts = append(p.stmts, tokenize(body).stmts...)
+		d.body[1], d.line, d.piped = len(p.stmts), line, piped
 	}
 	return s
+}
+
+// settleHeredocs decides, once every statement exists, what each body is: data
+// unless a shell in the owner's pipeline reads it, as in "cat <<EOF | bash",
+// and input like any operand the owner's allow rule covers only when it is
+// literal and no stage may run it; otherwise the owner is unsound.
+func (p *parsedCommand) settleHeredocs(docs []heredoc) {
+	if len(docs) == 0 {
+		return
+	}
+	inBody := make([]bool, len(p.stmts))
+	for _, d := range docs {
+		for k := d.body[0]; k < d.body[1]; k++ {
+			inBody[k] = true
+		}
+	}
+	// Read back to front, each statement outside a body learns whether it or a
+	// later stage of its pipeline may run stdin or is a shell reading it, and
+	// where that pipeline ends: one pass however long a chain of bodies is.
+	runs, shell, end := make([]bool, len(p.stmts)), make([]bool, len(p.stmts)), make([]int, len(p.stmts))
+	next := -1
+	for j := len(p.stmts) - 1; j >= 0; j-- {
+		if inBody[j] {
+			continue
+		}
+		end[j] = j
+		// runsStdin covers every program shellReadsStdin names.
+		if seg := p.stmts[j].tokens(); runsStdin(seg) {
+			runs[j], shell[j] = true, shellReadsStdin(seg)
+		}
+		if next >= 0 && p.stmts[next].sep == "|" {
+			runs[j], shell[j], end[j] = runs[j] || runs[next], shell[j] || shell[next], end[next]
+		}
+		next = j
+	}
+	for _, d := range docs {
+		// A wordless owner already made the command unsound, and its body
+		// stays commands.
+		if d.owner < 0 {
+			continue
+		}
+		data := !shell[d.owner]
+		if !data || !d.literal || runs[d.owner] || d.piped && end[d.owner] < d.line {
+			p.stmts[d.owner].unsound = true
+		}
+		for k := d.body[0]; k < d.body[1]; k++ {
+			p.stmts[k].data = p.stmts[k].data || data
+		}
+	}
 }
 
 // shellReadsStdin reports whether seg runs a POSIX shell that takes its script
@@ -864,7 +964,7 @@ func shellReadsStdin(seg []string) bool {
 		return false
 	}
 	// source and "." run their operand in the current shell.
-	if len(inner) > 1 && (inner[0] == "source" || inner[0] == ".") {
+	if len(inner) > 1 && (inner[0] == verbSource || inner[0] == ".") {
 		return stdinPaths[inner[1]]
 	}
 	m := interpreterName.FindStringSubmatch(filepath.Base(inner[0]))
@@ -877,12 +977,31 @@ func shellReadsStdin(seg []string) bool {
 	return !found || strings.IndexAny(strings.TrimLeft(arg, "0123456789&"), "<>") == 0
 }
 
+// runsStdin reports a statement that may run what it reads on stdin: a shell
+// or an interpreter the probe knows, source or ".", any sudo or doas command,
+// a wrapper that hides its inner command, or none at all, as in a bare "exec"
+// whose redirect feeds the statements after it.
+func runsStdin(seg []string) bool {
+	inner, _, err := unwrap(seg)
+	return err != nil || len(inner) == 0 || inner[0] == "sudo" || inner[0] == "doas" ||
+		inner[0] == verbSource || inner[0] == "." || interpreterName.MatchString(filepath.Base(inner[0]))
+}
+
+// redirectMarks puts back the operators the tokenizer marked.
+var redirectMarks = strings.NewReplacer("\x01>", ">", "\x01<", "<")
+
+// redirectMark reports a word the tokenizer marked as a redirect operator,
+// which the "\x01cwd" staticSegments appends is not.
+func redirectMark(w string) bool {
+	return w == "\x01>" || w == "\x01<"
+}
+
 // tokens is the statement with leading assignments stripped and nothing
 // substituted.
 func (st statement) tokens() []string {
 	seg := make([]string, 0, len(st.words)-st.cmd)
 	for _, w := range st.words[st.cmd:] {
-		seg = append(seg, strings.ReplaceAll(w.text, "\x01>", ">"))
+		seg = append(seg, redirectMarks.Replace(w.text))
 	}
 	return seg
 }
@@ -909,19 +1028,25 @@ var braceExpansion = regexp.MustCompile(`\{[^{}]*(,|\.\.)[^{}]*\}`)
 func (p parsedCommand) staticLoops() (parsedCommand, bool) {
 	vars := p.literalVars()
 	var out []statement
+	// A loop beside heredoc text stays unsound: a body line reading "done"
+	// could end it early.
+	heredocText := slices.ContainsFunc(p.stmts, func(s statement) bool { return s.data })
 	for j := 0; j < len(p.stmts); j++ {
 		st := p.stmts[j]
 		if len(st.words) == 0 {
 			continue
 		}
 		verb := st.words[0].text
-		if verb != wordFor && verb != wordWhile && verb != wordUntil {
+		if st.data || verb != wordFor && verb != wordWhile && verb != wordUntil {
 			st.words = slices.Clone(st.words)
 			for n, w := range st.words {
 				st.words[n].exp = p.substitute(vars, j, w)
 			}
 			out = append(out, st)
 			continue
+		}
+		if heredocText {
+			return p, false
 		}
 		end := j + 1
 		bodyAt := -1
@@ -1043,8 +1168,16 @@ func (p parsedCommand) staticSegments() ([2][][]string, bool) {
 	}
 	var readings [2][][]string
 	sound := !q.unsound && loopsOK
-	controlled := slices.ContainsFunc(q.stmts, func(st statement) bool { return len(st.words) > st.cmd && controlWords[st.words[st.cmd].text] })
+	controlled := slices.ContainsFunc(q.stmts, func(st statement) bool {
+		return !st.data && len(st.words) > st.cmd && controlWords[st.words[st.cmd].text]
+	})
 	for j, st := range q.stmts {
+		// Heredoc text runs nothing; settleHeredocs left its owner unsound unless
+		// the text is literal and no program runs it.
+		if st.data {
+			readings[0], readings[1] = append(readings[0], []string{}), append(readings[1], []string{})
+			continue
+		}
 		sound = sound && !st.unsound
 		verbAt := st.cmd
 		for verbAt < len(st.words) && prefixWords[st.words[verbAt].text] {
@@ -1054,7 +1187,7 @@ func (p parsedCommand) staticSegments() ([2][][]string, bool) {
 		bash, zsh, runsInZsh := []string{}, []string{}, true
 		for k, w := range st.words {
 			text := q.substitute(vars, j, w)
-			if !w.quoted && strings.HasPrefix(text, "~/") && (k > 0 && st.words[k-1].text == "\x01>" || slices.Contains(bash, "tee") || slices.Contains(bash, "cd")) {
+			if !w.quoted && strings.HasPrefix(text, "~/") && (k > 0 && redirectMark(st.words[k-1].text) || slices.Contains(bash, "tee") || slices.Contains(bash, "cd")) {
 				home, err := os.UserHomeDir()
 				if err != nil {
 					sound = false
@@ -1098,7 +1231,7 @@ func (p parsedCommand) staticSegments() ([2][][]string, bool) {
 		if !runsInZsh {
 			// zsh still opens the redirects of a command it cannot find, and a
 			// redirect with no command behind it settles nothing.
-			sound = sound && !slices.Contains(zsh, "\x01>")
+			sound = sound && !slices.ContainsFunc(zsh, redirectMark)
 			zsh = []string{}
 		}
 		readings[0], readings[1] = append(readings[0], bash), append(readings[1], zsh)
@@ -1115,7 +1248,7 @@ func (p parsedCommand) staticSegments() ([2][][]string, bool) {
 				seg = seg[:0]
 			}
 			// A redirect ahead of the verb hides it from the checks below.
-			if len(seg) > 0 && (seg[0] == wordFor || seg[0] == "case" || seg[0] == wordSelect || seg[0] == wordFunction || seg[0] == "esac" || seg[0] == "}" || seg[0] == "\x01>") {
+			if len(seg) > 0 && (seg[0] == wordFor || seg[0] == "case" || seg[0] == wordSelect || seg[0] == wordFunction || seg[0] == "esac" || seg[0] == "}" || redirectMark(seg[0])) {
 				sound = false
 			}
 			if controlled && len(seg) > 0 && seg[0] == "cd" {
@@ -1143,9 +1276,7 @@ func unmarked(segs [][]string) [][]string {
 	for i, seg := range segs {
 		out[i] = []string{}
 		for _, w := range seg {
-			if w == "\x01>" {
-				w = ">"
-			}
+			w = redirectMarks.Replace(w)
 			if w != "\x01cwd" {
 				out[i] = append(out[i], w)
 			}
@@ -1211,7 +1342,7 @@ var (
 	// trap and alias can change a variable or a verb later on; setopt and
 	// emulate change how zsh expands every word.
 	opaqueVerbs = map[string]bool{
-		"eval": true, "source": true, wordFunction: true, "trap": true, "alias": true,
+		"eval": true, verbSource: true, wordFunction: true, "trap": true, "alias": true,
 		"setopt": true, "unsetopt": true, "emulate": true,
 	}
 )
@@ -1324,7 +1455,7 @@ func (p parsedCommand) probeSegments() [][]string {
 	for j, st := range p.stmts {
 		for k, w := range st.words[st.cmd:] {
 			if text := p.substitute(vars, j, w); w.quoted || !strings.ContainsAny(text, " \t") {
-				segs[j][k] = strings.ReplaceAll(strings.ReplaceAll(text, "\x00", "$"), "\x01>", ">")
+				segs[j][k] = redirectMarks.Replace(strings.ReplaceAll(text, "\x00", "$"))
 			}
 		}
 	}
@@ -1417,9 +1548,10 @@ func matchAny(rules []string, segments [][]string, allow ...bool) string {
 // screens only keep a rule from matching a form that is not what the rule
 // means. An empty segment runs nothing: a statement of assignments, which
 // staticSegments has screened, a command zsh would not find, or a word that
-// only shapes a loop or an if. A command made of those alone has no rule
-// behind it. A redirect or tee target needs an Edit rule instead, resolved
-// from cwd through the literal cds joined to it by "&&".
+// only shapes a loop or an if, or heredoc text. A command made of those alone
+// has no rule behind it. An output redirect or tee target needs an Edit rule
+// instead, resolved from cwd through the literal cds joined to it by "&&"; a
+// file read on stdin is screened as an operand.
 func allSegmentsAllowed(rules []string, cwd string, readings ...[][]string) (string, bool) {
 	var matched string
 	for _, segments := range readings {
@@ -1429,22 +1561,27 @@ func allSegmentsAllowed(rules []string, cwd string, readings ...[][]string) (str
 				continue
 			}
 			unknownAfter := slices.Contains(seg, "\x01cwd")
-			var command []string
+			var command, reads []string
 			for i := 0; i < len(seg); i++ {
-				if seg[i] == "\x01cwd" {
-					continue
-				}
-				if seg[i] == "\x01>" {
+				switch seg[i] {
+				case "\x01cwd":
+				case "\x01>":
 					if i+1 == len(seg) || !allowedWrite(rules, writeDir, seg[i+1]) {
 						return "", false
 					}
 					i++
-				} else {
+				case "\x01<":
+					if i+1 == len(seg) {
+						return "", false
+					}
+					reads = append(reads, seg[i+1])
+					i++
+				default:
 					command = append(command, seg[i])
 				}
 			}
 			seg = command
-			if len(seg) == 0 {
+			if len(seg) == 0 || len(reads) > 0 && (runsStdin(seg) || !allowedReads(dir, reads)) {
 				return "", false
 			}
 			if seg[0] == "tee" && len(seg) > 1 {
@@ -1501,10 +1638,18 @@ var (
 	}
 )
 
+// literalTarget reports a redirect target that names one known file. A "~"
+// left here is quoted, or a form staticSegments does not expand ("~", "~user",
+// "~+"), so where it points is not certain. bash opens a socket for the
+// network pseudo-paths.
+func literalTarget(target string) bool {
+	clean := filepath.Clean(target)
+	return target != "" && target[0] != '~' && !strings.ContainsAny(target, "$`*?[{\x00") &&
+		!strings.HasPrefix(clean, "/dev/tcp/") && !strings.HasPrefix(clean, "/dev/udp/")
+}
+
 func allowedWrite(rules []string, dir, target string) bool {
-	// A "~" left here is quoted or follows no verb staticSegments expands it
-	// for, so where it lands is not certain.
-	if target == "" || target[0] == '~' || strings.ContainsAny(target, "$`*?[{\x00") || slices.Contains(strings.Split(target, "/"), "..") {
+	if !literalTarget(target) || slices.Contains(strings.Split(target, "/"), "..") {
 		return false
 	}
 	if !filepath.IsAbs(target) {
@@ -1514,7 +1659,7 @@ func allowedWrite(rules []string, dir, target string) bool {
 		target = filepath.Join(dir, target)
 	}
 	target = filepath.Clean(target)
-	if credentialPath.MatchString(target) || strings.HasPrefix(target, "/dev/tcp/") || strings.HasPrefix(target, "/dev/udp/") {
+	if credentialPath.MatchString(target) || !literalTarget(target) {
 		return false
 	}
 	// This gate's own config and the binary running it are never written
@@ -1569,6 +1714,14 @@ func cdTarget(dir string, args []string) string {
 		return ""
 	}
 	return filepath.Join(dir, args[i])
+}
+
+// allowedReads screens files fed on stdin as an operand naming them would be:
+// a literal path that is no credential file.
+func allowedReads(dir string, targets []string) bool {
+	return !slices.ContainsFunc(targets, func(target string) bool {
+		return !literalTarget(target) || credentialPath.MatchString(target)
+	}) && !credentialUnder(dir, targets)
 }
 
 // credentialUnder reports a relative operand that names a credential file once

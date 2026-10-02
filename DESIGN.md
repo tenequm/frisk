@@ -26,11 +26,13 @@ parse into pipeline segments (|, &&, ||, ;, newline)
 2. permissions.ask   match -> "ask"
 3. permissions.allow: EVERY segment matches a rule
    and trips no screen (core ships no rules; bails on
-    $(), backticks, (), heredocs, &, # comments, brace
+    $(), backticks, (), heredocs other than a literal
+    one no program runs, &, # comments, brace
     lists, variables the command does not set to a
     literal or that are not $HOME or $TMPDIR, and
-    redirects other than stream merges, /dev/null or
-    literal writes covered by Edit rules; inside single quotes or escaped, all of
+    redirects other than stream merges, /dev/null,
+    screened stdin files or literal writes covered by
+    Edit rules; inside single quotes or escaped, all of
     these are text) -> "allow"
 4. judge (needs jev.keyCmd): one Choice question
      allow + confidence >= 0.75 -> "allow"
@@ -114,8 +116,9 @@ construct only where the shell reads it as one: `rg "=>" src` and
 quotes do not stop a substitution. A verb that takes program text reads those
 characters its own way, so its screen has to: awk's covers `>`, `>>`, `<` and
 `@load` besides `system`, pipes and `ENVIRON`; sed's script walker covers `w`
-and `e`; jq's module operators and yq's load operators read other files. Heredocs stay unsound
-whoever reads them.
+and `e`; jq's module operators and yq's load operators read other files. A heredoc
+stays unsound unless its body is literal and no program it feeds runs stdin
+(see the probe section below).
 
 A statement that is only assignments (`S=/tmp/x; cat $S/f`) runs nothing and
 needs no rule, but some other statement must match one. It is refused when the
@@ -232,6 +235,18 @@ stage of that statement's pipeline, as in `cat <<EOF | bash`. An operand of
 `.` reading one of those paths counts as that shell. Fed to anything
 else it is text: the probe takes no script and no `cd` from it, while
 `permissions.deny` and `permissions.ask` rules still match its lines.
+Its terminator is the delimiter after the quote removal bash and zsh share, so
+a backslash inside single quotes stays, as in `<<'a\b'`.
+The static tier lets a heredoc through only when its delimiter is one quoted
+word, `'EOF'`, `"EOF"` or `\EOF` made of letters, digits, `_`, `.` and `-`, so
+nothing in the body expands and no shell reads its end elsewhere; and when no
+statement it feeds, down the whole pipeline and past a trailing `|`, may run
+stdin as code: a shell, `python` or `node`, `source` or `.`, any `sudo` or
+`doas` command, a wrapper that hides its command, or no command at all, as in
+`exec <<EOF`, which feeds the statements after it. The body is then input like
+an operand the owner's allow rule already covers, and runs nothing. A command
+with heredoc text and a loop stays unsound: a body line reading `done` could
+end the loop early.
 `$HOME`, `${HOME}`, `$TMPDIR` and `${TMPDIR}` resolve from the hook process
 (home via `os.UserHomeDir`, TMPDIR via its environment), including in literal
 assignments. Empty values or values containing whitespace, glob characters,
@@ -446,7 +461,10 @@ list) never qualify, so a redirect cannot settle a write an Edit under the
 same rule would not. Target and ancestor symlinks, nonregular targets and shell network pseudo-paths
 are refused. On macOS, the system `/tmp`
 alias is checked as `/private/tmp`; the example config includes both scopes.
-Input redirects other than the existing `/dev/null` exception, here-strings,
-process substitution, clobber redirects and additional descriptor duplications
+An input redirect (`< file`, `0< file`) is screened like an operand naming the
+file: a literal path that is no credential file or network pseudo-path, also
+once joined to a literal `cd`, fed to a program that does not run stdin as code
+(the same list as for a heredoc). Here-strings, process
+substitution, `<>`, clobber redirects and additional descriptor duplications
 stay unsound. These rules grant no command permission: the command still needs
 its own Bash allow rule.

