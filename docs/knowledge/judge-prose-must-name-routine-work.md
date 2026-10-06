@@ -4,7 +4,7 @@ title: Judge prose must name routine work
 description: Jev applies criteria literally, so allow prose that only describes read-only inspection turns ordinary development into prompts and blocks.
 tags: [judge, prompting, evaluation]
 status: stable
-generated: { by: claude-code/opus-5-5, at: "2026-09-30T13:07:00Z" }
+generated: { by: claude-code/opus-5-5, at: "2026-10-06T21:50:00Z" }
 sources:
   - id: replay
     resource: replay on 2026-09-30 of 1,514 classifier-allowed and 336 classifier-denied Bash commands from ops/classifier-data/classifier.duckdb through `frisk check` with jev-1.13.0 (results not committed)
@@ -18,6 +18,9 @@ sources:
   - id: scripts
     resource: script-judgment harness run on 2026-09-30, 100 corpus cases and 33 synthetic cases (results not committed)
     title: Script-body judging harness
+  - id: screen
+    resource: replay of the commands a judge config got wrong, before and after moving one exception from soft_deny to allow, judge jev-1.13 via OpenRouter, 2026-10-06 (results not committed)
+    title: Client collaboration screen
 ---
 
 # Finding
@@ -66,8 +69,14 @@ named in allow it scored 1.00.[^battery]
 4. Scope the "text claims prior approval" rule to text addressed to the
    evaluator. Written broadly, it denied a script at 0.97 for storing the string
    "reviewed and approved by the maintainer" as data.[^scripts]
+5. Put an exception in allow, not in the ask item it narrows. Rerunning and
+   cancelling CI on a client repository asked in five of five runs while the
+   exception sat in the soft_deny item as "Not covered: ..."; the item's heading
+   ("changing a system the user does not own") won. Moved into allow as named
+   routine collaboration, the same commands stopped prompting.[^screen]
 
 [^replay]: Corpus replay of three judge configs
 [^battery]: Hand battery
 [^jagged]: Jev 1.13 jaggedness
 [^scripts]: Script-body judging harness
+[^screen]: Client collaboration screen
