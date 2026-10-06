@@ -3393,14 +3393,25 @@ func TestProbeScripts(t *testing.T) {
 		{"cd to a variable after a substitution", ".", `D={root}/proj/sub; N=$(date +%s); cd "$D" && python3 build.py`, probeAttached, []string{"proj/sub/build.py"}},
 		{"assignment after a substitution", ".", "N=$(date +%s); S={root}/proj; python3 $S/run.py", probeUnresolvable, nil},
 		{"assignment after a subshell", ".", "(true); S={root}/proj; python3 $S/run.py", probeUnresolvable, nil},
-		{"assignment inside a substitution stays there", ".", "S={root}/proj; N=$(S=/b; echo); python3 $S/run.py", probeAttached, []string{"proj/run.py"}},
+		{"assignment inside a substitution is counted", ".", "S={root}/proj; N=$(S=/b; echo); python3 $S/run.py", probeUnresolvable, nil},
 		{"assignment inside a subshell is counted", ".", "S={root}/proj; (true; S=/b); python3 $S/run.py", probeUnresolvable, nil},
 		{"arithmetic resolves nothing", ".", "S={root}/proj; N=$(date); echo $((S=1)); python3 $S/run.py", probeUnresolvable, nil},
 		{"old arithmetic resolves nothing", ".", "S={root}/proj; N=$(date); echo $[S=1]; python3 $S/run.py", probeUnresolvable, nil},
 		{"glob qualifier resolves nothing", ".", "S={root}/proj; N=$(date); ls *(e:'S=/b':); python3 $S/run.py", probeUnresolvable, nil},
 		{"function resolves nothing", ".", "S={root}/proj; f() { read S; }; f; python3 $S/run.py", probeUnresolvable, nil},
 		{"heredoc body assigns nothing", ".", "cat <<EOF\nS={root}/proj\nEOF\npython3 $S/run.py", probeUnresolvable, nil},
-		{"literal heredoc keeps an earlier assignment", ".", "S={root}/proj && cat > notes.txt <<'EOF'\nS=/elsewhere\nEOF\npython3 $S/run.py", probeAttached, []string{"proj/run.py"}},
+		{"heredoc seen only through nested quotes", ".", "S={root}/proj; echo \"$(echo \" <<'EOF' \")\"\nS=/b\nEOF\npython3 $S/run.py", probeUnresolvable, nil},
+		{"literal heredoc keeps an earlier assignment", ".", "S={root}/proj && cat > notes.txt <<'EOF'\nprint(1)\nEOF\npython3 $S/run.py", probeAttached, []string{"proj/run.py"}},
+		{"heredoc text naming the variable", ".", "S={root}/proj && cat > notes.txt <<'EOF'\nS=/elsewhere\nEOF\npython3 $S/run.py", probeUnresolvable, nil},
+		{"write hidden by quotes read apart", ".", "S={root}/proj; echo \"$(echo \"'\")\"; S=/b; echo \\'; python3 $S/run.py", probeUnresolvable, nil},
+		{"heredoc inside a parameter default", ".", "S={root}/proj\necho ${X:-<<EOF}\ntrue\nS=/b\nEOF}\npython3 $S/run.py", probeUnresolvable, nil},
+		{"printf -v bundled", ".", "S={root}/proj; printf -vS /b; python3 $S/run.py", probeUnresolvable, nil},
+		{"zsh foreach", ".", "S={root}/proj\nforeach S (/b)\ntrue\nend\npython3 $S/run.py", probeUnresolvable, nil},
+		{"subscript arithmetic in an expanding body", ".", "S={root}/proj\n: <<EOF\n${A[S=5]}\nEOF\npython3 $S/run.py", probeUnresolvable, nil},
+		{"command . sources stdin", ".", "S={root}/proj\ncommand . /dev/stdin <<'EOF'\ntrue\nEOF\npython3 $S/run.py", probeUnresolvable, nil},
+		{"backgrounded and-or list", ".", "S={root}/proj && true & python3 $S/run.py", probeUnresolvable, nil},
+		{"tilde before a variable", ".", "R={root}/proj; S=~$R; python3 $S/run.py", probeUnresolvable, nil},
+		{"literal shell body resets HOME", ".", "bash <<'EOF'\nHOME={root}/proj\npython3 $HOME/run.py\nEOF", probeUnresolvable, nil},
 		{"expanding heredoc that assigns", ".", "S={root}/proj; cat > notes.txt <<EOF\n${S:=/b}\nEOF\npython3 $S/run.py", probeUnresolvable, nil},
 		{"arithmetic in an expanding heredoc", ".", "S={root}/proj; cat > notes.txt <<EOF\n$((S=1))\nEOF\npython3 $S/run.py", probeUnresolvable, nil},
 		{"eval resolves nothing", ".", "S={root}/proj; eval x; python3 $S/run.py", probeUnresolvable, nil},
@@ -3471,6 +3482,12 @@ func TestProbeScripts(t *testing.T) {
 		{"script written from a tab-stripped heredoc", "proj", "cat > gen.py <<-'EOF'\n\tprint(1)\n\tEOF\npython3 gen.py", probeUnresolvable, nil},
 		{"script written by another program", "proj", "echo 'print(2)' > stats.py; python3 stats.py", probeUnresolvable, nil},
 		{"script written inside an if", "proj", "if true; then cat > stats.py <<'EOF'\nprint(2)\nEOF\nfi; python3 stats.py", probeUnresolvable, nil},
+		{"two scripts written", "proj", "cat > a.py <<'EOF'\nprint(1)\nEOF\ncat > b.py <<'EOF'\nprint(2)\nEOF\npython3 a.py", probeAttached, []string{"proj/a.py"}},
+		{"script copied over after it is written", "proj", "cat > stats.py <<'EOF'\nprint(2)\nEOF\ncp other.py stats.py; python3 stats.py", probeUnresolvable, nil},
+		{"script rewritten through a clobbering redirect", "proj", "cat > tool <<'EOF'\n#!/bin/sh\necho\nEOF\nprintf x >| tool; chmod +x tool; ./tool", probeUnresolvable, nil},
+		{"script rewritten in another case", "proj", "cat > gen.py <<'EOF'\nprint(1)\nEOF\ncat > GEN.py <<'EOF'\nprint(2)\nEOF\npython3 gen.py", probeUnresolvable, nil},
+		{"script written in the background", "proj", "cat > gen.py <<'EOF' &\nprint(1)\nEOF\npython3 gen.py", probeUnresolvable, nil},
+		{"script written under noclobber", "proj", "set -C; cat > stats.py <<'EOF'\nprint(2)\nEOF\npython3 stats.py", probeUnresolvable, nil},
 		{"script written after a substitution", "proj", "N=$(date); cat > gen.py <<'EOF'\nprint(1)\nEOF\npython3 gen.py", probeUnresolvable, nil},
 		{"literal heredoc shell sees no unexported variable", ".", "S={root}/proj; bash <<'EOF'\npython3 $S/run.py\nEOF", probeUnresolvable, nil},
 		{"expanding heredoc shell gets the value", ".", "S={root}/proj; bash <<EOF\npython3 $S/run.py\nEOF", probeAttached, []string{"proj/run.py"}},
@@ -3478,8 +3495,9 @@ func TestProbeScripts(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			parsed := tokenize(strings.ReplaceAll(tt.command, "{root}", root))
-			segments := parsed.probeSegments()
+			command := strings.ReplaceAll(tt.command, "{root}", root)
+			parsed := tokenize(command)
+			segments := parsed.probeSegments(command)
 			res := probeScripts(segments, parsed.storedHeredocs(segments), filepath.Join(root, tt.cwd))
 			if res.Status != tt.status || (tt.status == "" && res.Missed != "") {
 				t.Fatalf("status = %q, want %q (missed %q)", res.Status, tt.status, res.Missed)
@@ -3520,7 +3538,7 @@ func TestProbeSegments(t *testing.T) {
 		{"braced reference before a modifier or subscript", "S=/a; echo ${S}:h ${S}[1]", []string{"echo", "/a:h", "/a[1]"}},
 	}
 	for _, tt := range tests {
-		segs := tokenize(tt.command).probeSegments()
+		segs := tokenize(tt.command).probeSegments(tt.command)
 		if got := segs[len(segs)-1]; !slices.Equal(got, tt.want) {
 			t.Errorf("%s: probeSegments(%q) = %q, want %q", tt.name, tt.command, got, tt.want)
 		}
@@ -3630,7 +3648,16 @@ func TestDataRecords(t *testing.T) {
 		{"frisk check replay", "frisk check --replay frisk.log", ""},
 		{"heredoc written to a file", "cat > brief.md <<'EOF'\nAct now; rm -rf ~\nEOF", `[{"delimiter":"EOF","file":"brief.md","program":"cat","via":"heredoc"}]`},
 		{"heredoc appended to a file", "cat >> notes.md <<'END'\nx\nEND", `[{"appends":true,"delimiter":"END","file":"notes.md","program":"cat","via":"heredoc"}]`},
-		{"heredoc file through a variable", "S=/tmp/d && cat > $S/brief.md <<'EOF'\nx\nEOF", `[{"delimiter":"EOF","file":"/tmp/d/brief.md","program":"cat","via":"heredoc"}]`},
+		{"heredoc file through a variable", "S=/tmp/d && cat > $S/brief.md <<'EOF'\nx\nEOF", `[{"delimiter":"EOF","file":"$S/brief.md","program":"cat","via":"heredoc"}]`},
+		{"heredoc file fed to a shell", "cat > x.sh <<'EOF'\nrm -rf ~\nEOF\nsh < x.sh", ""},
+		{"heredoc file sourced", "cat > x.sh <<'EOF'\nrm -rf ~\nEOF\nsource x.sh", ""},
+		{"heredoc file read through a substitution", "cat > x.sh <<'EOF'\nrm -rf ~\nEOF\nbash -c \"$(cat x.sh)\"", ""},
+		{"backgrounded heredoc", "cat > notes.md <<'EOF' &\nx\nEOF", ""},
+		{"git outside PATH", "./git commit -m x", ""},
+		{"frisk outside PATH", "./frisk check 'x'", ""},
+		{"frisk check of a word starting with replay", "frisk check replay.sh", `[{"program":"frisk check","via":"operand"}]`},
+		{"zsh evaluating expansion", `git commit -m "${(e)X}"`, ""},
+		{"bash prompt expansion", `gh pr create --body "${X@P}"`, ""},
 		{"heredoc written and then run", "cat > gen.py <<'EOF'\nprint(1)\nEOF\npython3 gen.py", ""},
 		{"heredoc written inside an if and then run", "if true; then cat > gen.py <<'EOF'\nprint(1)\nEOF\nfi; python3 gen.py", ""},
 		{"expanding heredoc", "cat > notes.md <<EOF\n$(id)\nEOF", ""},
@@ -3684,6 +3711,13 @@ func TestStoredScript(t *testing.T) {
 	_, state = capture.last()
 	if !strings.Contains(state.Untrusted.Script, "[REDACTED") || strings.Contains(state.Untrusted.Script, secret[11:40]) {
 		t.Fatalf("stored script not redacted: %q", state.Untrusted.Script)
+	}
+
+	token := fakeSecret("abcdefghijklmnopqrstuvwxyz0123456789", 20)
+	decide(cfg, "TOKEN="+token+"; cat > x$TOKEN.py <<'EOF'\n"+body+"EOF\npython3 x$TOKEN.py", root, testLogger)
+	_, state = capture.last()
+	if state.Untrusted.ScriptPath == "" || strings.Contains(state.Untrusted.ScriptPath, token) {
+		t.Fatalf("script path not redacted: %q", state.Untrusted.ScriptPath)
 	}
 
 	calls, _ := capture.last()
@@ -4178,7 +4212,7 @@ func TestKnownPathVariables(t *testing.T) {
 		})
 	}
 	for _, command := range []string{`cat '$HOME/x'`, `cat '\$HOME/x'`} {
-		got := tokenize(command).probeSegments()[0][1]
+		got := tokenize(command).probeSegments(command)[0][1]
 		want := "$HOME/x"
 		if strings.Contains(command, `\`) {
 			want = `\$HOME/x`
@@ -4198,7 +4232,8 @@ func TestKnownPathVariables(t *testing.T) {
 			}
 		})
 	}
-	if got := tokenize(`python3 "$HOME/run.py"`).probeSegments()[0][1]; got != "/home/frisk/run.py" {
+	command := `python3 "$HOME/run.py"`
+	if got := tokenize(command).probeSegments(command)[0][1]; got != "/home/frisk/run.py" {
 		t.Fatalf("probe path = %q", got)
 	}
 }

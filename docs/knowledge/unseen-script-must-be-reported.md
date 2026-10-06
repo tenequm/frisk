@@ -54,7 +54,8 @@ screen.[^scripts]
    run it in the same command (`S=/tmp/x; cat > $S/a.py <<'EOF' ... EOF;
    python3 $S/a.py`); unresolved, these were the largest single source of
    unwanted prompts in the labeled evaluation.[^eval831] The probe follows the
-   variable, takes the body from a literal heredoc written with `cat >`, and
+   variable, takes the body from a literal heredoc written with `cat >` when
+   nothing but `chmod` or `cd` comes between the write and the run, and
    reports any other earlier write as unresolvable rather than attaching
    what the disk held before.
 

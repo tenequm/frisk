@@ -76,9 +76,9 @@ with that prose dropped it allowed a forced push to a default branch.[^eval]
   earlier segment of the same command may have changed are reported as
   `unknown`: a push that goes by the checked-out branch after a `switch`, a
   discard's file counts after anything but a `cd` or a git read.
-- A discard record counts what the command could destroy, and only that is
-  reported: a `clean` with `-x` or `-X` also carries `ignored_files`, since
-  `-x` deletes ignored files along with untracked ones and `-X` only them.
+- A discard record counts what the command could destroy: a `clean` with
+  `-x` or `-X` also carries `ignored_files`, since `-x` deletes ignored files
+  along with untracked ones and `-X` only them.
 - The same split covers text a command does not run. Commit messages, PR
   bodies, briefs written through a heredoc and the commands given to
   `frisk check` were read by the judge as actions, a leading cause of
@@ -87,8 +87,9 @@ with that prose dropped it allowed a forced push to a default branch.[^eval]
   flag or heredoc delimiter, never a copy of the text) and the prose says
   what to do with it. Core lists only what it can settle from the words: a
   value in a statement with no substitution before it, a literal heredoc fed
-  to `cat` into a file or to git as a message. A heredoc fed to `ssh`, an
-  interpreter or any other program that may run it stays unlisted.
+  to `cat` into a file no other statement names or to git as a message. A
+  heredoc fed to `ssh`, an interpreter or any other program that may run it
+  stays unlisted, and the instruction says a listed file may still run later.
 - The same understanding serves the user's own rules: a git rule matches the
   command git runs, not its spelling. Global options such as `-C dir` are set
   aside, flags match anywhere with short, long and bundled forms unified, and
