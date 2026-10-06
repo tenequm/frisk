@@ -382,7 +382,7 @@ where it is built, so `frisk check` and the permission prompt show the same text
 
 - `frisk hook` - the PreToolUse handler
 - `frisk check '<command>'` - dry-run, prints decision + tier + reason
-- `frisk check --replay <capture-file>` - judge a captured state again, see below
+- `frisk check --replay <log-file>` - judge logged requests again, see below
 - `frisk validate [--live]` - config health check, see below
 
 ```json
@@ -398,7 +398,7 @@ where it is built, so `frisk check` and the permission prompt show the same text
 
 Uninstall = remove the hook entry.
 
-## Capture and replay
+## Debug log and replay
 
 The log keeps the command and the verdict, not what the judge was shown. A
 replay through `frisk check` rebuilds the trusted state from the replaying
@@ -406,22 +406,25 @@ machine: today's branch and remotes, and a probe that finds most scripts gone,
 so its verdicts skew toward ask
 ([finding](docs/knowledge/replays-are-skewed-by-trusted-state.md)).
 
-`--capture <dir>` on `hook` and `check` writes one file per answered judge
-call, `<UTC time>-<8 hex of sha256(command)>.json`: time, entry, the command as
-sent, cwd, endpoint and model, the request body byte for byte, the parsed
-answers and the final verdict. It holds only what the request already carried,
-redacted and screened as sent; never the key or the `apiKey` expression, and an
-endpoint's userinfo is masked. A capture holds command text and script bodies,
-so it is a command-line option only - no config key, nothing from the
-environment - written where the user points it, directory `0700`, file `0600`,
-never over an existing file. A failure to write is logged and changes nothing.
+`--log-level debug` on `hook` or `check` adds two fields to the verdict line of
+every answered judge call: `request`, the body as sent (already redacted and
+screened, embedded as an object), and `answers`, the parsed answers with the
+response's model and usage. The key rides only in a header and is never
+logged. The level is a command-line option only - no config key, nothing from
+the environment - because a debug line holds command text and script bodies.
+Lines run roughly 5-12 KB each, so debug is for evaluation periods; the log is
+already `0600`.
 
-`frisk check --replay <file>` sends the captured `state` unchanged and builds
-the questions from the current `judge` prose, then applies the same floors and
-`judge.decisions` as a live call. With `--capture` the replay is captured too,
-so two configs or models can be compared on the same inputs. A file without a
-request state exits 1 with `silent replay-error`. The reason carries no
-"script not attached" note: that comes from the probe, which a replay skips.
+`frisk check --replay <file>` (`-` for stdin) reads JSONL such as `frisk.log`
+or an excerpt and, for every line with a `request`, sends its `state` unchanged
+with questions built from the current `judge` prose, then applies the same
+floors and `judge.decisions` as a live call. It prints one `decision tier
+reason` line per replayed record in input order, then `replayed N, skipped M`;
+lines without a request state, malformed ones included, are skipped. With
+`--log-level debug` each replay is logged with its own request, so two configs
+or models can be compared on the same inputs. An unreadable file exits 1 with
+`silent replay-error`. The reason carries no "script not attached" note: that
+comes from the probe, which a replay skips.
 
 ## File tools
 

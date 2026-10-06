@@ -59,10 +59,11 @@ included.
   closest prose rule. Tier `no-judge` means `backend.apiKey` is unset; reason
   `judge unavailable` means the key or the endpoint failed (the log line says
   which).
-- To compare judge prose or models faithfully, add `--capture <dir>` to the
-  hook command, then `frisk check --replay <file>` per capture. A replay sends
-  the state the judge first saw; a plain `frisk check` re-reads today's git
-  and scripts and skews toward ask. Captures hold command text: keep them private.
+- To compare judge prose or models faithfully, add `--log-level debug` to the
+  hook command for an evaluation period, then `frisk check --replay <file>` on
+  `frisk.log` or an excerpt. A replay sends the state the judge first saw; a
+  plain `frisk check` re-reads today's git and scripts and skews toward ask.
+  Debug lines are large and hold command text and script bodies.
 
 Not config problems: the judge confidence floors (allow needs >= 0.75, deny
 and ask >= 0.50) and the guardrails that always ask (frisk's own config and
