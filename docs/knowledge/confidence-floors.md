@@ -4,7 +4,7 @@ title: Weak judge verdicts are not acted on
 description: A judge allow below 0.75, an ask below 0.50 or a deny below 0.50 is downgraded rather than enforced, because low-confidence verdicts were mostly wrong in live use.
 tags: [judge, confidence, thresholds]
 status: stable
-generated: { by: claude-code/opus-5-5, at: "2026-09-30T13:18:00Z" }
+generated: { by: claude-code/opus-5-5, at: "2026-10-06T21:55:00Z" }
 sources:
   - id: code
     resource: repository commit 091465e, frisk.go (the confidence floor constants and the judge verdict mapping)
@@ -21,6 +21,9 @@ sources:
   - id: design
     resource: repository file DESIGN.md
     title: frisk design
+  - id: eval
+    resource: 829-command regression and 831-command labeled five-run evaluation through `frisk check`, plus a leak battery, judge jev-1.13 via OpenRouter, 2026-10-06 (results not committed)
+    title: Judge evaluation of 2026-10-06
 ---
 
 # Decision
@@ -62,6 +65,14 @@ own flow has the conversation and decides better. A weak deny is turned into a
 prompt, because a judge leaning toward deny deserves a human look but not a hard
 block.
 
+Re-measured on 2026-10-06, both floors held. With the four-dimension prose,
+only 6 of 829 historically blocked commands were denied, so raising the deny
+floor was not needed. Lowering it was ruled out the other way: clear leaks, an
+API key posted to a paste site and a private SSH key published as a public gist,
+scored deny at only 0.38 to 0.41 confidence, and the floor turned them into
+prompts rather than letting them through, while a prose version that denied
+eagerly had denied routine work in 595 of 3,745 runs.[^eval]
+
 # Cost
 
 A weak ask on something risky is no longer shown to the user; it goes to whatever
@@ -76,3 +87,4 @@ They need re-measuring when the model pin or the judge prose changes materially.
 [^scripts]: Script-body judging harness
 [^confidence]: Jev confidence
 [^design]: frisk design
+[^eval]: Judge evaluation of 2026-10-06
