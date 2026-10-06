@@ -55,7 +55,17 @@ Conventions:
   chains out of allow as into it, at 1.8 times the judge calls, and loses the
   context that links the pieces.
 
+- [Judge prose is a few tests over four risk dimensions](judge-rules-four-dimensions.md) -
+  The judge lists are written as tests over ownership, recoverability, secret
+  exposure and gate integrity, within a fixed item and word budget, because
+  topic-word rules and carve-out lists both failed on the regression set.
+
 ## Findings
+
+- [Static allow rules are a speed cache with a ceiling near half of all calls](static-allow-is-a-speed-cache.md) -
+  A few dozen high-volume rules settle about half of real Bash calls; most of the
+  rest have a shape no static rule can settle, so the judge prose, not the allow
+  list, decides the interruption rate.
 
 - [Judge prose must name routine work](judge-prose-must-name-routine-work.md) - Jev
   applies criteria literally, so allow prose that only describes read-only
