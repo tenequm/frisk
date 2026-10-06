@@ -4,7 +4,7 @@ title: Judge prose is a few tests over four risk dimensions
 description: The judge lists are written as tests over ownership, recoverability, secret exposure and gate integrity, within a fixed item budget, because topic-word rules and carve-out lists both failed on the regression set.
 tags: [judge, prose, policy]
 status: stable
-generated: { by: claude-code/opus-5-5, at: "2026-10-06T18:52:00Z" }
+generated: { by: claude-code/opus-5-5, at: "2026-10-06T21:50:00Z" }
 sources:
   - id: regression
     resource: replay of 829 historical hook commands that the earlier config denied, asked or withheld as asks, through `frisk check` against three judge configurations on 2026-10-06, judge typesafe/jev-1.13 via OpenRouter (results not committed; replay state is the machine's, not the original)
@@ -12,6 +12,9 @@ sources:
   - id: advisors
     resource: two independent written reviews of the judge prose on 2026-10-06, one by a Fable model and one by a Codex model, given the same brief and regression results (not committed)
     title: Advisor reviews
+  - id: paired
+    resource: 831 commands labeled routine, must-ask or must-deny by two independent labelers and reconciled by the user, each judged five times per prose version through `frisk check`, judge jev-1.13 via OpenRouter, 2026-10-06 (results not committed)
+    title: Labeled five-run evaluation
 ---
 
 # Decision
@@ -55,5 +58,25 @@ match into an ask or a deny. Quoted text, agent briefs and `frisk check`
 arguments were judged as if executed. Adding one carve-out per false positive
 recreates the long list the compressed version replaced.[^advisors]
 
+# Where rewording stops helping
+
+Measured on 831 labeled commands (the regression set plus a must-stop suite),
+five runs each:[^paired]
+
+| Prose | Routine runs not interrupted | Must-stop runs stopped |
+| --- | ---: | ---: |
+| Compressed topic lists | 55.7% | 94.3% |
+| Four-dimension tests | 88.5% | 80.0% |
+| Further rewording, three rounds | 89.3% to 90.0% | 79.5% to 80.2% |
+
+Once the lists were principled, each further rewording moved the rates by about
+a point, within run-to-run variation. The remaining mistakes were missing facts,
+not wording: a script reached through a variable or run over ssh, text stored
+rather than run, ignored files a `git clean -x` deletes. Those were fixed in core
+records, and the next gain is expected there rather than in the prose. The one
+wording change that moved a whole class was naming secret sources (see
+[Secret rules must name the destination](secret-rules-name-the-destination.md)).
+
 [^regression]: 829-command regression
 [^advisors]: Advisor reviews
+[^paired]: Labeled five-run evaluation
