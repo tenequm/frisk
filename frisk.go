@@ -406,9 +406,6 @@ type config struct {
 	Jev         *jevConfig        `json:"jev"`
 	// flagged names the options a command-line flag set, for validate's report.
 	flagged map[string]bool
-	// captureDir is set only by --capture: where command text gets written is
-	// the hook command's choice, never the file's or a repository's environment.
-	captureDir string
 }
 
 type toolInput struct {
@@ -437,9 +434,12 @@ type verdict struct {
 	AskRule       jevAnswer
 	DenyRule      jevAnswer
 	Tool          string
-	Entry         string        // "hook" or "check"
-	Usage         *jevUsage     // nil when the judge did not run or reported none
-	capture       *judgeCapture // nil unless the judge answered
+	Entry         string    // "hook" or "check"
+	Usage         *jevUsage // nil when the judge did not run or reported none
+	// Request and Answers are set only when the judge answered; the debug log
+	// keeps them so a replay can send the same state again.
+	Request json.RawMessage
+	Answers *jevResult
 }
 
 func main() {
@@ -464,7 +464,8 @@ func run(args []string, stdin io.Reader, stdout io.Writer) int {
 		return 2
 	}
 
-	lg := newLogger()
+	level := new(slog.LevelVar)
+	lg := newLogger(level)
 	cfg, cfgErr := loadConfig()
 	flags := goflag.NewFlagSet("frisk "+args[0], goflag.ContinueOnError)
 	flags.SetOutput(stdout)
@@ -478,10 +479,22 @@ func run(args []string, stdin io.Reader, stdout io.Writer) int {
 	if args[0] == cmdValidate {
 		flags.BoolVar(&live, "live", false, "also make one real judge call")
 	} else {
-		flags.StringVar(&cfg.captureDir, "capture", "", "directory to write one JSON file per judge call into")
+		// Command line only: a debug line holds command text and script bodies,
+		// so turning it on is the hook command's choice, never a repository's.
+		flags.Func("log-level", "info, or debug to add each judge request and answers to its verdict line", func(v string) error {
+			switch v {
+			case "info":
+				level.Set(slog.LevelInfo)
+			case "debug":
+				level.Set(slog.LevelDebug)
+			default:
+				return fmt.Errorf("%q: %w", v, errLogLevel)
+			}
+			return nil
+		})
 	}
 	if args[0] == cmdCheck {
-		flags.StringVar(&replay, "replay", "", "judge a capture file's state again with the current config")
+		flags.StringVar(&replay, "replay", "", "judge again every request logged in this JSONL file (- for stdin) with the current config")
 	}
 	if err := flags.Parse(args[1:]); err != nil {
 		if args[0] == cmdHook {
@@ -504,10 +517,13 @@ func run(args []string, stdin io.Reader, stdout io.Writer) int {
 		return runHook(cfg, cfgErr, stdin, stdout, lg)
 	case cmdCheck:
 		if (flags.NArg() == 0) == (replay == "") {
-			fmt.Fprintln(stdout, "usage: frisk check [flags] '<command>' | frisk check [flags] --replay <capture-file>")
+			fmt.Fprintln(stdout, "usage: frisk check [flags] '<command>' | frisk check [flags] --replay <log-file>")
 			return 2
 		}
-		return runCheck(cfg, cfgErr, strings.Join(flags.Args(), " "), replay, stdout, lg)
+		if replay != "" {
+			return runReplay(cfg, cfgErr, replay, stdin, stdout, lg)
+		}
+		return runCheck(cfg, cfgErr, strings.Join(flags.Args(), " "), stdout, lg)
 	default:
 		if flags.NArg() > 0 {
 			fmt.Fprintln(stdout, "usage: frisk validate [--live] [flags]")
@@ -589,7 +605,6 @@ func runHook(cfg *config, cfgErr error, stdin io.Reader, stdout io.Writer, lg *s
 	}
 	v.Tool, v.Entry = in.ToolName, cmdHook
 	logVerdict(lg, v, subject)
-	writeCapture(cfg.captureDir, v, lg)
 	if v.Decision == "" {
 		return 0
 	}
@@ -606,32 +621,72 @@ func runHook(cfg *config, cfgErr error, stdin io.Reader, stdout io.Writer, lg *s
 	return 0
 }
 
-// runCheck judges command, or with replay set the state captured in that file.
-func runCheck(cfg *config, cfgErr error, command, replay string, stdout io.Writer, lg *slog.Logger) int {
+func runCheck(cfg *config, cfgErr error, command string, stdout io.Writer, lg *slog.Logger) int {
 	if cfgErr != nil {
 		fmt.Fprintf(stdout, "silent config-error %s\n", cfgErr.Error())
 		return 1
 	}
-	var v verdict
-	subject := command
-	if replay == "" {
-		cwd, _ := os.Getwd()
-		v = decide(cfg, command, cwd, lg)
-	} else {
-		var err error
-		if v, subject, err = replayCapture(cfg, replay, lg); err != nil {
-			fmt.Fprintf(stdout, "silent replay-error %s\n", err.Error())
-			return 1
-		}
-	}
+	cwd, _ := os.Getwd()
+	v := decide(cfg, command, cwd, lg)
 	v.Entry = cmdCheck
-	logVerdict(lg, v, subject)
-	writeCapture(cfg.captureDir, v, lg)
-	decision := v.Decision
-	if decision == "" {
-		decision = "silent"
+	logVerdict(lg, v, command)
+	fmt.Fprintf(stdout, "%-6s %-10s %s\n", cmp.Or(v.Decision, "silent"), v.Tier, v.Reason)
+	return 0
+}
+
+// runReplay judges again every request a debug log recorded, sending its state
+// as logged: a fresh `frisk check` would read today's git facts and scripts
+// instead. The questions, floors and decisions come from the current config.
+func runReplay(cfg *config, cfgErr error, path string, stdin io.Reader, stdout io.Writer, lg *slog.Logger) int {
+	if cfgErr != nil {
+		fmt.Fprintf(stdout, "silent config-error %s\n", cfgErr.Error())
+		return 1
 	}
-	fmt.Fprintf(stdout, "%-6s %-10s %s\n", decision, v.Tier, v.Reason)
+	// Read whole first: a debug replay of frisk.log appends to the file it reads.
+	var data []byte
+	var err error
+	if path == "-" {
+		data, err = io.ReadAll(stdin)
+	} else {
+		data, err = os.ReadFile(filepath.Clean(path))
+	}
+	if err != nil {
+		fmt.Fprintf(stdout, "silent replay-error %s\n", err.Error())
+		return 1
+	}
+	replayed, skipped := 0, 0
+	for line := range bytes.Lines(data) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var rec struct {
+			Command string          `json:"command"`
+			Request json.RawMessage `json:"request"`
+		}
+		if json.Unmarshal(line, &rec) != nil {
+			skipped++
+			continue
+		}
+		var req struct {
+			State map[string]any `json:"state"`
+		}
+		// Numbers stay as written, so the state goes out as it was logged.
+		dec := json.NewDecoder(bytes.NewReader(rec.Request))
+		dec.UseNumber()
+		if dec.Decode(&req) != nil || len(req.State) == 0 {
+			skipped++
+			continue
+		}
+		v := verdict{Tier: "no-judge", Reason: "no backend.apiKey configured"}
+		if cfg.Backend.APIKey != "" {
+			v = askJudge(cfg, req.State, verdict{Tier: tierJudge}, "", lg)
+		}
+		v.Entry = cmdCheck
+		logVerdict(lg, v, rec.Command)
+		fmt.Fprintf(stdout, "%-6s %-10s %s\n", cmp.Or(v.Decision, "silent"), v.Tier, v.Reason)
+		replayed++
+	}
+	fmt.Fprintf(stdout, "replayed %d, skipped %d\n", replayed, skipped)
 	return 0
 }
 
@@ -2353,7 +2408,7 @@ func judge(cfg *config, command, cwd string, parsed parsedCommand, lg *slog.Logg
 	if len(redactions) > 0 {
 		state["redactions"] = redactions
 	}
-	return askJudge(cfg, state, judgeCapture{Command: sent, Cwd: cwd}, v, probe.Missed, lg)
+	return askJudge(cfg, state, v, probe.Missed, lg)
 }
 
 // judgeRules splices the builtin prose into the judge lists.
@@ -2367,9 +2422,9 @@ func judgeRules(cfg *config) judgeConfig {
 }
 
 // askJudge asks about a finished state and maps the answer through the floors
-// and judge.decisions. A replay brings its state from a capture instead of the
+// and judge.decisions. A replay brings its state from the log instead of the
 // machine, so both are judged by the same current prose, floors and backend.
-func askJudge(cfg *config, state map[string]any, call judgeCapture, v verdict, missed string, lg *slog.Logger) verdict {
+func askJudge(cfg *config, state map[string]any, v verdict, missed string, lg *slog.Logger) verdict {
 	rules := judgeRules(cfg)
 	payload, err := judgeRequest(cfg.Backend.Model, rules, state)
 	var res jevResult
@@ -2381,10 +2436,7 @@ func askJudge(cfg *config, state map[string]any, call judgeCapture, v verdict, m
 		v.Reason = "judge unavailable"
 		return v
 	}
-	call.Time = time.Now().UTC()
-	call.Endpoint, call.Model = redactURL(cfg.Backend.endpoint()), cfg.Backend.Model
-	call.Request, call.Answers = payload, res
-	v.capture = &call
+	v.Request, v.Answers = payload, &res
 	ans := res.Decision
 	v.Confidence, v.Probabilities, v.Model = ans.Confidence, ans.Probabilities, res.Model
 	v.AskRule, v.DenyRule = res.AskRule, res.DenyRule
@@ -3560,99 +3612,6 @@ type jevResult struct {
 	Usage    *jevUsage `json:"usage,omitempty"`
 }
 
-// judgeCapture is one answered judge call, kept so it can be replayed against
-// other prose or another model with the trusted state it was judged with: a
-// fresh `frisk check` would read today's git facts and scripts instead. It
-// holds only what the request already carried, never the key or its expression.
-type judgeCapture struct {
-	Time     time.Time       `json:"time"`
-	Entry    string          `json:"entry"`
-	Command  string          `json:"command"`
-	Cwd      string          `json:"cwd"`
-	Endpoint string          `json:"endpoint"`
-	Model    string          `json:"model"`
-	Request  json.RawMessage `json:"request"`
-	Answers  jevResult       `json:"answers"`
-	Verdict  captureVerdict  `json:"verdict"`
-}
-
-type captureVerdict struct {
-	Decision string `json:"decision"`
-	Tier     string `json:"tier"`
-	Reason   string `json:"reason"`
-}
-
-var errCaptureState = errors.New("not a frisk capture: no request state")
-
-// writeCapture files one capture per judge call. A failure is only logged:
-// the verdict is already settled and the hook stays silent.
-func writeCapture(dir string, v verdict, lg *slog.Logger) {
-	if dir == "" || v.capture == nil {
-		return
-	}
-	c := *v.capture
-	c.Entry = v.Entry
-	c.Verdict.Decision, c.Verdict.Tier = cmp.Or(v.Decision, "silent"), v.Tier
-	c.Verdict.Reason, _ = redactSecrets(v.Reason)
-	// Not indented, so the request stays byte for byte what was sent.
-	data, err := json.Marshal(c)
-	if err != nil {
-		lg.Warn("capture not written", "err", err.Error())
-		return
-	}
-	sum := sha256.Sum256([]byte(c.Command))
-	name := c.Time.Format("20060102T150405.000000000Z") + "-" + hex.EncodeToString(sum[:4]) + ".json"
-	if err = os.MkdirAll(dir, 0o700); err != nil {
-		lg.Warn("capture not written", "err", err.Error())
-		return
-	}
-	// O_EXCL: a capture holds command text, so it never lands in a file someone
-	// else created or linked there first.
-	f, err := os.OpenFile(filepath.Join(dir, name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		lg.Warn("capture not written", "err", err.Error())
-		return
-	}
-	_, err = f.Write(append(data, '\n'))
-	if closeErr := f.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		lg.Warn("capture not written", "err", err.Error())
-	}
-}
-
-// replayCapture judges a captured state again, exactly as captured, with the
-// current prose, decisions, floors and backend. It returns the captured command
-// for the log.
-func replayCapture(cfg *config, path string, lg *slog.Logger) (verdict, string, error) {
-	data, err := os.ReadFile(filepath.Clean(path))
-	if err != nil {
-		return verdict{}, "", fmt.Errorf("reading capture: %w", err)
-	}
-	var c judgeCapture
-	if err := json.Unmarshal(data, &c); err != nil {
-		return verdict{}, "", fmt.Errorf("parsing %s: %w", path, err)
-	}
-	var req struct {
-		State map[string]any `json:"state"`
-	}
-	// Numbers stay as written, so the state goes out as it was captured.
-	dec := json.NewDecoder(bytes.NewReader(c.Request))
-	dec.UseNumber()
-	if err := dec.Decode(&req); err != nil {
-		return verdict{}, "", fmt.Errorf("%s: %w: %w", path, errCaptureState, err)
-	}
-	if len(req.State) == 0 {
-		return verdict{}, "", fmt.Errorf("%s: %w", path, errCaptureState)
-	}
-	if cfg.Backend.APIKey == "" {
-		return verdict{Tier: "no-judge", Reason: "no backend.apiKey configured"}, c.Command, nil
-	}
-	v := askJudge(cfg, req.State, judgeCapture{Command: c.Command, Cwd: c.Cwd}, verdict{Tier: tierJudge}, "", lg)
-	return v, c.Command, nil
-}
-
 // ruleQuestion asks which single rule fits, one option per prose item. It
 // rides in the same request as the decision, so attribution costs no round trip.
 func ruleQuestion(rules []string) map[string]any {
@@ -3767,6 +3726,7 @@ var (
 	errEndpoint         = errors.New("want an https URL, or http on a loopback host")
 	errJevConflict      = errors.New("set in both jev and backend; keep only backend")
 	errLiteralKeyFlag   = errors.New("a literal key on the command line is readable by every local process; pass a $(command) in single quotes")
+	errLogLevel         = errors.New("want info or debug")
 )
 
 // resolveAPIKey evaluates raw as the inside of a double-quoted sh string. The
@@ -3907,7 +3867,9 @@ func stateDir() string {
 	return filepath.Join(home, ".local", "state")
 }
 
-func newLogger() *slog.Logger {
+// newLogger takes the level as a var because the flag that sets it is parsed
+// after the log is open, so a flag error can still be logged.
+func newLogger(level *slog.LevelVar) *slog.Logger {
 	dir := filepath.Join(stateDir(), "frisk")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return slog.New(slog.NewJSONHandler(io.Discard, nil))
@@ -3916,7 +3878,7 @@ func newLogger() *slog.Logger {
 	if err != nil {
 		return slog.New(slog.NewJSONHandler(io.Discard, nil))
 	}
-	return slog.New(slog.NewJSONHandler(f, nil))
+	return slog.New(slog.NewJSONHandler(f, &slog.HandlerOptions{Level: level}))
 }
 
 const (
@@ -4103,6 +4065,11 @@ func logVerdict(lg *slog.Logger, v verdict, command string) {
 	}
 	if v.DenyRule.Choice != "" {
 		attrs = append(attrs, "deny_rule", v.DenyRule.Choice, "deny_rule_confidence", v.DenyRule.Confidence)
+	}
+	// The request is the body as sent, already redacted and screened; the key
+	// rides only in a header. Raw, so the line embeds it as an object.
+	if v.Request != nil && lg.Enabled(context.Background(), slog.LevelDebug) {
+		attrs = append(attrs, "request", v.Request, "answers", v.Answers)
 	}
 	lg.Info("verdict", attrs...)
 }
