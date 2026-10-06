@@ -1,5 +1,47 @@
 # Changelog
 
+## [0.3.0](https://github.com/tenequm/frisk/compare/v0.2.1...v0.3.0) - 2026-10-06
+
+**Upgrading:** upgrade the binary before editing the config, because an
+older frisk rejects the unknown `backend` key and stays silent. Then
+move `jev` under `backend`, writing `keyCmd` as `"apiKey": "$(your
+command)"`. Until you do, `jev` keeps working and `frisk validate`
+warns.
+
+### <!-- 0 -->🛠 Breaking Changes
+- [**breaking**] move the judge connection into the backend block ([38e07d6](https://github.com/tenequm/frisk/commit/38e07d6ab45e7365f89d3de11f04dcfc48d3f93f))
+
+### <!-- 1 -->🎉 New Features
+- **backend:** make the judge backend configurable ([#27](https://github.com/tenequm/frisk/pull/27)) ([9db8f24](https://github.com/tenequm/frisk/commit/9db8f247b821c56e642d96871e9bb521fdd00101))
+  The judge's connection now lives in a `backend` block, so frisk can
+  reach its judge through TypeSafe or OpenRouter. `apiKey` accepts a
+  literal, `${VAR}` or `$(command)`, options take flags, and `--log-level
+  debug` with `frisk check --replay` re-runs logged judge calls exactly.
+- **judge:** resolve script variables, record data text, count ignored files ([#32](https://github.com/tenequm/frisk/pull/32)) ([60e8f62](https://github.com/tenequm/frisk/commit/60e8f6287c1725443686f4a47fc134c3f2f588d1))
+  The judge now sees scripts that a command writes or reaches through a
+  variable, a `data` list naming message, body and heredoc text the shell
+  does not run, and `ignored_files` for `git clean -x`/`-X`. Reference
+  `data` and `ignored_files` in your judge prose to use them.
+- **probe:** attach scripts that ssh runs on a remote host ([#33](https://github.com/tenequm/frisk/pull/33)) ([1a9b16a](https://github.com/tenequm/frisk/commit/1a9b16ad99afd6ad89aea50b09847fc6e0da0ba9))
+  The judge now sees scripts that ssh runs on another host: a heredoc or
+  local file fed to a remote shell, or a file copied with scp or rsync and
+  then run there, is attached with its host, and a script that exists only
+  on the host is reported as remote-only. Nothing to configure.
+
+### <!-- 5 -->📚 Documentation
+- add frisk skill for setup, diagnosis and tuning ([debbfd2](https://github.com/tenequm/frisk/commit/debbfd2765ffbd0893665424632e591de08f904b))
+- **knowledge:** drop the word cap from the judge prose budget ([#31](https://github.com/tenequm/frisk/pull/31)) ([3ecae29](https://github.com/tenequm/frisk/commit/3ecae29540a95ebd58ba0e58b5486a745c37988d))
+  Documentation only: the recorded judge prose budget keeps its item
+  limits and no longer caps words.
+- **agents:** a breaking-change marker bumps the minor version ([e8c6796](https://github.com/tenequm/frisk/commit/e8c679631fd9208cfab8f797d748e4c64eda8611))
+- **knowledge:** record what the judge evaluation showed ([#34](https://github.com/tenequm/frisk/pull/34)) ([e687ad4](https://github.com/tenequm/frisk/commit/e687ad4d326127a5ee4db32899554c0e745605a8))
+  Documentation only: the knowledge base records what the judge evaluation
+  showed about secret wording, where exceptions belong, and where
+  rewording stops helping.
+- **knowledge:** record why the deny floor stays at 0.50 ([766ab19](https://github.com/tenequm/frisk/commit/766ab19d66376ff9b322f124c0f7dee02cdbd9bb))
+
+**Full Changelog**: https://github.com/tenequm/frisk/compare/v0.2.1...v0.3.0
+
 ## [0.2.1](https://github.com/tenequm/frisk/compare/v0.2.0...v0.2.1) - 2026-10-02
 
 ### <!-- 1 -->🎉 New Features
