@@ -57,7 +57,7 @@ Conventions:
 
 - [Judge prose is a few tests over four risk dimensions](judge-rules-four-dimensions.md) -
   The judge lists are written as tests over ownership, recoverability, secret
-  exposure and gate integrity, within a fixed item and word budget, because
+  exposure and gate integrity, within a fixed item budget, because
   topic-word rules and carve-out lists both failed on the regression set.
 
 ## Findings

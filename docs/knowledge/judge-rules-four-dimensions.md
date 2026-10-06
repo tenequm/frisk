@@ -1,10 +1,10 @@
 ---
 type: Decision
 title: Judge prose is a few tests over four risk dimensions
-description: The judge lists are written as tests over ownership, recoverability, secret exposure and gate integrity, within a fixed item and word budget, because topic-word rules and carve-out lists both failed on the regression set.
+description: The judge lists are written as tests over ownership, recoverability, secret exposure and gate integrity, within a fixed item budget, because topic-word rules and carve-out lists both failed on the regression set.
 tags: [judge, prose, policy]
 status: stable
-generated: { by: claude-code/opus-5-5, at: "2026-10-06T18:15:00Z" }
+generated: { by: claude-code/opus-5-5, at: "2026-10-06T18:52:00Z" }
 sources:
   - id: regression
     resource: replay of 829 historical hook commands that the earlier config denied, asked or withheld as asks, through `frisk check` against three judge configurations on 2026-10-06, judge typesafe/jev-1.13 via OpenRouter (results not committed; replay state is the machine's, not the original)
@@ -30,13 +30,14 @@ becomes readable or leaves, and whether it attacks the gate.[^advisors]
   observable trigger.
 - `hard_deny` requires demonstrated harm: every condition visible, and a stated
   non-applicability when a condition cannot be read.
-- Budget: at most 6 environment, 4 allow, 4 soft_deny and 3 hard_deny items, and
-  1,200 words in total. A new item replaces or generalizes an existing one; an item
-  that names a specific command is moved to environment, to a core record or to the
-  static allow list instead.
-- `ask` stays in `judge.decisions`: the asks the user wants (client merges,
-  operational comments on client pull requests, production writes, IAM grants) are
-  conditioned on ownership, which static rules cannot express.
+- Budget: at most 6 environment, 4 allow, 4 soft_deny and 3 hard_deny items. A new
+  item replaces or generalizes an existing one; an item that names a specific
+  command is moved to environment, to a core record or to the static allow list
+  instead. There is no word cap: the item count is what keeps the lists from
+  growing, and prose length costs little at the judge's input price.
+- `ask` stays in `judge.decisions`: the asks the user wants (client merges, apply
+  comments on client pull requests, production writes, IAM grants) are conditioned
+  on ownership, which static rules cannot express.
 
 # Why
 
