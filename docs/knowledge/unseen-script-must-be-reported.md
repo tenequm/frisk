@@ -4,7 +4,7 @@ title: A script the judge cannot see must be reported, not omitted
 description: When a command runs a script whose body is not attached, the judge rates the harmless-looking command line and allows it, so the probe must follow the command to the real file and say so when it cannot.
 tags: [judge, script-probe, safety]
 status: stable
-generated: { by: claude-code/opus-5-5, at: "2026-10-06T23:30:00Z" }
+generated: { by: claude-code/opus-5-5, at: "2026-10-06T21:35:03Z" }
 sources:
   - id: scripts
     resource: script-judgment harness run on 2026-09-30 against the build at commit 9b552c2, 100 corpus cases, 33 synthetic cases with 3 judge runs each, and an offline pass over 743 script-running corpus commands (results not committed)
@@ -66,8 +66,10 @@ screen.[^scripts]
    with no body the judge stayed at low confidence on exactly those
    commands.[^ssh] What ssh feeds a remote shell or interpreter on stdin, and a
    local file copied to the path the remote command runs, is attached with the
-   host it runs on. A script that exists only on the host is reported as
-   `remote-only`, never left silent.
+   host it runs on, and only while nothing can have replaced it on the way. A
+   script ssh runs from a path that exists only on the host is reported as
+   `remote-only`; one behind remote control flow, a substitution or a remote
+   `sudo` is still not followed.
 
 [^scripts]: Script-body judging harness
 [^code]: feat: probe scripts behind wrappers, explain judge verdicts, close static holes

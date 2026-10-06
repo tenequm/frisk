@@ -3278,7 +3278,7 @@ func probeFixture(t *testing.T) string {
 			t.Fatal(err)
 		}
 	}
-	links := map[string]string{"proj/link_path.py": "../outside/.netrc", "proj/link_content.py": "../outside/netrc"}
+	links := map[string]string{"proj/link_path.py": "../outside/.netrc", "proj/link_content.py": "../outside/netrc", "proj/ln.sh": "smoke.sh"}
 	for rel, target := range links {
 		if err := os.Symlink(target, filepath.Join(root, rel)); err != nil {
 			t.Fatal(err)
@@ -3509,7 +3509,7 @@ func TestProbeScripts(t *testing.T) {
 		{"credential-shaped file to a remote shell", "proj", "ssh bl bash -s < keyed.py", probeWithheld, nil},
 		{"ssh -n feeds nothing", "proj", "ssh -n bl 'bash -s' < smoke.sh", "", nil},
 		{"remote command that runs no stdin", "proj", "ssh bl uptime < smoke.sh", "", nil},
-		{"remote statement before the stdin shell", "proj", "ssh bl 'cat > /tmp/a; bash -s' < smoke.sh", "", nil},
+		{"remote statement before the stdin shell", "proj", "ssh bl 'cat > /tmp/a; bash -s' < smoke.sh", probeUnresolvable, nil},
 		{"ssh with a remote command option", "proj", "ssh -o RemoteCommand=uptime bl < smoke.sh", "", nil},
 		{"remote redirect names a host file", "proj", "ssh bl 'bash -s < smoke.sh'", probeRemote, nil},
 		{"quoted redirect is the remote shell's", "proj", "ssh bl bash -s '<' smoke.sh", probeRemote, nil},
@@ -3517,15 +3517,56 @@ func TestProbeScripts(t *testing.T) {
 		{"remote binary is no script", "proj", "ssh bl /usr/bin/uptime", "", nil},
 		{"remote substitution is not followed", "proj", "ssh bl 'bash $(ls *.sh)'", "", nil},
 		{"copied then run", "proj", "scp -q stats.py bl:/tmp/x.py && ssh bl 'python3 /tmp/x.py; rm /tmp/x.py'", probeAttached, []string{"bl:proj/stats.py"}},
-		{"copied into a directory", "proj", "rsync -az smoke.sh bl:/srv/ && ssh bl 'cd /srv && bash smoke.sh'", probeAttached, []string{"bl:proj/smoke.sh"}},
-		{"copied to the remote home", "proj", "scp stats.py user@bl: && ssh bl python3 '~/stats.py'", probeAttached, []string{"bl:proj/stats.py"}},
-		{"copied then made executable", "proj", "scp -P 2222 smoke.sh bl:/tmp/s.sh && ssh bl 'chmod +x /tmp/s.sh && /tmp/s.sh'", probeAttached, []string{"bl:proj/smoke.sh"}},
+		{"copied into a directory", "proj", "rsync -azc smoke.sh bl:/srv/ && ssh bl 'cd /srv && bash smoke.sh'", probeAttached, []string{"bl:proj/smoke.sh"}},
+		{"copied to the remote home", "proj", "scp stats.py user@bl: && ssh user@bl python3 '~/stats.py'", probeAttached, []string{"bl:proj/stats.py"}},
+		{"copied then made executable", "proj", "scp -q smoke.sh bl:/tmp/s.sh && ssh bl 'chmod +x /tmp/s.sh && /tmp/s.sh'", probeAttached, []string{"bl:proj/smoke.sh"}},
 		{"copy of a script written from a heredoc", "proj", "cat > gen.py <<'EOF'\nprint(1)\nEOF\nscp gen.py bl:/tmp/gen.py && ssh bl python3 /tmp/gen.py", probeAttached, []string{"bl:proj/gen.py"}},
 		{"copied to another host", "proj", "scp stats.py ci:/tmp/x.py && ssh bl python3 /tmp/x.py", probeRemote, nil},
 		{"remote statement between copy and run", "proj", "scp stats.py bl:/tmp/x.py && ssh bl 'sed -i s/a/b/ /tmp/x.py && python3 /tmp/x.py'", probeRemote, nil},
 		{"local program between copy and run", "proj", "scp stats.py bl:/tmp/x.py && make && ssh bl python3 /tmp/x.py", probeRemote, nil},
 		{"rsync dry run copies nothing", "proj", "rsync -n stats.py bl:/tmp/x.py && ssh bl python3 /tmp/x.py", probeRemote, nil},
 		{"copied from a host is not local", "proj", "scp ci:/tmp/x.py bl:/tmp/x.py && ssh bl python3 /tmp/x.py", probeRemote, nil},
+		{"copy that may not have run", "proj", "scp stats.py bl:/tmp/x.py || ssh bl python3 /tmp/x.py", probeRemote, nil},
+		{"copy that may have failed", "proj", "scp stats.py bl:/tmp/x.py; ssh bl python3 /tmp/x.py", probeRemote, nil},
+		{"copy racing the run", "proj", "scp stats.py bl:/tmp/x.py & ssh bl python3 /tmp/x.py", probeRemote, nil},
+		{"copy after an or", "proj", "true || scp stats.py bl:/tmp/x.py && ssh bl python3 /tmp/x.py", probeRemote, nil},
+		{"negated copy", "proj", "! scp stats.py bl:/tmp/x.py && ssh bl python3 /tmp/x.py", probeRemote, nil},
+		{"copy as another user", "proj", "scp stats.py root@bl:x.py && ssh deploy@bl python3 x.py", probeRemote, nil},
+		{"run on another port", "proj", "scp stats.py bl:/tmp/x.py && ssh -p 2222 bl python3 /tmp/x.py", probeRemote, nil},
+		{"copy to another port", "proj", "scp -P 2222 stats.py bl:/tmp/x.py && ssh bl python3 /tmp/x.py", probeRemote, nil},
+		{"run through a jump host", "proj", "scp stats.py bl:/tmp/x.py && ssh -J prod bl python3 /tmp/x.py", probeRemote, nil},
+		{"copy with a routing option", "proj", "scp -o HostName=decoy stats.py bl:/tmp/x.py && ssh bl python3 /tmp/x.py", probeRemote, nil},
+		{"copy through another program", "proj", "scp -S ./fake stats.py bl:/tmp/x.py && ssh bl python3 /tmp/x.py", probeRemote, nil},
+		{"rsync through another program", "proj", "rsync -c -e ./fake stats.py bl:/tmp/x.py && ssh bl python3 /tmp/x.py", probeRemote, nil},
+		{"change through another host name", "proj", "scp stats.py bl:/tmp/x.py && ssh BL 'cp /tmp/e /tmp/x.py' && ssh bl python3 /tmp/x.py", probeRemote, nil},
+		{"copy through another host name", "proj", "scp stats.py bl:/tmp/x.py && scp decoy.py bl.lan:/tmp/x.py && ssh bl python3 /tmp/x.py", probeRemote, nil},
+		{"directory copy over a copied file", "proj", "scp stats.py bl:/srv/sub/stats.py && scp -r sub bl:/srv/ && ssh bl python3 /srv/sub/stats.py", probeRemote, nil},
+		{"directory beside a file in one copy", "proj", "rsync -ac stats.py sub/ bl:/srv/ && ssh bl python3 /srv/stats.py", probeRemote, nil},
+		{"rsync quick check may skip", "proj", "rsync -az stats.py bl:/tmp/x.py && ssh bl python3 /tmp/x.py", probeRemote, nil},
+		{"rsync by checksum", "proj", "rsync -azc stats.py bl:/tmp/x.py && ssh bl python3 /tmp/x.py", probeAttached, []string{"bl:proj/stats.py"}},
+		{"rsync of a symlink", "proj", "rsync -ac ln.sh bl:/tmp/x.sh && ssh bl bash /tmp/x.sh", probeRemote, nil},
+		{"one copy of two same-named files", "proj", "rsync -c stats.py sub/stats.py bl:/tmp/ && ssh bl python3 /tmp/stats.py", probeRemote, nil},
+		{"bare remote name runs from PATH", "proj", "scp smoke.sh bl:x.sh && ssh bl x.sh", probeRemote, nil},
+		{"remote assignment moves home", "proj", "scp stats.py bl:x.py && ssh bl 'HOME=/tmp; python3 ~/x.py'", probeRemote, nil},
+		{"backgrounded remote cd", "proj", "scp stats.py bl:/tmp/x.py && ssh bl 'cd /tmp & python3 x.py'", probeRemote, nil},
+		{"remote cd that may fail", "proj", "scp stats.py bl:/tmp/x.py && ssh bl 'cd /tmp; python3 x.py'", probeRemote, nil},
+		{"remote dot-dot", "proj", "scp stats.py bl:/tmp/l/../x.py && ssh bl python3 /tmp/x.py", probeRemote, nil},
+		{"unquoted tilde expands here", "proj", "scp stats.py bl: && ssh bl python3 ~/stats.py", probeRemote, nil},
+		{"remote command option split by a tab", "proj", "ssh -o 'RemoteCommand\tpython3 x.py' bl < smoke.sh", "", nil},
+		{"quoted remote command option", "proj", "ssh -o '\"RemoteCommand\" uptime' bl < smoke.sh", "", nil},
+		{"ssh config file", "proj", "ssh -F ./cfg bl < smoke.sh", "", nil},
+		{"here-string beside an ssh feed", "proj", "ssh bl bash -s < smoke.sh <<< 'rm -rf /'", probeUnresolvable, nil},
+		{"read-write redirect beside an ssh feed", "proj", "ssh bl bash -s < smoke.sh <> stats.py", probeUnresolvable, nil},
+		{"dup beside an ssh heredoc", "proj", "ssh bl bash -s <<'EOF' 0<&3\nuptime\nEOF", probeUnresolvable, nil},
+		{"dup beside a local feed", "proj", "bash -s < smoke.sh 0<&3", probeUnresolvable, nil},
+		{"remote here-string is the remote shell's", "proj", "ssh bl 'bash -s <<< uptime' < smoke.sh", "", nil},
+		{"remote statement may read the feed first", "proj", "ssh bl 'uptime; bash -s' <<'EOF'\nrm -rf ~\nEOF", probeUnresolvable, nil},
+		{"second remote stdin shell gets nothing", "proj", "ssh bl 'bash -s; bash -s' < smoke.sh", probeAttached, []string{"bl:proj/smoke.sh"}},
+		{"backgrounded cd", "proj", "cd sub & python3 stats.py", probeUnresolvable, nil},
+		{"run only when cd failed", "proj", "cd sub || python3 stats.py", probeUnresolvable, nil},
+		{"redirected cd", "proj", "cd sub > /dev/null && python3 stats.py", probeAttached, []string{"proj/sub/stats.py"}},
+		{"stored script run only when the write failed", "proj", "cat > gen.py <<'EOF' || python3 gen.py\nprint(1)\nEOF", probeUnresolvable, nil},
+		{"rewritten script attaches both bodies", "proj", "cat > gen.py <<'EOF'\nprint(1)\nEOF\npython3 gen.py; cat > gen.py <<'EOF'\nprint(2)\nEOF\npython3 gen.py", probeAttached, []string{"proj/gen.py", "proj/gen.py"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -3539,9 +3580,9 @@ func TestProbeScripts(t *testing.T) {
 			}
 			var got []string
 			for _, s := range res.Scripts {
-				rel, _ := filepath.Rel(root, s.Path)
-				if !filepath.IsAbs(s.Path) {
-					rel = s.Path
+				rel := s.Path
+				if filepath.IsAbs(s.Path) {
+					rel, _ = filepath.Rel(root, s.Path)
 				}
 				if s.Host != "" {
 					rel = s.Host + ":" + rel
