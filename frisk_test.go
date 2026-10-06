@@ -3,6 +3,8 @@ package main
 import (
 	"cmp"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -12,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -996,6 +999,227 @@ func TestCheckTakesFlagsBeforeCommand(t *testing.T) {
 	var out strings.Builder
 	if code := run([]string{"check", "--backend.model=x", "ls", "-la"}, strings.NewReader(""), &out); code != 0 || !strings.HasPrefix(out.String(), "allow") {
 		t.Fatalf("code = %d, out = %q", code, out.String())
+	}
+}
+
+const captureCfg = `{"permissions":{"allow":["ls *"]},"backend":{"model":"jev-test","apiKey":"test-key"}}`
+
+var captureName = regexp.MustCompile(`^\d{8}T\d{6}\.\d{9}Z-([0-9a-f]{8})\.json$`)
+
+// runHookCommand feeds one Bash call to `frisk hook` with extra flags.
+func runHookCommand(t *testing.T, command, cwd string, flags ...string) (string, int) {
+	t.Helper()
+	in, err := json.Marshal(map[string]any{"tool_name": "Bash", "tool_input": map[string]string{"command": command}, "cwd": cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out strings.Builder
+	code := run(append([]string{"hook"}, flags...), strings.NewReader(string(in)), &out)
+	return out.String(), code
+}
+
+// captureFiles lists dir and fails unless it holds exactly want captures.
+func captureFiles(t *testing.T, dir string, want int) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if len(entries) != want {
+		t.Fatalf("%d captures in %s, want %d", len(entries), dir, want)
+	}
+	paths := make([]string, 0, len(entries))
+	for _, e := range entries {
+		paths = append(paths, filepath.Join(dir, e.Name()))
+	}
+	return paths
+}
+
+func TestHookCaptureRecordsJudgeCall(t *testing.T) {
+	newHookEnv(t, captureCfg)
+	_, fake := fakeJevCapture(t, jevAnswer{Choice: "ask", Confidence: 0.62})
+	dir := filepath.Join(t.TempDir(), "captures")
+	cwd := t.TempDir()
+	const command = "terraform plan"
+
+	if out, code := runHookCommand(t, command, cwd, "--capture", dir); code != 0 || !strings.Contains(out, `"ask"`) {
+		t.Fatalf("code = %d, out = %q", code, out)
+	}
+	// A static verdict calls no judge, so it leaves no capture.
+	if out, code := runHookCommand(t, "ls -la", cwd, "--capture="+dir); code != 0 || !strings.Contains(out, `"allow"`) {
+		t.Fatalf("static: code = %d, out = %q", code, out)
+	}
+	path := captureFiles(t, dir, 1)[0]
+
+	sum := sha256.Sum256([]byte(command))
+	if m := captureName.FindStringSubmatch(filepath.Base(path)); m == nil || m[1] != hex.EncodeToString(sum[:4]) {
+		t.Fatalf("capture name = %s", filepath.Base(path))
+	}
+	for p, want := range map[string]os.FileMode{path: 0o600, dir: 0o700} {
+		if info, err := os.Stat(p); err != nil || info.Mode().Perm() != want {
+			t.Fatalf("%s: mode = %v, err = %v, want %v", p, info.Mode().Perm(), err, want)
+		}
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "test-key") || strings.Contains(string(raw), "apiKey") {
+		t.Fatalf("capture carries key material: %s", raw)
+	}
+	var c judgeCapture
+	if err := json.Unmarshal(raw, &c); err != nil {
+		t.Fatalf("capture not JSON: %v", err)
+	}
+	if sent, _ := fake.request(); string(c.Request) != sent {
+		t.Fatalf("captured request differs from the one sent:\n%s\n%s", c.Request, sent)
+	}
+	if c.Entry != cmdHook || c.Command != command || c.Cwd != cwd || c.Endpoint != defaultEndpoint || c.Model != "jev-test" || c.Time.IsZero() {
+		t.Fatalf("capture header = %+v", c)
+	}
+	if c.Answers.Decision.Choice != decisionAsk || c.Answers.Decision.Confidence != 0.62 {
+		t.Fatalf("captured answers = %+v", c.Answers)
+	}
+	if c.Verdict.Decision != decisionAsk || c.Verdict.Tier != tierJudge || !strings.HasPrefix(c.Verdict.Reason, "judge ask (0.62)") {
+		t.Fatalf("captured verdict = %+v", c.Verdict)
+	}
+}
+
+func TestCaptureFailureLeavesVerdictAlone(t *testing.T) {
+	newHookEnv(t, captureCfg)
+	fakeJevCapture(t, jevAnswer{Choice: "ask", Confidence: 0.62})
+	blocker := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(blocker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unwritable := filepath.Join(blocker, "captures")
+	cwd := t.TempDir()
+
+	want, _ := runHookCommand(t, "terraform plan", cwd)
+	if got, code := runHookCommand(t, "terraform plan", cwd, "--capture", unwritable); code != 0 || got != want || !strings.Contains(got, `"ask"`) {
+		t.Fatalf("hook: code = %d, out = %q, want %q", code, got, want)
+	}
+	var plain, captured strings.Builder
+	run([]string{"check", "terraform plan"}, strings.NewReader(""), &plain)
+	if code := run([]string{"check", "--capture", unwritable, "terraform plan"}, strings.NewReader(""), &captured); code != 0 || captured.String() != plain.String() {
+		t.Fatalf("check: code = %d, out = %q, want %q", code, captured.String(), plain.String())
+	}
+	log, err := os.ReadFile(filepath.Join(os.Getenv("XDG_STATE_HOME"), "frisk", "frisk.log"))
+	if err != nil || !strings.Contains(string(log), "capture not written") {
+		t.Fatalf("no capture warning logged: err = %v", err)
+	}
+}
+
+// A replay sends the captured state untouched, so the machine's present git
+// facts and scripts cannot skew it, and judges it with the current prose.
+func TestReplaySendsCapturedState(t *testing.T) {
+	e := newHookEnv(t, `{"backend":{"model":"jev-test","apiKey":"test-key"},"judge":{"soft_deny":["old ask prose"]}}`)
+	_, first := fakeJevCapture(t, jevAnswer{Choice: "ask", Confidence: 0.90})
+	dir := filepath.Join(t.TempDir(), "captures")
+	if _, code := runHookCommand(t, "git push", t.TempDir(), "--capture", dir); code != 0 {
+		t.Fatalf("hook exit = %d", code)
+	}
+	path := captureFiles(t, dir, 1)[0]
+	var sent struct {
+		State json.RawMessage `json:"state"`
+	}
+	firstRaw, _ := first.request()
+	if err := json.Unmarshal([]byte(firstRaw), &sent); err != nil {
+		t.Fatal(err)
+	}
+
+	newCfg := `{"backend":{"model":"jev-test","apiKey":"test-key"},"judge":{"soft_deny":["new ask prose"],"decisions":["allow","deny"]}}`
+	if err := os.WriteFile(filepath.Join(e.cfgDir, "frisk", "config.json"), []byte(newCfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, second := fakeJevCapture(t, jevAnswer{Choice: "deny", Confidence: 0.40})
+	replays := filepath.Join(t.TempDir(), "replays")
+	var out strings.Builder
+	if code := run([]string{"check", "--capture", replays, "--replay", path}, strings.NewReader(""), &out); code != 0 {
+		t.Fatalf("exit = %d, out = %q", code, out.String())
+	}
+	// The deny floor makes it ask, and judge.decisions then withholds the ask.
+	if got := out.String(); !strings.HasPrefix(got, "silent") || !strings.Contains(got, "judge deny below confidence floor (0.40), asking") || !strings.Contains(got, "ask withheld by judge.decisions") {
+		t.Fatalf("replay output = %q", got)
+	}
+
+	secondRaw, req := second.request()
+	var replayed struct {
+		State json.RawMessage `json:"state"`
+	}
+	if err := json.Unmarshal([]byte(secondRaw), &replayed); err != nil {
+		t.Fatal(err)
+	}
+	if string(replayed.State) != string(sent.State) {
+		t.Fatalf("replayed state differs:\n%s\n%s", replayed.State, sent.State)
+	}
+	if req.Questions["decision"].Criteria[decisionAsk] != "new ask prose" || strings.Contains(secondRaw, "old ask prose") {
+		t.Fatalf("replay did not use the current prose: %s", secondRaw)
+	}
+
+	var c judgeCapture
+	raw, err := os.ReadFile(captureFiles(t, replays, 1)[0])
+	if err != nil || json.Unmarshal(raw, &c) != nil {
+		t.Fatalf("replay capture unreadable: %v", err)
+	}
+	if c.Entry != cmdCheck || c.Command != "git push" || c.Verdict.Decision != "silent" || string(c.Request) != secondRaw {
+		t.Fatalf("replay capture = %+v", c)
+	}
+}
+
+func TestReplayRejectsMalformedCapture(t *testing.T) {
+	newHookEnv(t, captureCfg)
+	_, fake := fakeJevCapture(t, jevAnswer{Choice: "allow", Confidence: 0.98})
+	dir := t.TempDir()
+	files := map[string]string{
+		"not json":         "{not json",
+		"no request":       `{"command":"ls"}`,
+		"request no state": `{"command":"ls","request":{"model":"m"}}`,
+		"empty state":      `{"command":"ls","request":{"state":{}}}`,
+	}
+	for name, body := range files {
+		path := filepath.Join(dir, strings.ReplaceAll(name, " ", "-")+".json")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var out strings.Builder
+		if code := run([]string{"check", "--replay", path}, strings.NewReader(""), &out); code != 1 || !strings.HasPrefix(out.String(), "silent replay-error ") {
+			t.Errorf("%s: code = %d, out = %q", name, code, out.String())
+		}
+	}
+	var out strings.Builder
+	if code := run([]string{"check", "--replay", filepath.Join(dir, "missing.json")}, strings.NewReader(""), &out); code != 1 || !strings.HasPrefix(out.String(), "silent replay-error ") {
+		t.Errorf("missing file: code = %d, out = %q", code, out.String())
+	}
+	if calls, _ := fake.last(); calls != 0 {
+		t.Fatalf("judge called %d times for malformed captures", calls)
+	}
+}
+
+func TestCaptureAndReplayFlags(t *testing.T) {
+	newHookEnv(t, captureCfg)
+	tests := []struct {
+		name string
+		args []string
+		code int
+	}{
+		{"check takes capture", []string{"check", "--capture", t.TempDir(), "ls"}, 0},
+		{"replay takes no command", []string{"check", "--replay", "x.json", "ls"}, 2},
+		{"validate has no capture", []string{"validate", "--capture", t.TempDir()}, 2},
+		{"validate has no replay", []string{"validate", "--replay", "x.json"}, 2},
+	}
+	for _, tt := range tests {
+		var out strings.Builder
+		if code := run(tt.args, strings.NewReader(""), &out); code != tt.code {
+			t.Errorf("%s: code = %d, out = %q", tt.name, code, out.String())
+		}
+	}
+	if out, code := runHookCommand(t, "ls", t.TempDir(), "--capture", t.TempDir()); code != 0 || !strings.Contains(out, `"allow"`) {
+		t.Errorf("hook --capture: code = %d, out = %q", code, out)
+	}
+	// replay is a check option; on the hook it is a bad flag, which is silence.
+	if out, code := runHookCommand(t, "ls", t.TempDir(), "--replay", "x.json"); code != 0 || out != "" {
+		t.Errorf("hook --replay: code = %d, out = %q", code, out)
 	}
 }
 
