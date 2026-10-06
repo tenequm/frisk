@@ -4,7 +4,7 @@ title: A script the judge cannot see must be reported, not omitted
 description: When a command runs a script whose body is not attached, the judge rates the harmless-looking command line and allows it, so the probe must follow the command to the real file and say so when it cannot.
 tags: [judge, script-probe, safety]
 status: stable
-generated: { by: claude-code/opus-5-5, at: "2026-09-30T13:18:00Z" }
+generated: { by: claude-code/opus-5-5, at: "2026-10-06T21:00:00Z" }
 sources:
   - id: scripts
     resource: script-judgment harness run on 2026-09-30 against the build at commit 9b552c2, 100 corpus cases, 33 synthetic cases with 3 judge runs each, and an offline pass over 743 script-running corpus commands (results not committed)
@@ -12,6 +12,9 @@ sources:
   - id: code
     resource: repository commit 091465e, frisk.go (script probe and judge state)
     title: "feat: probe scripts behind wrappers, explain judge verdicts, close static holes"
+  - id: eval831
+    resource: 5-run judge evaluation of 831 labeled commands on 2026-10-06 (results not committed)
+    title: Labeled-command judge evaluation
 ---
 
 # Finding
@@ -46,6 +49,15 @@ screen.[^scripts]
 3. The credential screen runs on the symlink-resolved path and on the content
    before anything is sent. A withheld script produces silence without a judge
    call.[^code]
+4. The file on disk is not the script when the command writes it first. Agents
+   routinely write a script into a scratch directory named by a variable and
+   run it in the same command (`S=/tmp/x; cat > $S/a.py <<'EOF' ... EOF;
+   python3 $S/a.py`); unresolved, these were the largest single source of
+   unwanted prompts in the labeled evaluation.[^eval831] The probe follows the
+   variable, takes the body from a literal heredoc written with `cat >`, and
+   reports any other earlier write as unresolvable rather than attaching
+   what the disk held before.
 
 [^scripts]: Script-body judging harness
 [^code]: feat: probe scripts behind wrappers, explain judge verdicts, close static holes
+[^eval831]: Labeled-command judge evaluation
