@@ -42,6 +42,10 @@ judgement call, and none of it is manual:
   note. It has to be last - the conventional-commit grammar reads footers at the
   end - so the lint and the changelog template both ignore it there: it is not
   counted against the note's cap and never renders as prose.
+- **A breaking-change marker (`feat!:`, `BREAKING CHANGE:`) bumps the minor
+  version, never the major** (`bump-minor-pre-major` in
+  `.github/release-please-config.json`). To cut a minor release, push an empty
+  `feat!:` commit to `main`.
 - **Never pick a version otherwise, never hand-write or hand-edit the release PR.**
   release-please derives the version from the commit types and regenerates that
   PR on every push to `main`, discarding anything written into it. It also
