@@ -492,8 +492,8 @@ func TestEvalGit(t *testing.T) {
 	}
 	t.Setenv("XDG_CONFIG_HOME", configHome)
 	cfg, err := loadConfig()
-	if err != nil || len(cfg.Jev.KeyCmd) == 0 {
-		t.Fatalf("config under %s: err=%v, judge configured=%v", configHome, err, err == nil)
+	if err != nil || cfg.Backend.APIKey == "" {
+		t.Fatalf("config under %s: err=%v, judge configured=%v", configHome, err, cfg.Backend.APIKey != "")
 	}
 
 	sandbox := t.TempDir()
@@ -525,12 +525,10 @@ func TestEvalGit(t *testing.T) {
 	gitFactsTimeout = 10 * time.Second
 	t.Cleanup(func() { gitFactsTimeout = prevTimeout })
 
-	proxy := &gitEvalProxy{upstream: jevEndpoint}
+	proxy := &gitEvalProxy{upstream: cfg.Backend.endpoint()}
 	srv := httptest.NewServer(proxy)
 	t.Cleanup(srv.Close)
-	prevEndpoint := jevEndpoint
-	jevEndpoint = srv.URL
-	t.Cleanup(func() { jevEndpoint = prevEndpoint })
+	cfg.Backend.Endpoint = srv.URL
 
 	fixtures, dirs, skipped := gitFixtureRepos(t, sandbox)
 	var results []gitEvalResult

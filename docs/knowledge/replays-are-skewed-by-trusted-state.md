@@ -4,7 +4,7 @@ title: Replaying logged commands skews verdicts through trusted state
 description: A replay sends the judge the replay machine's git facts and probe results, not the ones the command originally ran with, so ask and deny rates from a replay overstate what live traffic gets.
 tags: [eval, replay, judge, probe]
 status: stable
-generated: { by: claude-code/opus-5-5, at: "2026-09-30T14:21:00Z" }
+generated: { by: claude-code/opus-5-5, at: "2026-10-06T18:17:13Z" }
 sources:
   - id: replay
     resource: replay of 1,519 classifier-allowed corpus commands through `frisk check` on 2026-09-30, from one working directory on one machine (results not committed)
@@ -12,6 +12,9 @@ sources:
   - id: code
     resource: repository commit 091465e, frisk.go (gitFacts and probeScripts, both resolved from the hook's working directory)
     title: "feat: probe scripts behind wrappers, explain judge verdicts, close static holes"
+  - id: replay-log
+    resource: frisk.go (logVerdict and runReplay), DESIGN.md "Debug log and replay"
+    title: "refactor(judge): log judge requests at debug level and replay from the log"
 ---
 
 # Finding
@@ -32,12 +35,17 @@ those excluded.[^replay]
 
 # Consequence
 
-A replay is sound for the static tier, which reads only the command text. For the
-judge tier it gives an upper bound on asks and denies, and it cannot evaluate
-rules that depend on the repository or on a script body.
+A replay of logged commands is sound for the static tier, which reads only the
+command text. For the judge tier it gives an upper bound on asks and denies, and
+it cannot evaluate rules that depend on the repository or on a script body.
 
-To tune those rules, use fixtures that pin the trusted state, or dry-run the
-command from the directory it belongs to while its files still exist.
+To tune those rules faithfully, run the hook with `--log-level debug` and
+replay the log with `frisk check --replay`: a debug line keeps the request state
+exactly as the judge first saw it, git facts and script bodies included, and the
+replay judges it with the current prose.[^replay-log] Fixtures that pin the
+trusted state, or a dry-run from the command's own directory while its files
+still exist, cover commands that were never logged at debug.
 
 [^replay]: Corpus replay after the probe and git-facts change
 [^code]: feat: probe scripts behind wrappers, explain judge verdicts, close static holes
+[^replay-log]: refactor(judge): log judge requests at debug level and replay from the log

@@ -12,7 +12,7 @@ frisk is a shortcut, never a bypass:
 
 - A frisk `allow` still passes Claude Code's `permissions.deny`/`ask` re-check.
 - A frisk `deny`/`ask` is honored in every mode, including `bypassPermissions`.
-- Every failure path (bad config, no key, Jev timeout, malformed answer,
+- Every failure path (bad config, no key, judge timeout, malformed answer,
   low confidence) is silence.
 
 ## Decision flow
@@ -34,7 +34,7 @@ parse into pipeline segments (|, &&, ||, ;, newline)
     screened stdin files or literal writes covered by
     Edit rules; inside single quotes or escaped, all of
     these are text) -> "allow"
-4. judge (needs jev.keyCmd): one Choice question
+4. judge (needs backend.apiKey): one Choice question
      allow + confidence >= 0.75 -> "allow"
      deny  + confidence >= 0.50 -> "deny" (below: "ask")
      ask   + confidence >= 0.50 -> "ask"  (below: silence)
@@ -295,7 +295,7 @@ is never sent and the verdict is silence.
 
 The reason shown in the prompt, `frisk check`, and the log is one line: the
 probability split, then the closest rule, then any script that was expected
-but not attached - `jev ask (allow 0.30 / ask 0.62 / deny 0.08); closest rule:
+but not attached - `judge ask (allow 0.30 / ask 0.62 / deny 0.08); closest rule:
 soft_deny "..." (0.71); script build.py not attached: unresolvable after cd`.
 The closest rule comes from two more Choice questions in the same request
 (`ask_rule`, `deny_rule`: one option per prose item plus `none`). It is a
@@ -306,7 +306,7 @@ reason and never changes the decision.
 silence, and Claude Code's own flow decides. With `["allow", "deny"]` the judge
 never prompts: an `ask`, and a `deny` below its floor, are both withheld. The
 reason and the log row keep what the judge concluded, with the decision logged
-as `silent`: `jev ask (allow 0.30 / ask 0.62 / deny 0.08); ask withheld by
+as `silent`: `judge ask (allow 0.30 / ask 0.62 / deny 0.08); ask withheld by
 judge.decisions; closest rule: soft_deny "..." (0.71)`. It covers the judge
 tier only: `permissions.deny` / `permissions.ask` rules, the static tier and the
 file-tool guardrails are untouched.
@@ -381,8 +381,13 @@ literal and stays, as does a 40-character git object id. The reason is redacted
 where it is built, so `frisk check` and the permission prompt show the same text.
 
 - `frisk hook` - the PreToolUse handler
-- `frisk check '<command>'` - dry-run, prints decision + tier + reason
-- `frisk validate [--live]` - config health check, see below
+- `frisk check [flags] '<command>'` - dry-run, prints decision + tier + reason
+- `frisk check [flags] --replay <log-file>` - judge logged requests again, see below
+- `frisk validate [--live] [flags]` - config health check, see below
+
+Flags go before the command: `frisk check ls --log-level debug` judges
+`ls --log-level debug`. A flag placed before `hook` makes the hook silent, never
+a usage error, since exit 2 would block every tool call.
 
 ```json
 {
@@ -396,6 +401,35 @@ where it is built, so `frisk check` and the permission prompt show the same text
 ```
 
 Uninstall = remove the hook entry.
+
+## Debug log and replay
+
+The log keeps the command and the verdict, not what the judge was shown. A
+replay through `frisk check` rebuilds the trusted state from the replaying
+machine: today's branch and remotes, and a probe that finds most scripts gone,
+so its verdicts skew toward ask
+([finding](docs/knowledge/replays-are-skewed-by-trusted-state.md)).
+
+`--log-level debug` on `hook` or `check` adds two fields to the verdict line of
+every answered judge call: `request`, the body as sent (already redacted and
+screened, embedded as an object), and `answers`, the parsed answers with the
+response's model and usage. The key rides only in a header and is never
+logged. The level is a command-line option only - no config key, nothing from
+the environment - because a debug line holds command text and script bodies.
+Lines run roughly 5-12 KB each, so debug is for evaluation periods; the log is
+already `0600`.
+
+`frisk check --replay <file>` (`-` for stdin) reads JSONL such as `frisk.log`
+or an excerpt and, for every line with a `request`, sends its `state` as logged
+except the `policy`, which like the questions is built from the current `judge`
+prose, then applies the same floors and `judge.decisions` as a live call. The
+key is resolved once for the whole run, and one that does not resolve exits 1. It prints one `decision tier
+reason` line per replayed record in input order, then `replayed N, skipped M`;
+lines without a request state, malformed ones included, are skipped. With
+`--log-level debug` each replay is logged with its own request, so two configs
+or models can be compared on the same inputs. An unreadable file exits 1 with
+`silent replay-error`. The reason carries no "script not attached" note: that
+comes from the probe, which a replay skips.
 
 ## File tools
 
@@ -417,9 +451,44 @@ A malformed config makes the hook stay silent for the whole session, so
 bad-glob rules, empty `Edit()` patterns, bare `*` in deny/ask, `$defaults` in
 `permissions.allow` (a warning: it adds no rules), an allow list with no rules,
 whether each judge list is unset, extends (`$defaults`) or replaces the builtins, the
-effective `judge.decisions`, and whether `jev.keyCmd` runs - never printing any
-part of the key. No network unless `--live`, which makes one real judge call
-for `true`.
+effective `judge.decisions`, each `backend` value with where it came from
+(flag, file or default), and whether `backend.apiKey` resolves - never printing
+any part of the key. No network unless `--live`, which makes one real judge
+call for `true`.
+
+## Backend
+
+`judge` holds policy (what may be decided); `backend` holds the connection
+(where the question goes). The request is TypeSafe's System One shape, which
+TypeSafe (`https://api.typesafe.ai/v1/systemone`, the default) and OpenRouter
+(`https://openrouter.ai/api/v1/systemone`, or the alpha
+`https://openrouter.ai/api/alpha/decisions`) both serve, so switching vendor or
+model is `backend.endpoint` and `backend.model`. The confidence floors were
+measured on Jev, so a different model needs its own replay before it decides.
+
+`backend.apiKey` is read as the inside of a double-quoted shell string: a
+literal, `${VAR}` or `$(command)`. A value with no `$` or backtick is used as
+is; otherwise `sh` evaluates it, in its own process group so a timeout kills
+the key command too, with the expression passed in the environment rather than
+the `-c` text so the key it yields stays off argv. `validate` warns on a literal
+key, since the config is readable by anything that reads files. Prefer
+`$(command)` to `${VAR}`: a repository's `.claude/settings.json` can set the
+session's environment, so it could swap in its own key and read your commands
+in that vendor's request logs. `endpoint` must be https, or http on a loopback
+host, and the judge never follows a redirect, because the key travels as a
+bearer token.
+
+The scalar options (`backend.*`, `judge.decisions`) also take flags on `hook`,
+`check` and `validate`, named as in the file (`--backend.model=...`,
+`'--backend.apiKey=$(...)'`), which override it. The key flag refuses a literal,
+which would sit in argv. No option is read from the environment: a
+repository's `.claude/settings.json` can set the session's environment, but not
+the user's hook command. `XDG_CONFIG_HOME` still chooses where the config file
+is read from, as it always has.
+
+The older `jev` block still loads as an alias: `jev.keyCmd` becomes
+`apiKey: "$(<argv, quoted>)"`, `validate` warns, and setting the same option in
+both blocks is an error.
 
 ## Provenance
 

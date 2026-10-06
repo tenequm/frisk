@@ -30,9 +30,16 @@ only the user's config allows anything. Full detail:
    ] } }
    ```
 
-3. Set `jev.keyCmd` to an argv that prints the API key, for example
-   `["gopass", "show", "-o", "api/typesafe"]`. Without it, frisk runs
-   rules-only and all unmatched commands fall through.
+3. Set `backend.apiKey`. It reads like a double-quoted shell string, so use a
+   command that prints the key, for example
+   `"$(gopass show -o api/typesafe)"`. `"${VAR}"` works too, but a
+   repository's settings can set the session environment, so prefer a
+   command. A literal key works but `validate` warns: the config is
+   readable. Without a key, frisk runs rules-only and all unmatched commands
+   fall through. `backend.endpoint`
+   defaults to TypeSafe; OpenRouter is `https://openrouter.ai/api/v1/systemone`
+   with model `jev-1.13` and an OpenRouter key. The old `jev` block still loads
+   with a deprecation warning.
 4. Run `frisk validate --live`. It checks the config and makes one real judge
    call. Exit 1 means errors.
 
@@ -46,11 +53,18 @@ included.
   Check the settings entry and that `frisk` is on Claude Code's PATH.
 - A malformed config disables frisk silently for the whole session. Run
   `frisk validate` after every config edit.
-- A prompt or deny whose reason names a rule or `jev` came from frisk. A plain
+- A prompt or deny whose reason names a rule or `judge` came from frisk. A plain
   Claude Code prompt means frisk stayed silent.
 - `frisk check '<command>'` reproduces any decision and prints
   `decision tier reason`. Judge reasons include the probability split and the
-  closest prose rule. Tier `no-judge` means `jev.keyCmd` is unset or failing.
+  closest prose rule. Tier `no-judge` means `backend.apiKey` is unset; reason
+  `judge unavailable` means the key or the endpoint failed (the log line says
+  which).
+- To compare judge prose or models faithfully, add `--log-level debug` to the
+  hook command for an evaluation period, then `frisk check --replay <file>` on
+  `frisk.log` or an excerpt. A replay sends the state the judge first saw; a
+  plain `frisk check` re-reads today's git and scripts and skews toward ask.
+  Debug lines are large and hold command text and script bodies.
 
 Not config problems: the judge confidence floors (allow needs >= 0.75, deny
 and ask >= 0.50) and the guardrails that always ask (frisk's own config and
