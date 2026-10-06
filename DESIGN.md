@@ -146,7 +146,7 @@ One Choice question per judged command, mapped straight onto
 | `defer` | none of the above clearly applies -> silence    |
 
 State is provenance-labeled - trusted `policy` (environment), `cwd`, `probe`,
-`git` and `redactions` vs `untrusted` (command, scripts) - and the
+`git`, `data` and `redactions` vs `untrusted` (command, scripts) - and the
 instructions say untrusted text is content to evaluate, never instructions or
 evidence of approval. Precedence when options overlap: deny > ask > allow >
 defer.
@@ -179,6 +179,7 @@ runs in (`-C`, or the directory a literal `cd` led to).
 | `destination` | push | the branch the arguments name; with no refspec the upstream branch, when the push goes to the upstream's remote; `HEAD` is the current branch; else `unknown` |
 | `destination_is_default` | push | `yes`, `no`, or `unknown` when the remote has no `HEAD` ref locally |
 | `uncommitted_files`, `untracked_files` | class `discard` | counts from one `git status --porcelain`, or `unknown` when it does not answer in time |
+| `ignored_files` | class `discard`, a `clean` with `-x` or `-X` | ignored entries counted by the same call, run with `--ignored=matching`, an ignored directory once as an untracked one is; `-x` deletes them along with untracked files and `-X` only them |
 | `state` | always | `current`, or `unknown` when what this record reads from the repository may not hold when the segment runs |
 
 `git checkout <word>` is the one class the repository settles: when the
@@ -211,7 +212,8 @@ can make it `unknown`, by what the record depends on:
   never zero.
 
 The repository fields are then `unknown` and the ones read from the words
-stay. A remote written as a URL is always read from the words. The record is
+stay. A remote written as a URL is always read from the words. A dry run
+(`clean -n`) is class `read` and carries no counts. The record is
 description only; the instructions
 gain one sentence saying what it is, that it is trusted, that `unknown` means
 frisk could not determine the field and that an absent optional field is
@@ -252,7 +254,7 @@ end the loop early.
 assignments. Empty values or values containing whitespace, glob characters,
 quotes, backslashes or `$` stay unresolved. Any write to HOME or TMPDIR, or
 to the existing expansion variables, disables all resolution. The probe uses
-the same substitution. Other `$NAME` and `${NAME}` references resolve only
+the same substitution, with the additions below. Other `$NAME` and `${NAME}` references resolve only
 for a variable the command itself assigns
 exactly once, as its own statement, to a plain literal, before any control
 flow and ahead of the use (`S=/tmp/x; cd "$S" && python3 run.py`); anything
@@ -263,6 +265,42 @@ does a bare `$NAME` followed by `:` or `[`, which zsh reads as a modifier or
 subscript. A value of several words resolves for the probe only inside double
 quotes, where bash and zsh both keep it one word (`S="/tmp/my dir"; python3
 "$S/run.py"`).
+
+The probe, which only reads, goes further than the static tier. A subshell,
+substitution or heredoc cannot assign in the shell that runs the command, so
+an assignment ahead of the first one still holds after it
+(`S=/tmp/x; N=$(date); python3 $S/run.py`); an assignment at or after the
+first parenthesis, substitution or backtick is never taken, since it may sit
+inside one. And a value may use a variable resolved before it
+(`R=/tmp; S=$R/x`), unless a `~` comes first, which bash expands before the
+variable (`S=~$R`). Past a substitution the tokenizer may read quotes apart
+from the shell, and builtins write names in forms no word shows (`printf -vS`,
+`read {S,T}`, `$[S=1]`), so the probe also reads the raw command: a name
+resolves only when the text names it nowhere but in its one assignment and in
+plain reads (`$S`, `${S}`, `${S:-x}`), heredoc bodies included. HOME and
+TMPDIR resolve only when the text never names them that way. Code that may
+assign where no word shows it - arithmetic (`((`, `$((`, `$[`), a `(` inside a
+word, a zsh glob qualifier that can run code, `command .` or `builtin .` -
+leaves the whole command unresolved, and so does an assignment in an and-or
+list run in the background. A shell reading a literal heredoc body expands it
+itself, in an environment this command does not settle (`env -i`, `sudo -H`),
+so nothing resolves there.
+
+A file the command writes with a redirect before running it is not read from
+disk, which does not hold what will run yet. When the write is `cat > file`
+fed a literal heredoc, ahead of any control flow, not piped or backgrounded,
+not after `||` and not under a noclobber the command sets, the body is the
+script: it is attached under the file's path, with secret-shaped spans
+redacted as in the command and the digest taken of what is sent, assuming as
+for a `cd` that the statements before it succeed and that the write does (a
+noclobber set outside the command, or a read-only file, keeps the old one).
+Only `chmod`, a `cd` and other such `cat` writes to resolvable paths may come
+between the write and the run: any other program may change the file by means
+no redirect shows (`cp`, `tee`, a script it runs), and so may a write to a
+path that differs only in case. Any other redirect to the file (`>>`, an
+expanding or `<<-` heredoc, another program's output, a write inside an
+`if`), or anything else between, leaves the script `unresolvable`, noted as
+written earlier in the command.
 
 The static tier and the `permissions.deny` / `permissions.ask` rules read the
 same substitution, so every screen runs on the word the shell will see:
@@ -287,6 +325,32 @@ spaces in it, finds none, and runs nothing; with a `/` in the word it runs that
 path instead (`C="git -C /tmp/repo log"; $C` runs `./git -C /tmp/repo log` if
 it exists), so such a command never settles, nor does a value of several words
 in a word with a glob character. Deny and ask rules see both readings.
+
+`data` lists, in order, text inside the command that the shell does not run
+where it stands, so the judge stops reading a test string, a commit message or a brief as an
+action. Each record names the `program` and `via`, which locates the text in
+`untrusted.command` without copying it:
+
+| via | when | fields |
+|-----|------|--------|
+| `heredoc` | a literal heredoc fed to `cat` whose output is redirected to a file, not piped on or backgrounded, and whose file name no other statement contains; or to `git commit` / `git tag` with `-F -` | `delimiter`, and for `cat` the `file` as written and `appends` for `>>`, both redacted like the command |
+| `flag` | a message flag of `git commit`, `tag` or `stash` (`-m`, `--message`, bundled or attached), or a title, body, notes, subject or comment flag of `gh pr`, `gh issue` or `gh release` (create, edit, comment, review, merge, close) | `flag` as written |
+| `operand` | `frisk check` without `--replay` | none |
+
+The program must be named bare (`git`, not `./git`), so it is the one on
+`PATH` and not a file the command may have written.
+
+Flags and operands count only in the command's own statements ahead of the
+first parenthesis, substitution or backtick: a value could hold a
+substitution that runs, and past one the tokenizer may read quotes apart from
+the shell. A word holding `${` or `$~` leaves its statement out too, since
+zsh's `${(e)X}` and `$~X` and bash's `${X@P}` run what a value holds. A
+heredoc the shell expands, or fed to a shell, an interpreter, `ssh` or any
+other program that may run it, gets no record, and neither does a file another
+statement names (`sh < f`, `source f`, `$(cat f)`). A file nothing in the
+command names may still run later, read by a git hook, `make` or a shell at
+startup, and the instruction says so. Like `git.commands` it is description only, with one sentence of
+instructions, and no builtin prose refers to it.
 
 `probe.status` tells the judge why a body is absent: `attached`, `missing`,
 `unresolvable`, `oversize`, `non-utf8`, `multiple-truncated`. A script whose

@@ -4,7 +4,7 @@ title: Core describes git, config decides
 description: frisk sends the judge a trusted record for each git command (class, forcing, push destination, files a discard would lose) and ships no git policy; the user's judge prose is written against the record's fields.
 tags: [git, judge, architecture]
 status: stable
-generated: { by: claude-code/opus-5-5, at: "2026-09-30T16:40:00Z" }
+generated: { by: claude-code/opus-5-5, at: "2026-10-06T21:00:00Z" }
 sources:
   - id: maintainer
     resource: maintainer instructions on 2026-09-30 (no durable link)
@@ -15,6 +15,9 @@ sources:
   - id: eval
     resource: live run of `just eval-git` on 2026-09-30, 103 fixtures in testdata/git-fixtures.jsonl with pinned repository state (no durable link)
     title: Git record measurement
+  - id: eval831
+    resource: 5-run judge evaluation of 831 labeled commands on 2026-10-06 (results not committed)
+    title: Labeled-command judge evaluation
 ---
 
 # Decision
@@ -73,6 +76,20 @@ with that prose dropped it allowed a forced push to a default branch.[^eval]
   earlier segment of the same command may have changed are reported as
   `unknown`: a push that goes by the checked-out branch after a `switch`, a
   discard's file counts after anything but a `cd` or a git read.
+- A discard record counts what the command could destroy: a `clean` with
+  `-x` or `-X` also carries `ignored_files`, since `-x` deletes ignored files
+  along with untracked ones and `-X` only them.
+- The same split covers text a command does not run. Commit messages, PR
+  bodies, briefs written through a heredoc and the commands given to
+  `frisk check` were read by the judge as actions, a leading cause of
+  unwanted prompts in the labeled evaluation.[^eval831] Core does not decide
+  that such text is harmless; it lists where it is (`state.data`, by program,
+  flag or heredoc delimiter, never a copy of the text) and the prose says
+  what to do with it. Core lists only what it can settle from the words: a
+  value in a statement with no substitution before it, a literal heredoc fed
+  to `cat` into a file no other statement names or to git as a message. A
+  heredoc fed to `ssh`, an interpreter or any other program that may run it
+  stays unlisted, and the instruction says a listed file may still run later.
 - The same understanding serves the user's own rules: a git rule matches the
   command git runs, not its spelling. Global options such as `-C dir` are set
   aside, flags match anywhere with short, long and bundled forms unified, and
@@ -84,3 +101,4 @@ with that prose dropped it allowed a forced push to a default branch.[^eval]
 [^maintainer]: How frisk should treat git
 [^design]: frisk design
 [^eval]: Git record measurement
+[^eval831]: Labeled-command judge evaluation
