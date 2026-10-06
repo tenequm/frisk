@@ -1984,6 +1984,7 @@ type jevUntrusted struct {
 	Script     string              `json:"script"`
 	ScriptPath string              `json:"script_path"`
 	ScriptSHA  string              `json:"script_sha256"`
+	ScriptHost string              `json:"script_host"`
 	Scripts    []map[string]string `json:"scripts"`
 }
 
@@ -3444,7 +3445,7 @@ func TestProbeScripts(t *testing.T) {
 		{"heredoc body never moves the directory", "proj", "cat > notes.txt <<EOF\ncd sub\nEOF\npython3 stats.py", probeAttached, []string{"proj/stats.py"}},
 		{"heredoc read by a shell is probed", "proj", "bash <<EOF\npython3 stats.py\nEOF", probeAttached, []string{"proj/stats.py"}},
 		{"heredoc read by a wrapped shell is probed", "proj", "timeout 60 dash -s <<'EOF'\npython3 stats.py\nEOF", probeAttached, []string{"proj/stats.py"}},
-		{"heredoc read by a redirected shell is probed", "proj", "sh <<EOF > out.log\npython3 stats.py\nEOF", probeMissing, []string{"proj/stats.py"}},
+		{"heredoc read by a redirected shell is probed", "proj", "sh <<EOF > out.log\npython3 stats.py\nEOF", probeAttached, []string{"proj/stats.py"}},
 		{"heredoc piped into a shell is probed", "proj", "cat <<EOF | bash\npython3 stats.py\nEOF", probeAttached, []string{"proj/stats.py"}},
 		{"heredoc pipeline continued after terminator is probed", "proj", "cat <<EOF |\npython3 stats.py\nEOF\nbash", probeAttached, []string{"proj/stats.py"}},
 		{"heredoc piped through a filter into a shell is probed", "proj", "cat <<EOF | grep -v skip | sh -s\npython3 stats.py\nEOF", probeAttached, []string{"proj/stats.py"}},
@@ -3491,6 +3492,40 @@ func TestProbeScripts(t *testing.T) {
 		{"script written after a substitution", "proj", "N=$(date); cat > gen.py <<'EOF'\nprint(1)\nEOF\npython3 gen.py", probeUnresolvable, nil},
 		{"literal heredoc shell sees no unexported variable", ".", "S={root}/proj; bash <<'EOF'\npython3 $S/run.py\nEOF", probeUnresolvable, nil},
 		{"expanding heredoc shell gets the value", ".", "S={root}/proj; bash <<EOF\npython3 $S/run.py\nEOF", probeAttached, []string{"proj/run.py"}},
+		{"shell reading a file on stdin", "proj", "bash < smoke.sh", probeAttached, []string{"proj/smoke.sh"}},
+		{"python reading a file on stdin", "proj", "python3 -u - < stats.py", probeAttached, []string{"proj/stats.py"}},
+		{"stdin file written from a heredoc", "proj", "cat > gen.sh <<'EOF'\necho\nEOF\nsh -s < gen.sh", probeAttached, []string{"proj/gen.sh"}},
+		{"stdin file beside a script operand", "proj", "python3 run.py < stats.py", probeAttached, []string{"proj/run.py"}},
+		{"stdin file of a program that runs no code", "proj", "wc -l < stats.py", "", nil},
+		{"stdin file beside inline code", "proj", "python3 -c 'print(1)' < stats.py", "", nil},
+		{"ssh heredoc to a remote shell", "proj", "ssh bl 'bash -s' <<'EOF'\nrm -rf ~/backups\nEOF", probeAttached, []string{"bl:<<EOF"}},
+		{"ssh heredoc to a login shell", "proj", "ssh deploy@bl <<'EOF'\nuptime\nEOF", probeAttached, []string{"bl:<<EOF"}},
+		{"ssh heredoc past options on both sides", "proj", "ssh -p 22 -o BatchMode=yes ssh://u@bl:2222 -t sudo bash -s <<'EOF'\nuptime\nEOF", probeAttached, []string{"bl:<<EOF"}},
+		{"ssh heredoc body is not run here", "proj", "ssh bl bash -s <<'EOF'\npython3 stats.py\nEOF", probeAttached, []string{"bl:<<EOF"}},
+		{"expanding ssh heredoc", "proj", "ssh bl bash <<EOF\nrm -rf $X\nEOF", probeUnresolvable, nil},
+		{"tab-stripped ssh heredoc", "proj", "ssh bl bash -s <<-'EOF'\n\tuptime\n\tEOF", probeUnresolvable, nil},
+		{"local file to a remote shell", "proj", "ssh bl 'bash -s' < smoke.sh", probeAttached, []string{"bl:proj/smoke.sh"}},
+		{"local file through a variable to remote python", ".", "S={root}/proj; ssh bl 'python3 -' < $S/stats.py", probeAttached, []string{"bl:proj/stats.py"}},
+		{"credential-shaped file to a remote shell", "proj", "ssh bl bash -s < keyed.py", probeWithheld, nil},
+		{"ssh -n feeds nothing", "proj", "ssh -n bl 'bash -s' < smoke.sh", "", nil},
+		{"remote command that runs no stdin", "proj", "ssh bl uptime < smoke.sh", "", nil},
+		{"remote statement before the stdin shell", "proj", "ssh bl 'cat > /tmp/a; bash -s' < smoke.sh", "", nil},
+		{"ssh with a remote command option", "proj", "ssh -o RemoteCommand=uptime bl < smoke.sh", "", nil},
+		{"remote redirect names a host file", "proj", "ssh bl 'bash -s < smoke.sh'", probeRemote, nil},
+		{"quoted redirect is the remote shell's", "proj", "ssh bl bash -s '<' smoke.sh", probeRemote, nil},
+		{"remote-only script", "proj", "ssh bl 'bash ~/deploy-v0621.sh'", probeRemote, nil},
+		{"remote binary is no script", "proj", "ssh bl /usr/bin/uptime", "", nil},
+		{"remote substitution is not followed", "proj", "ssh bl 'bash $(ls *.sh)'", "", nil},
+		{"copied then run", "proj", "scp -q stats.py bl:/tmp/x.py && ssh bl 'python3 /tmp/x.py; rm /tmp/x.py'", probeAttached, []string{"bl:proj/stats.py"}},
+		{"copied into a directory", "proj", "rsync -az smoke.sh bl:/srv/ && ssh bl 'cd /srv && bash smoke.sh'", probeAttached, []string{"bl:proj/smoke.sh"}},
+		{"copied to the remote home", "proj", "scp stats.py user@bl: && ssh bl python3 '~/stats.py'", probeAttached, []string{"bl:proj/stats.py"}},
+		{"copied then made executable", "proj", "scp -P 2222 smoke.sh bl:/tmp/s.sh && ssh bl 'chmod +x /tmp/s.sh && /tmp/s.sh'", probeAttached, []string{"bl:proj/smoke.sh"}},
+		{"copy of a script written from a heredoc", "proj", "cat > gen.py <<'EOF'\nprint(1)\nEOF\nscp gen.py bl:/tmp/gen.py && ssh bl python3 /tmp/gen.py", probeAttached, []string{"bl:proj/gen.py"}},
+		{"copied to another host", "proj", "scp stats.py ci:/tmp/x.py && ssh bl python3 /tmp/x.py", probeRemote, nil},
+		{"remote statement between copy and run", "proj", "scp stats.py bl:/tmp/x.py && ssh bl 'sed -i s/a/b/ /tmp/x.py && python3 /tmp/x.py'", probeRemote, nil},
+		{"local program between copy and run", "proj", "scp stats.py bl:/tmp/x.py && make && ssh bl python3 /tmp/x.py", probeRemote, nil},
+		{"rsync dry run copies nothing", "proj", "rsync -n stats.py bl:/tmp/x.py && ssh bl python3 /tmp/x.py", probeRemote, nil},
+		{"copied from a host is not local", "proj", "scp ci:/tmp/x.py bl:/tmp/x.py && ssh bl python3 /tmp/x.py", probeRemote, nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -3498,13 +3533,19 @@ func TestProbeScripts(t *testing.T) {
 			command := strings.ReplaceAll(tt.command, "{root}", root)
 			parsed := tokenize(command)
 			segments := parsed.probeSegments(command)
-			res := probeScripts(segments, parsed.storedHeredocs(segments), filepath.Join(root, tt.cwd))
+			res := probeScripts(segments, parsed.stdinFeeds(segments), parsed.storedHeredocs(segments), filepath.Join(root, tt.cwd))
 			if res.Status != tt.status || (tt.status == "" && res.Missed != "") {
 				t.Fatalf("status = %q, want %q (missed %q)", res.Status, tt.status, res.Missed)
 			}
 			var got []string
 			for _, s := range res.Scripts {
 				rel, _ := filepath.Rel(root, s.Path)
+				if !filepath.IsAbs(s.Path) {
+					rel = s.Path
+				}
+				if s.Host != "" {
+					rel = s.Host + ":" + rel
+				}
 				got = append(got, rel)
 				if len(s.SHA) != 64 || s.Contents == "" {
 					t.Fatalf("incomplete probe: %+v", s)
@@ -3718,6 +3759,13 @@ func TestStoredScript(t *testing.T) {
 	_, state = capture.last()
 	if state.Untrusted.ScriptPath == "" || strings.Contains(state.Untrusted.ScriptPath, token) {
 		t.Fatalf("script path not redacted: %q", state.Untrusted.ScriptPath)
+	}
+
+	v = decide(cfg, "ssh bl 'bash -s' <<'EOF'\n"+secret+"EOF", root, testLogger)
+	_, state = capture.last()
+	if v.Probe != probeAttached || state.Untrusted.ScriptHost != "bl" || state.Untrusted.ScriptPath != "<<EOF" ||
+		!strings.Contains(state.Untrusted.Script, "[REDACTED") || strings.Contains(state.Untrusted.Script, secret[11:40]) {
+		t.Fatalf("remote heredoc: probe %q, untrusted = %+v", v.Probe, state.Untrusted)
 	}
 
 	calls, _ := capture.last()

@@ -4,7 +4,7 @@ title: A script the judge cannot see must be reported, not omitted
 description: When a command runs a script whose body is not attached, the judge rates the harmless-looking command line and allows it, so the probe must follow the command to the real file and say so when it cannot.
 tags: [judge, script-probe, safety]
 status: stable
-generated: { by: claude-code/opus-5-5, at: "2026-10-06T21:00:00Z" }
+generated: { by: claude-code/opus-5-5, at: "2026-10-06T23:30:00Z" }
 sources:
   - id: scripts
     resource: script-judgment harness run on 2026-09-30 against the build at commit 9b552c2, 100 corpus cases, 33 synthetic cases with 3 judge runs each, and an offline pass over 743 script-running corpus commands (results not committed)
@@ -15,6 +15,9 @@ sources:
   - id: eval831
     resource: 5-run judge evaluation of 831 labeled commands on 2026-10-06 (results not committed)
     title: Labeled-command judge evaluation
+  - id: ssh
+    resource: live judge traffic reviewed on 2026-10-06, commands that ran a script on a remote host over ssh (not committed)
+    title: Remote-script judge traffic
 ---
 
 # Finding
@@ -58,7 +61,15 @@ screen.[^scripts]
    nothing but `chmod` or `cd` comes between the write and the run, and
    reports any other earlier write as unresolvable rather than attaching
    what the disk held before.
+5. A script ssh runs on another host is still a script. Agents feed a remote
+   shell a heredoc or a local file, or copy a file with scp and run it there;
+   with no body the judge stayed at low confidence on exactly those
+   commands.[^ssh] What ssh feeds a remote shell or interpreter on stdin, and a
+   local file copied to the path the remote command runs, is attached with the
+   host it runs on. A script that exists only on the host is reported as
+   `remote-only`, never left silent.
 
 [^scripts]: Script-body judging harness
 [^code]: feat: probe scripts behind wrappers, explain judge verdicts, close static holes
 [^eval831]: Labeled-command judge evaluation
+[^ssh]: Remote-script judge traffic

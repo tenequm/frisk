@@ -302,6 +302,38 @@ expanding or `<<-` heredoc, another program's output, a write inside an
 `if`), or anything else between, leaves the script `unresolvable`, noted as
 written earlier in the command.
 
+A file redirected into a shell or interpreter that reads its program from
+stdin (`bash < x.sh`, `sh -s < x.sh`, `python3 - < x.py`) is the script, read
+like a file operand, or taken from the heredoc that wrote it.
+
+ssh runs the words after the destination as a command on that host, so the
+probe reads them as one. Its options are read on both sides of the
+destination; `-N`, `-s`, `-W`, `-O`, `-G`, `-Q`, `-V`, or a `RemoteCommand`,
+`SessionType`, `StdinNull` or `ForkAfterAuthentication` option leave the
+segment unread. When the remote command is a shell or interpreter reading
+stdin, as above, or is absent, which starts a login shell that reads it, what
+ssh is fed is the script: a literal heredoc is attached like a written one,
+redacted, its digest taken of what is sent, under the path `<<DELIM`; a local
+file given with `<` is read like a script operand. Only the first remote
+statement that may read stdin gets it, and `-n` or `-f` feeds nothing. An
+expanding or `<<-` heredoc leaves it `unresolvable`, as for a written script.
+
+A script the remote command runs from a path on the host (`bash ~/deploy.sh`,
+`./x.sh`, a remote `bash -s < /srv/x.sh`) cannot be read, and is reported
+`remote-only` - unless an earlier `scp` or `rsync` in the command copied a
+resolvable local file to that host and path, which is then attached as it
+stood when copied. Remote paths are compared as written, `~` standing for the
+host's home and a literal remote `cd` followed. A copy counts only while
+nothing but `cd`, `chmod` and other copies runs between it and the run, here
+or on that host, as for a written script, and an rsync only with options that
+neither skip files nor move them (`-avzqhPcrlptgoDE`, `-e`, `--rsh`,
+`--chmod=` and long forms such as `--archive`). Every script that runs on a
+host carries it as `host` (`script_host` when it is the only one): the
+destination as the command names it, without user or port, never from config.
+A remote command with control flow, a substitution or a heredoc of its own,
+stdin fed through a pipe, and a remote `sudo bash x.sh` stay as they were: no
+script and no status.
+
 The static tier and the `permissions.deny` / `permissions.ask` rules read the
 same substitution, so every screen runs on the word the shell will see:
 `A=-x; fd . "$A" rm` is screened as `fd . -x rm`, and a deny rule for
@@ -353,7 +385,7 @@ startup, and the instruction says so. Like `git.commands` it is description only
 instructions, and no builtin prose refers to it.
 
 `probe.status` tells the judge why a body is absent: `attached`, `missing`,
-`unresolvable`, `oversize`, `non-utf8`, `multiple-truncated`. A script whose
+`unresolvable`, `oversize`, `non-utf8`, `multiple-truncated`, `remote-only`. A script whose
 resolved path or content looks credential-bearing (`withheld-credential-shaped`)
 is never sent and the verdict is silence.
 

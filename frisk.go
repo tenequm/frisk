@@ -84,6 +84,7 @@ const (
 
 	verbAwk    = "awk"
 	verbCat    = "cat"
+	verbChmod  = "chmod"
 	verbCmd    = "command"
 	verbEnv    = "env"
 	verbGH     = "gh"
@@ -348,6 +349,7 @@ const (
 	probeNonUTF8      = "non-utf8"
 	probeWithheld     = "withheld-credential-shaped"
 	probeTruncated    = "multiple-truncated"
+	probeRemote       = "remote-only"
 )
 
 type permissionsConfig struct {
@@ -1214,12 +1216,7 @@ func (p *parsedCommand) settleHeredocs(docs []heredoc) {
 // shellReadsStdin reports whether seg runs a POSIX shell that takes its script
 // from stdin, which makes a heredoc fed to it commands rather than text.
 func shellReadsStdin(seg []string) bool {
-	inner, _, err := unwrap(seg)
-	for err == nil && len(inner) > 0 && (inner[0] == "sudo" || inner[0] == "doas") {
-		if inner, err = wrapperCommand(inner[0], privilegeSpec, inner[1:]); err == nil {
-			inner, _, err = unwrap(inner)
-		}
-	}
+	inner, err := unwrapPrivileged(seg)
 	if err != nil || len(inner) == 0 {
 		return false
 	}
@@ -1233,8 +1230,38 @@ func shellReadsStdin(seg []string) bool {
 	}
 	// A redirect in operand position is not a script file, and treating the
 	// shell as reading stdin keeps the body probed.
-	arg, found := scriptArg(stdinShellArgs, inner[1:])
-	return !found || strings.IndexAny(strings.TrimLeft(arg, "0123456789&"), "<>") == 0
+	arg, source := scriptArg(stdinShellArgs, inner[1:])
+	return source != fromFile || strings.IndexAny(strings.TrimLeft(arg, "0123456789&"), "<>") == 0
+}
+
+// unwrapPrivileged strips wrappers and sudo or doas, for a program whose
+// stdin is the question, where who runs it changes nothing.
+func unwrapPrivileged(seg []string) ([]string, error) {
+	inner, _, err := unwrap(seg)
+	for err == nil && len(inner) > 0 && (inner[0] == "sudo" || inner[0] == "doas") {
+		if inner, err = wrapperCommand(inner[0], privilegeSpec, inner[1:]); err == nil {
+			inner, _, err = unwrap(inner)
+		}
+	}
+	return inner, err
+}
+
+// stdinScript reports whether seg runs a shell or an interpreter that takes
+// its program from stdin, so a file or heredoc fed to it is the script.
+func stdinScript(seg []string) bool {
+	if shellReadsStdin(seg) {
+		return true
+	}
+	inner, err := unwrapPrivileged(seg)
+	if err != nil || len(inner) == 0 {
+		return false
+	}
+	m := interpreterName.FindStringSubmatch(filepath.Base(inner[0]))
+	if m == nil || m[1] == "" {
+		return false
+	}
+	_, source := scriptArg(interpreterArgs[m[1]], inner[1:])
+	return source == fromStdin
 }
 
 // runsStdin reports a statement that may run what it reads on stdin: a shell
@@ -1953,6 +1980,61 @@ func (p parsedCommand) storedHeredocs(segs [][]string) map[int]storedText {
 		stored[k] = t
 	}
 	return stored
+}
+
+// stdinFeed is what a probe segment's own redirects put on its stdin.
+type stdinFeed struct {
+	words   []string // the segment without its redirect operators and their targets
+	sources int      // its "<" redirects and heredocs
+	file    string   // the target of its one "<", as the probe reads it
+	doc     *heredoc // its one heredoc, when it has no "<"
+}
+
+// stdinFeeds finds, by probe segment, the segments that have redirects. A
+// segment fed by more than one, or past the first substitution or parenthesis,
+// where the tokenizer may read quotes apart from the shell, gets neither a
+// file nor a doc.
+func (p parsedCommand) stdinFeeds(segs [][]string) map[int]stdinFeed {
+	owned := map[int][]heredoc{}
+	for _, d := range p.docs {
+		owned[d.owner] = append(owned[d.owner], d)
+	}
+	feeds := map[int]stdinFeed{}
+	k := -1
+	for i, st := range p.stmts {
+		if st.data {
+			continue
+		}
+		k++
+		words := st.words[st.cmd:]
+		if len(owned[i]) == 0 && !slices.ContainsFunc(words, func(w word) bool { return redirectMark(w.text) }) {
+			continue
+		}
+		f := stdinFeed{words: []string{}}
+		var files []string
+		for n := 0; n < len(words); n++ {
+			if !redirectMark(words[n].text) {
+				f.words = append(f.words, segs[k][n])
+				continue
+			}
+			if words[n].text == "\x01<" && n+1 < len(words) {
+				files = append(files, segs[k][n+1])
+			}
+			n++
+		}
+		f.sources = len(files) + len(owned[i])
+		if p.nested < 0 || i < p.nested {
+			switch docs := owned[i]; {
+			case len(files) == 1 && len(docs) == 0:
+				f.file = files[0]
+			case len(files) == 0 && len(docs) == 1:
+				f.doc = &docs[0]
+			default:
+			}
+		}
+		feeds[k] = f
+	}
+	return feeds
 }
 
 // ghTextFlags names, per gh command, the flags whose value is text it posts.
@@ -2809,7 +2891,7 @@ func spliceDefaults(list, defaults []string) []string {
 func judge(cfg *config, command, cwd string, parsed parsedCommand, lg *slog.Logger) verdict {
 	segments := parsed.probeSegments(command)
 	stored := parsed.storedHeredocs(segments)
-	probe := probeScripts(segments, stored, cwd)
+	probe := probeScripts(segments, parsed.stdinFeeds(segments), stored, cwd)
 	v := verdict{Tier: tierJudge, Probe: probe.Status, Scripts: len(probe.Scripts), ScriptSHA: probe.SHA}
 	if probe.Status == probeWithheld {
 		v.Reason = "script looks credential-bearing, not sent"
@@ -2848,6 +2930,9 @@ func judge(cfg *config, command, cwd string, parsed parsedCommand, lg *slog.Logg
 		untrusted["script_path"] = scripts[0].Path
 		untrusted["script_sha256"] = scripts[0].SHA
 		untrusted["script"] = scripts[0].Contents
+		if scripts[0].Host != "" {
+			untrusted["script_host"] = scripts[0].Host
+		}
 	default:
 		untrusted["scripts"] = scripts
 	}
@@ -3687,6 +3772,7 @@ type scriptProbe struct {
 	Path     string `json:"path"`
 	SHA      string `json:"sha256"`
 	Contents string `json:"contents"`
+	Host     string `json:"host,omitempty"` // the ssh host it runs on, as the command names it
 }
 
 type probeResult struct {
@@ -3775,58 +3861,114 @@ func probeRank(status string) int {
 // same-named file elsewhere is never a stand-in. A file an earlier segment
 // writes is not read from disk, which does not hold what will run yet: the
 // body a stored heredoc puts there is the script, and any other write leaves
-// it unresolvable.
-func probeScripts(segments [][]string, stored map[int]storedText, cwd string) probeResult {
+// it unresolvable. A script ssh runs on a host is what it feeds a remote shell
+// on stdin, or a file an earlier copy put there; any other is remote-only.
+func probeScripts(segments [][]string, feeds map[int]stdinFeed, stored map[int]storedText, cwd string) probeResult {
 	var res probeResult
 	dir := shellDir{path: cwd, known: cwd != ""}
 	seen := map[string]bool{}
 	// written maps each path an earlier segment redirected to onto that
 	// segment, or -1 when what the path holds is not known.
 	written := map[string]int{}
+	// copies holds what an earlier scp or rsync put on a host, read when it ran.
+	copies := map[remoteFile]probedScript{}
 	noclobber := false
 	total := 0
+	// local reads the script at target as it stands when the current segment runs.
+	local := func(target string, direct bool) probedScript {
+		c := probedScript{target: target}
+		resolved, ok := dir.resolve(target)
+		w, rewritten := written[resolved]
+		switch {
+		case ok && rewritten && w >= 0:
+			c.p, c.status = storedProbe(resolved, stored[w].body, direct)
+		case ok && rewritten:
+			c.status, c.why = probeUnresolvable, "written earlier in the command"
+		default:
+			c.p, c.status = probeFile(target, direct, dir)
+			if _, literal := literalPath(target, "/", true); c.status == probeUnresolvable && dir.lost && literal {
+				c.why = c.status + " after cd"
+			}
+		}
+		return c
+	}
+	add := func(c probedScript, host string) {
+		c.p.Host = host
+		key := host + "\x00" + c.p.Path + "\x00" + c.p.SHA
+		switch {
+		case c.status == probeAttached && seen[key]:
+		case c.status == probeAttached && total+len(c.p.Contents) > maxScriptBytes:
+			c.status, c.why = probeTruncated, ""
+		case c.status == probeAttached:
+			seen[key] = true
+			total += len(c.p.Contents)
+			res.Scripts = append(res.Scripts, c.p)
+		default:
+		}
+		res.note(c.status)
+		res.miss(c.target, cmp.Or(c.why, c.status))
+		if res.SHA == "" {
+			res.SHA = c.p.SHA
+		}
+	}
 	for k, seg := range segments {
 		if len(seg) == 0 || dir.step(seg) {
 			continue
 		}
-		target, direct, status := scriptTarget(seg)
-		var p scriptProbe
-		switch {
+		feed := feeds[k]
+		cmd := seg
+		if feed.words != nil {
+			cmd = feed.words
+		}
+		ssh, isSSH := sshCommand(cmd)
+		cp, isCopy := copyCommand(cmd)
+		switch target, direct, status := scriptTarget(cmd); {
+		case isSSH:
+			host := ssh.host
+			runs, changes := remoteRuns(ssh.remote)
+			for _, r := range runs {
+				c, copied := copies[remoteFile{host, r.path}]
+				switch {
+				case r.target != "" && copied && r.path != "" && !r.stale:
+					add(c, host)
+				case r.target != "":
+					add(probedScript{target: r.target, status: probeRemote, why: "lives on remote host " + host}, host)
+				case !ssh.stdin:
+				case feed.file != "":
+					add(local(feed.file, false), host)
+				case feed.doc == nil:
+				case !feed.doc.literal:
+					add(probedScript{status: probeUnresolvable, why: "heredoc expands before it reaches " + host}, host)
+				case feed.doc.tabs:
+					add(probedScript{status: probeUnresolvable, why: "heredoc strips tabs before it reaches " + host}, host)
+				default:
+					body, bodyStatus := storedProbe("<<"+feed.doc.delim, feed.doc.text, false)
+					add(probedScript{p: body, status: bodyStatus}, host)
+				}
+			}
+			if changes {
+				maps.DeleteFunc(copies, func(f remoteFile, _ probedScript) bool { return f.host == host })
+			}
+		case isCopy:
+			for _, src := range cp.srcs {
+				at := cp.dest
+				if cp.destDir {
+					at = filepath.Join(cp.dest, filepath.Base(src))
+				}
+				copies[remoteFile{cp.host, at}] = local(src, false)
+			}
 		case status != "":
 			res.note(status)
 			res.miss(target, status)
+		case target == "" && feed.file != "" && stdinScript(cmd):
+			add(local(feed.file, false), "")
 		case target == "":
 		default:
-			path, ok := dir.resolve(target)
-			w, rewritten := written[path]
-			switch {
-			case ok && rewritten && w >= 0:
-				p, status = storedProbe(path, stored[w].body, direct)
-			case ok && rewritten:
-				status = probeUnresolvable
-				res.miss(target, "written earlier in the command")
-			default:
-				p, status = probeFile(target, direct, dir)
-			}
-			switch {
-			case status == probeAttached && seen[p.Path]:
-			case status == probeAttached && total+len(p.Contents) > maxScriptBytes:
-				status = probeTruncated
-			case status == probeAttached:
-				seen[p.Path] = true
-				total += len(p.Contents)
-				res.Scripts = append(res.Scripts, p)
-			case status == probeUnresolvable && dir.lost:
-				if _, literal := literalPath(target, "/", true); literal {
-					res.miss(target, status+" after cd")
-				}
-			default:
-			}
-			res.note(status)
-			res.miss(target, status)
-			if res.SHA == "" {
-				res.SHA = p.SHA
-			}
+			add(local(target, direct), "")
+		}
+		// A program may change a host's files by means the command does not show.
+		if !isSSH && !isCopy && seg[0] != verbChmod {
+			clear(copies)
 		}
 		// Any program but chmod may change a file written earlier by means no
 		// redirect shows (cp, tee, a script it runs), and so may a cat > file
@@ -3834,7 +3976,7 @@ func probeScripts(segments [][]string, stored map[int]storedText, cwd string) pr
 		// case-insensitive disk reads as the same file.
 		own, ownKnown := dir.resolve(stored[k].path)
 		for path, w := range written {
-			if w >= 0 && seg[0] != "chmod" && (!stored[k].exact || !ownKnown || path != own && strings.EqualFold(path, own)) {
+			if w >= 0 && seg[0] != verbChmod && (!stored[k].exact || !ownKnown || path != own && strings.EqualFold(path, own)) {
 				written[path] = -1
 			}
 		}
@@ -3857,6 +3999,269 @@ func probeScripts(segments [][]string, stored map[int]storedText, cwd string) pr
 		}
 	}
 	return res
+}
+
+// probedScript is a script read for the probe, kept with why it is not
+// attached when it is not.
+type probedScript struct {
+	target string // as the command names it, for the reason
+	p      scriptProbe
+	status string
+	why    string // the reason when it says more than the status
+}
+
+// remoteFile is a path on an ssh host, as remotePath reads it.
+type remoteFile struct{ host, path string }
+
+// sshValueLetters are the ssh options that take a value.
+const sshValueLetters = "BbcDEeFIiJLlmOoPpQRSWw"
+
+// sshRun is what an ssh segment runs on host, as the command names it: the
+// words ssh hands the remote shell, none for a login shell, which reads stdin
+// as its script, and whether ssh passes its stdin on.
+type sshRun struct {
+	host   string
+	remote []string
+	stdin  bool
+}
+
+// sshCommand reads an ssh segment. ok is false for any other segment, and for
+// options that run no command or another one.
+func sshCommand(seg []string) (sshRun, bool) {
+	inner, err := unwrapPrivileged(seg)
+	if err != nil || len(inner) == 0 || filepath.Base(inner[0]) != "ssh" {
+		return sshRun{}, false
+	}
+	run := sshRun{stdin: true}
+	dest := ""
+	args := inner[1:]
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--" && dest == "" && i+1 < len(args):
+			run.host, run.remote = sshHost(args[i+1]), args[i+2:]
+			return run, true
+		case a == "--":
+			run.host, run.remote = sshHost(dest), args[i+1:]
+			return run, dest != ""
+		case len(a) > 1 && a[0] == '-':
+			for j := 1; j < len(a); j++ {
+				c := a[j]
+				// -G, -N, -O, -Q, -s, -V and -W run no remote command.
+				if strings.IndexByte("GNOQsVW", c) >= 0 {
+					return sshRun{}, false
+				}
+				// -f implies -n: stdin is /dev/null.
+				run.stdin = run.stdin && c != 'n' && c != 'f'
+				if strings.IndexByte(sshValueLetters, c) < 0 {
+					continue
+				}
+				value := a[j+1:]
+				if value == "" && i+1 < len(args) {
+					i++
+					value = args[i]
+				}
+				key, _, _ := strings.Cut(strings.ToLower(strings.TrimSpace(value)), "=")
+				key, _, _ = strings.Cut(key, " ")
+				if c == 'o' && (key == "remotecommand" || key == "sessiontype" || key == "stdinnull" || key == "forkafterauthentication") {
+					return sshRun{}, false
+				}
+				break
+			}
+		case dest == "":
+			// ssh reads options after the destination too.
+			dest = a
+		default:
+			run.host, run.remote = sshHost(dest), args[i:]
+			return run, true
+		}
+	}
+	run.host = sshHost(dest)
+	return run, dest != ""
+}
+
+// sshHost drops the user, and for an ssh:// destination the port, from what
+// ssh or scp connects to.
+func sshHost(dest string) string {
+	if u, err := url.Parse(dest); err == nil && u.Scheme == "ssh" {
+		return u.Hostname()
+	}
+	return dest[strings.LastIndex(dest, "@")+1:]
+}
+
+// rsyncFlags are the rsync options that change neither which files are sent
+// nor where they land; any other option leaves an rsync unread, since some do
+// (--dry-run, --update, --existing, --relative, --files-from).
+var rsyncFlags = map[string]bool{
+	"--archive": true, "--verbose": true, "--compress": true, "--quiet": true, "--human-readable": true,
+	"--progress": true, "--partial": true, "--checksum": true, "--recursive": true, "--links": true,
+	"--perms": true, "--times": true, "--executability": true, "--stats": true,
+}
+
+// remoteCopy is local files, as the command names them, that scp or rsync
+// puts on host: at dest, or into it when destDir.
+type remoteCopy struct {
+	host    string
+	srcs    []string
+	dest    string
+	destDir bool
+}
+
+// copyCommand reads an scp or rsync segment that copies local files to one
+// host. ok is false for any other segment.
+func copyCommand(seg []string) (remoteCopy, bool) {
+	inner, _, err := unwrap(seg)
+	if err != nil || len(inner) < 3 {
+		return remoteCopy{}, false
+	}
+	verb, args := filepath.Base(inner[0]), inner[1:]
+	scp := verb == "scp"
+	if !scp && verb != "rsync" {
+		return remoteCopy{}, false
+	}
+	var operands []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--":
+			operands = append(operands, args[i+1:]...)
+			i = len(args)
+		// scp reads options only ahead of its operands.
+		case len(a) < 2 || a[0] != '-' || scp && len(operands) > 0:
+			operands = append(operands, a)
+		case scp:
+			if j := strings.IndexAny(a[1:], "cDFiJloPSX"); j == len(a)-2 {
+				i++
+			}
+		case strings.HasPrefix(a, "--"):
+			name, _, attached := strings.Cut(a, "=")
+			switch {
+			case name == "--rsh" && !attached:
+				i++
+			case name == "--rsh", name == "--chmod" && attached, rsyncFlags[a]:
+			default:
+				return remoteCopy{}, false
+			}
+		default:
+			if strings.Trim(a[1:], "avzqhPcrlptgoDE") != "" {
+				if a[1:] != "e" {
+					return remoteCopy{}, false
+				}
+				i++
+			}
+		}
+	}
+	if len(operands) < 2 {
+		return remoteCopy{}, false
+	}
+	cp := remoteCopy{srcs: operands[:len(operands)-1]}
+	to, remote := remoteSpec(operands[len(operands)-1])
+	if !remote || slices.ContainsFunc(cp.srcs, func(s string) bool { _, r := remoteSpec(s); return r }) {
+		return remoteCopy{}, false
+	}
+	cp.host, cp.destDir = to.host, to.path == "" || strings.HasSuffix(to.path, "/") || len(cp.srcs) > 1
+	var ok bool
+	cp.dest, ok = remotePath(cmp.Or(to.path, "~"), "~")
+	return cp, ok
+}
+
+// remoteSpec splits [user@]host:path the way scp and rsync tell it from a
+// local path: by a colon before any slash. The path is as written.
+func remoteSpec(arg string) (remoteFile, bool) {
+	before, after, found := strings.Cut(arg, ":")
+	if !found || before == "" || strings.ContainsAny(before, "/[") || strings.HasPrefix(after, ":") {
+		return remoteFile{}, false
+	}
+	return remoteFile{sshHost(before), after}, true
+}
+
+// remotePath reads a literal path on an ssh host against dir there, "" when
+// that is unknown. "~" stands for the host's home, which is not this machine's.
+func remotePath(tok, dir string) (string, bool) {
+	switch {
+	case tok == "" || strings.ContainsAny(tok, "$`*?[{"):
+		return "", false
+	case tok == "~" || strings.HasPrefix(tok, "~/") || filepath.IsAbs(tok):
+	case strings.HasPrefix(tok, "~") || dir == "":
+		return "", false
+	default:
+		tok = dir + "/" + tok
+	}
+	// Cleaning "~/.." would drop the home it stands for.
+	if p := filepath.Clean(tok); p == "~" || strings.HasPrefix(p, "~/") || filepath.IsAbs(p) {
+		return p, true
+	}
+	return "", false
+}
+
+// remoteRun is one script a remote command runs on its host.
+type remoteRun struct {
+	target string // as written, "" for what ssh feeds on stdin
+	path   string // on the host, "" when it cannot be pinned down
+	stale  bool   // an earlier statement may have changed the host's files
+}
+
+// remoteRuns lists, in order, the scripts a remote command runs on its host,
+// none for one this does not follow: control flow, a substitution, a heredoc
+// of its own. changes reports such a command or a statement other than cd or
+// chmod, which may change any file there.
+func remoteRuns(remote []string) ([]remoteRun, bool) {
+	if len(remote) == 0 {
+		return []remoteRun{{}}, true
+	}
+	var runs []remoteRun
+	changes := false
+	rp := tokenize(strings.Join(remote, " "))
+	if rp.unsound || rp.nested >= 0 || len(rp.docs) > 0 {
+		return nil, true
+	}
+	segs := rp.segments()
+	feeds := rp.stdinFeeds(segs)
+	dir := "~"
+	for j, seg := range segs {
+		if len(seg) == 0 {
+			continue
+		}
+		if controlWords[seg[0]] {
+			return nil, true
+		}
+		cmd := seg
+		feed, fed := feeds[j]
+		if fed {
+			cmd = feed.words
+		}
+		if len(cmd) == 0 {
+			continue
+		}
+		switch target, direct, status := scriptTarget(cmd); {
+		case cmd[0] == "cd":
+			switch {
+			case len(cmd) == 1:
+				dir = "~"
+			case len(cmd) == 2 && !strings.HasPrefix(cmd[1], "-") && !strings.HasPrefix(cmd[1], "+"):
+				dir, _ = remotePath(cmd[1], dir)
+			default:
+				dir = ""
+			}
+			continue
+		case target != "" && (!direct || scriptExtensions[filepath.Ext(target)]), status != "":
+			at, _ := remotePath(target, dir)
+			runs = append(runs, remoteRun{target: cmp.Or(target, cmd[0]), path: at, stale: changes})
+		case !stdinScript(cmd):
+		case feed.file != "":
+			// Its own "<" names a file on the host.
+			at, _ := remotePath(feed.file, dir)
+			runs = append(runs, remoteRun{target: feed.file, path: at, stale: changes})
+		case feed.sources == 0 && !changes:
+			// Only the first statement that may read ssh's stdin gets it.
+			runs = append(runs, remoteRun{})
+		default:
+		}
+		if cmd[0] != verbChmod {
+			changes = true
+		}
+	}
+	return runs, changes
 }
 
 // literalPath resolves tok only when the shell would read it verbatim: no
@@ -3903,7 +4308,7 @@ func scriptTarget(seg []string) (string, bool, string) {
 		if family == "" {
 			family = "sh"
 		}
-		if arg, runsFile := scriptArg(interpreterArgs[family], inner[1:]); runsFile {
+		if arg, source := scriptArg(interpreterArgs[family], inner[1:]); source == fromFile {
 			return arg, false, ""
 		}
 		return "", false, ""
@@ -3997,23 +4402,32 @@ func flagIn(tok string, flags []string) (bool, int) {
 	return false, 0
 }
 
-// scriptArg finds the script path among interpreter arguments; false means
-// the code comes inline (-c, -m, -e) or from stdin.
-func scriptArg(spec argSpec, args []string) (string, bool) {
+// codeSource says where an interpreter takes its program from.
+type codeSource int
+
+const (
+	fromStdin codeSource = iota
+	fromFile
+	fromInline // -c, -m, -e
+)
+
+// scriptArg finds where interpreter arguments take the program from, and the
+// script path when it is a file.
+func scriptArg(spec argSpec, args []string) (string, codeSource) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
 		case a == "-" || stdinPaths[a]:
-			return "", false
+			return "", fromStdin
 		case a == "--":
 			if i+1 < len(args) {
-				return args[i+1], true
+				return args[i+1], fromFile
 			}
-			return "", false
+			return "", fromStdin
 		case strings.HasPrefix(a, "--"):
 			name, _, attached := strings.Cut(a, "=")
 			if slices.Contains(spec.inlineLong, name) {
-				return "", false
+				return "", fromInline
 			}
 			if !attached && slices.Contains(spec.valueLong, name) {
 				i++
@@ -4021,7 +4435,7 @@ func scriptArg(spec argSpec, args []string) (string, bool) {
 		case len(a) > 1 && (a[0] == '-' || a[0] == '+'):
 			for j := 1; j < len(a); j++ {
 				if strings.IndexByte(spec.inlineLetters, a[j]) >= 0 {
-					return "", false
+					return "", fromInline
 				}
 				if strings.IndexByte(spec.valueLetters, a[j]) >= 0 {
 					if j == len(a)-1 {
@@ -4031,10 +4445,10 @@ func scriptArg(spec argSpec, args []string) (string, bool) {
 				}
 			}
 		default:
-			return a, true
+			return a, fromFile
 		}
 	}
-	return "", false
+	return "", fromStdin
 }
 
 var errNotRegular = errors.New("not a regular file")
