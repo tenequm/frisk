@@ -382,6 +382,7 @@ where it is built, so `frisk check` and the permission prompt show the same text
 
 - `frisk hook` - the PreToolUse handler
 - `frisk check '<command>'` - dry-run, prints decision + tier + reason
+- `frisk check --replay <capture-file>` - judge a captured state again, see below
 - `frisk validate [--live]` - config health check, see below
 
 ```json
@@ -396,6 +397,31 @@ where it is built, so `frisk check` and the permission prompt show the same text
 ```
 
 Uninstall = remove the hook entry.
+
+## Capture and replay
+
+The log keeps the command and the verdict, not what the judge was shown. A
+replay through `frisk check` rebuilds the trusted state from the replaying
+machine: today's branch and remotes, and a probe that finds most scripts gone,
+so its verdicts skew toward ask
+([finding](docs/knowledge/replays-are-skewed-by-trusted-state.md)).
+
+`--capture <dir>` on `hook` and `check` writes one file per answered judge
+call, `<UTC time>-<8 hex of sha256(command)>.json`: time, entry, the command as
+sent, cwd, endpoint and model, the request body byte for byte, the parsed
+answers and the final verdict. It holds only what the request already carried,
+redacted and screened as sent; never the key or the `apiKey` expression, and an
+endpoint's userinfo is masked. A capture holds command text and script bodies,
+so it is a command-line option only - no config key, nothing from the
+environment - written where the user points it, directory `0700`, file `0600`,
+never over an existing file. A failure to write is logged and changes nothing.
+
+`frisk check --replay <file>` sends the captured `state` unchanged and builds
+the questions from the current `judge` prose, then applies the same floors and
+`judge.decisions` as a live call. With `--capture` the replay is captured too,
+so two configs or models can be compared on the same inputs. A file without a
+request state exits 1 with `silent replay-error`. The reason carries no
+"script not attached" note: that comes from the probe, which a replay skips.
 
 ## File tools
 
