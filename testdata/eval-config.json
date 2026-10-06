@@ -52,7 +52,7 @@
     "soft_deny": ["$defaults", "Modifying local tool state outside the project"],
     "hard_deny": ["$defaults"]
   },
-  "jev": {
+  "backend": {
     "model": "jev-1.13.0",
     "timeoutMs": 5000
   }

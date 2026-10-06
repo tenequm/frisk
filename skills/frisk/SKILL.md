@@ -34,8 +34,9 @@ only the user's config allows anything. Full detail:
    command that prints the key, for example
    `"$(gopass show -o api/typesafe)"`. `"${VAR}"` works too, but a
    repository's settings can set the session environment, so prefer a
-   command. A literal key works but `validate` warns: the config is readable. Without a key, frisk runs
-   rules-only and all unmatched commands fall through. `backend.endpoint`
+   command. A literal key works but `validate` warns: the config is
+   readable. Without a key, frisk runs rules-only and all unmatched commands
+   fall through. `backend.endpoint`
    defaults to TypeSafe; OpenRouter is `https://openrouter.ai/api/v1/systemone`
    with model `jev-1.13` and an OpenRouter key. The old `jev` block still loads
    with a deprecation warning.

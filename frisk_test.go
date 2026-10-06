@@ -922,6 +922,9 @@ func TestValidateBackend(t *testing.T) {
 		{"empty expansion", `{"backend":{"apiKey":"$(true)"}}`, 1, []string{"error: backend.apiKey: ", "expanded to nothing"}},
 		{"custom endpoint", `{"backend":{"endpoint":"https://openrouter.ai/api/v1/systemone"}}`, 0, []string{"backend.endpoint: https://openrouter.ai/api/v1/systemone (file)"}},
 		{"loopback http endpoint", `{"backend":{"endpoint":"http://127.0.0.1:8080/v1/systemone"}}`, 0, []string{"(file)"}},
+		{"localhost http endpoint", `{"backend":{"endpoint":"http://localhost:8080/v1/systemone"}}`, 0, []string{"(file)"}},
+		{"ipv6 loopback http endpoint", `{"backend":{"endpoint":"http://[::1]:8080/v1/systemone"}}`, 0, []string{"(file)"}},
+		{"look-alike loopback host", `{"backend":{"endpoint":"http://localhost.example.com/v1/systemone"}}`, 1, []string{"error: backend.endpoint"}},
 		{"plain http endpoint", `{"backend":{"endpoint":"http://example.com/v1/systemone"}}`, 1, []string{"error: backend.endpoint", "want an https URL"}},
 		{"negative timeout", `{"backend":{"timeoutMs":-1}}`, 1, []string{"error: backend.timeoutMs -1"}},
 		{
@@ -929,6 +932,8 @@ func TestValidateBackend(t *testing.T) {
 			[]string{"warning: jev is deprecated", "backend.apiKey resolved", `backend.model: "m1" (file)`, "backend.timeout: 1.5s"},
 		},
 		{"jev and backend conflict", `{"jev":{"model":"a"},"backend":{"model":"b"}}`, 1, []string{"error:", "model: set in both jev and backend"}},
+		{"jev and backend key conflict", `{"jev":{"keyCmd":["echo","a"]},"backend":{"apiKey":"$(echo b)"}}`, 1, []string{"error:", "keyCmd/apiKey: set in both"}},
+		{"jev and backend timeout conflict", `{"jev":{"timeoutMs":100},"backend":{"timeoutMs":200}}`, 1, []string{"error:", "timeoutMs: set in both"}},
 		{"jev alias failing", `{"jev":{"keyCmd":["false"]}}`, 1, []string{"error: backend.apiKey: "}},
 	}
 	for _, tt := range tests {
@@ -976,7 +981,7 @@ func TestValidateFlagsOverrideFile(t *testing.T) {
 func TestHookFlagErrorsStaySilent(t *testing.T) {
 	newHookEnv(t, `{"permissions":{"deny":["rm *"]}}`)
 	in := `{"tool_name":"Bash","tool_input":{"command":"rm -rf x"},"cwd":"/tmp"}`
-	for _, args := range [][]string{{"hook", "--backend.timeoutMs=soon"}, {"hook", "--nope"}, {"hook", "--backend.endpoint=http://example.com"}, {"hook", "--backend.apiKey=sk-literal"}} {
+	for _, args := range [][]string{{"hook", "--backend.timeoutMs=soon"}, {"hook", "--nope"}, {"hook", "--backend.endpoint=http://example.com"}, {"hook", "--backend.apiKey=sk-literal"}, {"--log-level=debug", "hook"}} {
 		var out strings.Builder
 		if code := run(args, strings.NewReader(in), &out); code != 0 || out.Len() != 0 {
 			t.Errorf("%v: code = %d, out = %q", args, code, out.String())
@@ -1001,7 +1006,6 @@ func TestCheckTakesFlagsBeforeCommand(t *testing.T) {
 
 const judgeCfg = `{"permissions":{"allow":["ls *"]},"backend":{"model":"jev-test","apiKey":"test-key"}}`
 
-// runHookCommand feeds one Bash call to `frisk hook` with extra flags.
 func runHookCommand(t *testing.T, command, cwd string, flags ...string) (string, int) {
 	t.Helper()
 	in, err := json.Marshal(map[string]any{"tool_name": "Bash", "tool_input": map[string]string{"command": command}, "cwd": cwd})
@@ -1022,7 +1026,6 @@ func readLog(t *testing.T) string {
 	return string(raw)
 }
 
-// verdictLines returns the verdict records in frisk.log, in order.
 func verdictLines(t *testing.T) []map[string]json.RawMessage {
 	t.Helper()
 	var lines []map[string]json.RawMessage
@@ -1092,11 +1095,14 @@ func TestDebugLogRecordsJudgeRequest(t *testing.T) {
 // A replay sends each logged state untouched, so the machine's present git
 // facts and scripts cannot skew it, and judges it with the current prose.
 func TestReplayRejudgesLoggedRequests(t *testing.T) {
-	e := newHookEnv(t, `{"permissions":{"allow":["ls *"]},"backend":{"model":"jev-test","apiKey":"test-key"},"judge":{"soft_deny":["old ask prose"]}}`)
+	e := newHookEnv(t, `{"permissions":{"allow":["ls *"]},"backend":{"model":"jev-test","apiKey":"test-key"},"judge":{"soft_deny":["old ask prose"],"environment":["old environment fact"]}}`)
 	_, first := fakeJevCapture(t, jevAnswer{Choice: "ask", Confidence: 0.90})
-	commands := []string{"git push", "ls -la", "terraform plan"}
-	for _, c := range commands {
-		if _, code := runHookCommand(t, c, t.TempDir(), "--log-level", "debug"); code != 0 {
+	cwd := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cwd, "smoke.sh"), []byte("echo smoke\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []string{"git push", "ls -la", "bash smoke.sh"} {
+		if _, code := runHookCommand(t, c, cwd, "--log-level", "debug"); code != 0 {
 			t.Fatalf("hook exit = %d", code)
 		}
 	}
@@ -1106,7 +1112,7 @@ func TestReplayRejudgesLoggedRequests(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	newCfg := `{"backend":{"model":"jev-test","apiKey":"test-key"},"judge":{"soft_deny":["new ask prose"],"decisions":["allow","deny"]}}`
+	newCfg := `{"backend":{"model":"jev-test","apiKey":"test-key"},"judge":{"soft_deny":["new ask prose"],"environment":["new environment fact"],"decisions":["allow","deny"]}}`
 	if err := os.WriteFile(filepath.Join(e.cfgDir, "frisk", "config.json"), []byte(newCfg), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1126,14 +1132,20 @@ func TestReplayRejudgesLoggedRequests(t *testing.T) {
 		}
 	}
 
+	// The policy is current prose, so only the rest must match the log.
 	stateOf := func(raw string) string {
 		var req struct {
-			State json.RawMessage `json:"state"`
+			State map[string]json.RawMessage `json:"state"`
 		}
 		if err := json.Unmarshal([]byte(raw), &req); err != nil {
 			t.Fatal(err)
 		}
-		return string(req.State)
+		delete(req.State, "policy")
+		out, err := json.Marshal(req.State)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(out)
 	}
 	sent, replayed := first.sent(), second.sent()
 	if len(sent) != 2 || len(replayed) != 2 {
@@ -1143,24 +1155,33 @@ func TestReplayRejudgesLoggedRequests(t *testing.T) {
 		if stateOf(replayed[i]) != stateOf(sent[i]) {
 			t.Fatalf("replay %d sent another state:\n%s\n%s", i, stateOf(replayed[i]), stateOf(sent[i]))
 		}
-		if !strings.Contains(replayed[i], `"new ask prose"`) || strings.Contains(replayed[i], "old ask prose") {
+		if !strings.Contains(replayed[i], `"new ask prose"`) || strings.Contains(replayed[i], "old ask prose") ||
+			!strings.Contains(replayed[i], `"new environment fact"`) || strings.Contains(replayed[i], "old environment fact") {
 			t.Fatalf("replay did not use the current prose: %s", replayed[i])
 		}
 	}
 
 	// At debug each replay is logged with its own request, for an A/B diff.
-	var checks []map[string]json.RawMessage
+	var hooks, checks []map[string]json.RawMessage
 	for _, rec := range verdictLines(t) {
 		if string(rec["entry"]) == `"check"` {
 			checks = append(checks, rec)
+		} else if string(rec["tier"]) == `"judge"` {
+			hooks = append(hooks, rec)
 		}
 	}
-	if len(checks) != 2 || string(checks[0]["command"]) != `"git push"` || string(checks[1]["command"]) != `"terraform plan"` {
+	if len(checks) != 2 || string(checks[0]["command"]) != `"git push"` || string(checks[1]["command"]) != `"bash smoke.sh"` {
 		t.Fatalf("replay log lines = %d", len(checks))
+	}
+	if len(hooks) != 2 || string(hooks[1]["scripts"]) != "1" {
+		t.Fatalf("live judge lines = %d, script line %s", len(hooks), hooks[1]["scripts"])
 	}
 	for i, rec := range checks {
 		if string(rec["request"]) != replayed[i] || string(rec["decision"]) != `"silent"` {
 			t.Fatalf("replay log line %d = %s", i, rec["request"])
+		}
+		if string(rec["probe"]) != string(hooks[i]["probe"]) || string(rec["scripts"]) != string(hooks[i]["scripts"]) || string(rec["script_sha256"]) != string(hooks[i]["script_sha256"]) {
+			t.Fatalf("replay log line %d probe = %s/%s, live %s/%s", i, rec["probe"], rec["scripts"], hooks[i]["probe"], hooks[i]["scripts"])
 		}
 	}
 
@@ -1188,6 +1209,12 @@ func TestReplaySkipsAndFails(t *testing.T) {
 	}
 	if calls, _ := fake.last(); calls != 0 {
 		t.Fatalf("judge called %d times for lines without a request state", calls)
+	}
+
+	newHookEnv(t, `{"backend":{"apiKey":"$(true)"}}`)
+	out.Reset()
+	if code := run([]string{"check", "--replay", path}, strings.NewReader(""), &out); code != 1 || out.String() != "silent replay-error backend.apiKey: expanded to nothing: no API key\n" {
+		t.Errorf("unresolved key: code = %d, out = %q", code, out.String())
 	}
 }
 
@@ -1232,6 +1259,7 @@ func TestFlagRules(t *testing.T) {
 	}{
 		{"literal key flag refused", []string{"--backend.apiKey=sk-literal"}, 1, "error: a literal key on the command line"},
 		{"key expression flag", []string{"--backend.apiKey=$(echo k)"}, 0, "backend.apiKey: set (flag)"},
+		{"backtick key flag", []string{"--backend.apiKey=`echo k`"}, 0, "backend.apiKey: set (flag)"},
 		{"zero timeout means default", []string{"--backend.timeoutMs=0"}, 0, "backend.timeout: 5s (flag)"},
 		{"negative timeout flag", []string{"--backend.timeoutMs=-5"}, 1, "error: backend.timeoutMs -5"},
 		{"endpoint userinfo redacted", []string{"--backend.endpoint=https://user:hunter2@example.com/v1/systemone"}, 0, "backend.endpoint: https://user:xxxxx@example.com/v1/systemone (flag)"},
@@ -1265,8 +1293,9 @@ func TestResolveAPIKeyTimeoutKillsKeyCommand(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "survived")
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	if _, err := resolveAPIKey(ctx, "$(sleep 1; touch "+marker+"; echo k)"); err == nil {
-		t.Fatal("want a timeout error")
+	start := time.Now()
+	if _, err := resolveAPIKey(ctx, "$(sleep 1; touch "+marker+"; echo k)"); err == nil || time.Since(start) > 900*time.Millisecond {
+		t.Fatalf("want a prompt timeout error, got %v after %s", err, time.Since(start))
 	}
 	time.Sleep(1500 * time.Millisecond)
 	if _, err := os.Stat(marker); err == nil {
@@ -1279,6 +1308,7 @@ func TestResolveAPIKey(t *testing.T) {
 	ctx := context.Background()
 	tests := []struct{ raw, want string }{
 		{"plain-key", "plain-key"},
+		{" plain-key\n", "plain-key"},
 		{"${FRISK_TEST_KEY}", "from-env"},
 		{"$(printf '%s\\n' from-cmd)", "from-cmd"},
 		{`$(echo "quoted value")`, "quoted value"},
@@ -1290,17 +1320,10 @@ func TestResolveAPIKey(t *testing.T) {
 			t.Errorf("resolveAPIKey(%q) = %q, %v; want %q", tt.raw, got, err, tt.want)
 		}
 	}
-	for _, raw := range []string{"", "$(false)", "$(true)", "${FRISK_UNSET_FOR_TEST}"} {
+	for _, raw := range []string{"", "  ", "$(false)", "$(true)", "${FRISK_UNSET_FOR_TEST}"} {
 		if got, err := resolveAPIKey(ctx, raw); err == nil {
 			t.Errorf("resolveAPIKey(%q) = %q, want an error", raw, got)
 		}
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
-	defer cancel()
-	start := time.Now()
-	if _, err := resolveAPIKey(ctx, "$(sleep 5)"); err == nil || time.Since(start) > 2*time.Second {
-		t.Errorf("hung helper: err = %v after %s", err, time.Since(start))
 	}
 }
 
@@ -1320,10 +1343,7 @@ func TestValidateLive(t *testing.T) {
 		t.Fatalf("no live call without --live: %s", out)
 	}
 
-	prev := defaultEndpoint
-	defaultEndpoint = "http://127.0.0.1:1"
-	t.Cleanup(func() { defaultEndpoint = prev })
-	out, code = validateOutput(t, cfg, "--live")
+	out, code = validateOutput(t, cfg, "--live", "--backend.endpoint=http://127.0.0.1:1")
 	if code != 1 || !strings.Contains(out, "error: live judge call failed") {
 		t.Fatalf("unreachable judge: code = %d, out = %s", code, out)
 	}
@@ -1930,7 +1950,6 @@ func TestOnlyConfigRulesAllow(t *testing.T) {
 type jevCapture struct {
 	mu    sync.Mutex
 	calls int
-	raw   string
 	raws  []string
 	req   jevRequest
 }
@@ -1974,10 +1993,12 @@ func (c *jevCapture) last() (int, jevState) {
 func (c *jevCapture) request() (string, jevRequest) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.raw, c.req
+	if len(c.raws) == 0 {
+		return "", c.req
+	}
+	return c.raws[len(c.raws)-1], c.req
 }
 
-// sent returns every request body received, in order.
 func (c *jevCapture) sent() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -2014,7 +2035,7 @@ func fakeJevAnswers(t *testing.T, answers map[string]any) (*config, *jevCapture)
 		}
 		capture.mu.Lock()
 		capture.calls++
-		capture.raw, capture.req = string(raw), req
+		capture.req = req
 		capture.raws = append(capture.raws, string(raw))
 		capture.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -3176,10 +3197,7 @@ func TestDescribeGit(t *testing.T) {
 }
 
 func TestBackendUnreachableIsSilence(t *testing.T) {
-	prev := defaultEndpoint
-	defaultEndpoint = "http://127.0.0.1:1"
-	t.Cleanup(func() { defaultEndpoint = prev })
-	cfg := &config{Backend: backendConfig{Model: "jev-test", APIKey: "k", TimeoutMs: 200}}
+	cfg := &config{Backend: backendConfig{Endpoint: "http://127.0.0.1:1", Model: "jev-test", APIKey: "k", TimeoutMs: 200}}
 	if v := decide(cfg, "terraform plan", t.TempDir(), testLogger); v.Decision != "" {
 		t.Fatalf("unreachable backend must be silence, got %q", v.Decision)
 	}

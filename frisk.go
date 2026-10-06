@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"maps"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -379,6 +380,9 @@ type backendConfig struct {
 	// literal, ${VAR} and $(command) all work as they would in sh.
 	APIKey    string `json:"apiKey"`
 	TimeoutMs int    `json:"timeoutMs"`
+	// key is APIKey once resolved, so a replay or `validate --live` runs the
+	// key command once rather than per call.
+	key string
 }
 
 func (b backendConfig) endpoint() string {
@@ -404,7 +408,8 @@ type config struct {
 	Judge       judgeConfig       `json:"judge"`
 	Backend     backendConfig     `json:"backend"`
 	Jev         *jevConfig        `json:"jev"`
-	// flagged names the options a command-line flag set, for validate's report.
+	// flagged names the options a command-line flag set: validate reports
+	// them, and checkConfig refuses a literal key among them.
 	flagged map[string]bool
 }
 
@@ -460,7 +465,13 @@ func run(args []string, stdin io.Reader, stdout io.Writer) int {
 	}
 
 	if len(args) == 0 || !slices.Contains([]string{cmdHook, cmdCheck, cmdValidate}, args[0]) {
-		fmt.Fprintln(stdout, "usage: frisk [--version|-V] hook|check|validate|version")
+		// A flag placed before `hook` must not turn into exit 2, which blocks
+		// every tool call.
+		if slices.Contains(args, cmdHook) {
+			newLogger(new(slog.LevelVar)).Error("flags before the hook command, staying silent")
+			return 0
+		}
+		fmt.Fprintln(stdout, "usage: frisk hook|check|validate [flags] ... | frisk --version|-V|version")
 		return 2
 	}
 
@@ -488,7 +499,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer) int {
 			case "debug":
 				level.Set(slog.LevelDebug)
 			default:
-				return fmt.Errorf("%q: %w", v, errLogLevel)
+				return errLogLevel
 			}
 			return nil
 		})
@@ -558,7 +569,7 @@ func bindConfigFlags(flags *goflag.FlagSet, cfg *config) {
 	flags.Func("backend.timeoutMs", "judge call timeout in milliseconds", func(v string) error {
 		ms, err := strconv.Atoi(v)
 		if err != nil {
-			return fmt.Errorf("%q: %w", v, errTimeoutMs)
+			return errTimeoutMs
 		}
 		cfg.Backend.TimeoutMs = ms
 		return nil
@@ -630,13 +641,18 @@ func runCheck(cfg *config, cfgErr error, command string, stdout io.Writer, lg *s
 	v := decide(cfg, command, cwd, lg)
 	v.Entry = cmdCheck
 	logVerdict(lg, v, command)
-	fmt.Fprintf(stdout, "%-6s %-10s %s\n", cmp.Or(v.Decision, "silent"), v.Tier, v.Reason)
+	printVerdict(stdout, v)
 	return 0
+}
+
+func printVerdict(w io.Writer, v verdict) {
+	fmt.Fprintf(w, "%-6s %-10s %s\n", cmp.Or(v.Decision, "silent"), v.Tier, v.Reason)
 }
 
 // runReplay judges again every request a debug log recorded, sending its state
 // as logged: a fresh `frisk check` would read today's git facts and scripts
-// instead. The questions, floors and decisions come from the current config.
+// instead. The prose, environment included, the floors and the decisions come
+// from the current config.
 func runReplay(cfg *config, cfgErr error, path string, stdin io.Reader, stdout io.Writer, lg *slog.Logger) int {
 	if cfgErr != nil {
 		fmt.Fprintf(stdout, "silent config-error %s\n", cfgErr.Error())
@@ -652,6 +668,13 @@ func runReplay(cfg *config, cfgErr error, path string, stdin io.Reader, stdout i
 	}
 	if err != nil {
 		fmt.Fprintf(stdout, "silent replay-error %s\n", err.Error())
+		return 1
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.Backend.timeout())
+	cfg.Backend.key, err = resolveAPIKey(ctx, cfg.Backend.APIKey)
+	cancel()
+	if err != nil {
+		fmt.Fprintf(stdout, "silent replay-error backend.apiKey: %s\n", err.Error())
 		return 1
 	}
 	replayed, skipped := 0, 0
@@ -677,17 +700,40 @@ func runReplay(cfg *config, cfgErr error, path string, stdin io.Reader, stdout i
 			skipped++
 			continue
 		}
-		v := verdict{Tier: "no-judge", Reason: "no backend.apiKey configured"}
-		if cfg.Backend.APIKey != "" {
-			v = askJudge(cfg, req.State, verdict{Tier: tierJudge}, "", lg)
-		}
+		v := askJudge(cfg, req.State, replaySeed(req.State), "", lg)
 		v.Entry = cmdCheck
 		logVerdict(lg, v, rec.Command)
-		fmt.Fprintf(stdout, "%-6s %-10s %s\n", cmp.Or(v.Decision, "silent"), v.Tier, v.Reason)
+		printVerdict(stdout, v)
 		replayed++
 	}
 	fmt.Fprintf(stdout, "replayed %d, skipped %d\n", replayed, skipped)
 	return 0
+}
+
+// replaySeed carries the logged probe fields into the replay's verdict line,
+// so it reads like the live line it repeats.
+func replaySeed(state map[string]any) verdict {
+	v := verdict{Tier: tierJudge}
+	if p, ok := state["probe"].(map[string]any); ok {
+		if status, ok := p["status"].(string); ok {
+			v.Probe = status
+		}
+	}
+	u, ok := state["untrusted"].(map[string]any)
+	if !ok {
+		return v
+	}
+	if sha, ok := u["script_sha256"].(string); ok {
+		v.Scripts, v.ScriptSHA = 1, sha
+	} else if scripts, ok := u["scripts"].([]any); ok && len(scripts) > 0 {
+		v.Scripts = len(scripts)
+		if first, ok := scripts[0].(map[string]any); ok {
+			if sha, ok := first["sha256"].(string); ok {
+				v.ScriptSHA = sha
+			}
+		}
+	}
+	return v
 }
 
 func decide(cfg *config, command, cwd string, lg *slog.Logger) verdict {
@@ -2393,7 +2439,6 @@ func judge(cfg *config, command, cwd string, parsed parsedCommand, lg *slog.Logg
 		untrusted["scripts"] = probe.Scripts
 	}
 	state := map[string]any{
-		"policy":    map[string]any{"environment": judgeRules(cfg).Environment},
 		"cwd":       cwd,
 		"untrusted": untrusted,
 	}
@@ -2411,7 +2456,6 @@ func judge(cfg *config, command, cwd string, parsed parsedCommand, lg *slog.Logg
 	return askJudge(cfg, state, v, probe.Missed, lg)
 }
 
-// judgeRules splices the builtin prose into the judge lists.
 func judgeRules(cfg *config) judgeConfig {
 	return judgeConfig{
 		Environment: spliceDefaults(cfg.Judge.Environment, builtinJudge.Environment),
@@ -2426,6 +2470,9 @@ func judgeRules(cfg *config) judgeConfig {
 // machine, so both are judged by the same current prose, floors and backend.
 func askJudge(cfg *config, state map[string]any, v verdict, missed string, lg *slog.Logger) verdict {
 	rules := judgeRules(cfg)
+	// Set here, not where the state is gathered, so a replay swaps in the
+	// current environment prose like every other list.
+	state["policy"] = map[string]any{"environment": rules.Environment}
 	payload, err := judgeRequest(cfg.Backend.Model, rules, state)
 	var res jevResult
 	if err == nil {
@@ -3676,7 +3723,10 @@ func askBackend(b backendConfig, payload []byte) (jevResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), b.timeout())
 	defer cancel()
 
-	key, err := resolveAPIKey(ctx, b.APIKey)
+	key, err := b.key, error(nil)
+	if key == "" {
+		key, err = resolveAPIKey(ctx, b.APIKey)
+	}
 	if err != nil {
 		return jevResult{}, err
 	}
@@ -3722,7 +3772,8 @@ var (
 	errBackendRequest   = errors.New("judge backend request failed")
 	errBackendMalformed = errors.New("judge backend answer malformed")
 	errJudgeDecisions   = errors.New("want a non-empty list drawn from allow, ask, deny")
-	errTimeoutMs        = errors.New("want a positive number of milliseconds")
+	errTimeoutMs        = errors.New("want a whole number of milliseconds, 0 for the default")
+	errNoKey            = errors.New("no API key")
 	errEndpoint         = errors.New("want an https URL, or http on a loopback host")
 	errJevConflict      = errors.New("set in both jev and backend; keep only backend")
 	errLiteralKeyFlag   = errors.New("a literal key on the command line is readable by every local process; pass a $(command) in single quotes")
@@ -3733,10 +3784,11 @@ var (
 // expression travels in the environment rather than in the -c text, so the key
 // it yields stays off argv and out of the log.
 func resolveAPIKey(ctx context.Context, raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return "", errBackendRequest
+		return "", errNoKey
 	}
-	if !strings.ContainsAny(raw, "$`") {
+	if !isKeyExpression(raw) {
 		return raw, nil
 	}
 	// An assignment exits with its last command substitution's status, so a
@@ -3754,9 +3806,14 @@ func resolveAPIKey(ctx context.Context, raw string) (string, error) {
 	}
 	key := strings.TrimSpace(string(out))
 	if key == "" {
-		return "", fmt.Errorf("expanded to nothing: %w", errBackendRequest)
+		return "", fmt.Errorf("expanded to nothing: %w", errNoKey)
 	}
 	return key, nil
+}
+
+// isKeyExpression tells sh work from a literal key, which is used as written.
+func isKeyExpression(raw string) bool {
+	return strings.ContainsAny(raw, "$`")
 }
 
 // shellQuote single-quotes each argument so the deprecated jev.keyCmd argv
@@ -3833,14 +3890,14 @@ func checkConfig(cfg *config) error {
 		return fmt.Errorf("judge.decisions %q: %w", d, errJudgeDecisions)
 	}
 	// A literal key on the command line sits in argv, which every local process can read.
-	if cfg.flagged["backend.apiKey"] && !strings.ContainsAny(cfg.Backend.APIKey, "$`") {
+	if cfg.flagged["backend.apiKey"] && !isKeyExpression(cfg.Backend.APIKey) {
 		return errLiteralKeyFlag
 	}
 	if cfg.Backend.TimeoutMs < 0 {
 		return fmt.Errorf("backend.timeoutMs %d: %w", cfg.Backend.TimeoutMs, errTimeoutMs)
 	}
 	u, err := url.Parse(cfg.Backend.endpoint())
-	loopback := err == nil && slices.Contains([]string{"127.0.0.1", "localhost", "::1"}, u.Hostname())
+	loopback := err == nil && (u.Hostname() == "localhost" || net.ParseIP(u.Hostname()).IsLoopback())
 	if err != nil || u.Host == "" || (u.Scheme != "https" && (u.Scheme != "http" || !loopback)) {
 		return fmt.Errorf("backend.endpoint %q: %w", redactURL(cfg.Backend.endpoint()), errEndpoint)
 	}
@@ -4013,10 +4070,7 @@ func redactSecrets(s string) (string, []string) {
 }
 
 func logVerdict(lg *slog.Logger, v verdict, command string) {
-	decision := v.Decision
-	if decision == "" {
-		decision = "silent"
-	}
+	decision := cmp.Or(v.Decision, "silent")
 	command, kinds := redactSecrets(command)
 	reason, reasonKinds := redactSecrets(v.Reason)
 	git, gitKinds := redactSecrets(v.Git)
@@ -4275,17 +4329,19 @@ func checkBackend(report func(level, format string, a ...any), cfg *config) bool
 		return false
 	}
 	report("info", "backend.apiKey: set (%s)", source("backend.apiKey", true))
-	if !strings.ContainsAny(b.APIKey, "$`") {
+	if !isKeyExpression(b.APIKey) {
 		report("warning", "backend.apiKey is a literal key, readable by anything that reads the config; prefer %q", "$(<command that prints it>)")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), b.timeout())
 	defer cancel()
 	// resolveAPIKey's errors never carry the key, so they are safe to print.
-	if _, err := resolveAPIKey(ctx, b.APIKey); err != nil {
+	key, err := resolveAPIKey(ctx, b.APIKey)
+	if err != nil {
 		report("error", "backend.apiKey: %v", err)
 		return false
 	}
+	cfg.Backend.key = key
 	report("info", "backend.apiKey resolved, output non-empty")
 	return true
 }

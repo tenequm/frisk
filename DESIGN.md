@@ -12,7 +12,7 @@ frisk is a shortcut, never a bypass:
 
 - A frisk `allow` still passes Claude Code's `permissions.deny`/`ask` re-check.
 - A frisk `deny`/`ask` is honored in every mode, including `bypassPermissions`.
-- Every failure path (bad config, no key, Jev timeout, malformed answer,
+- Every failure path (bad config, no key, judge timeout, malformed answer,
   low confidence) is silence.
 
 ## Decision flow
@@ -381,9 +381,13 @@ literal and stays, as does a 40-character git object id. The reason is redacted
 where it is built, so `frisk check` and the permission prompt show the same text.
 
 - `frisk hook` - the PreToolUse handler
-- `frisk check '<command>'` - dry-run, prints decision + tier + reason
-- `frisk check --replay <log-file>` - judge logged requests again, see below
-- `frisk validate [--live]` - config health check, see below
+- `frisk check [flags] '<command>'` - dry-run, prints decision + tier + reason
+- `frisk check [flags] --replay <log-file>` - judge logged requests again, see below
+- `frisk validate [--live] [flags]` - config health check, see below
+
+Flags go before the command: `frisk check ls --log-level debug` judges
+`ls --log-level debug`. A flag placed before `hook` makes the hook silent, never
+a usage error, since exit 2 would block every tool call.
 
 ```json
 {
@@ -416,9 +420,10 @@ Lines run roughly 5-12 KB each, so debug is for evaluation periods; the log is
 already `0600`.
 
 `frisk check --replay <file>` (`-` for stdin) reads JSONL such as `frisk.log`
-or an excerpt and, for every line with a `request`, sends its `state` unchanged
-with questions built from the current `judge` prose, then applies the same
-floors and `judge.decisions` as a live call. It prints one `decision tier
+or an excerpt and, for every line with a `request`, sends its `state` as logged
+except the `policy`, which like the questions is built from the current `judge`
+prose, then applies the same floors and `judge.decisions` as a live call. The
+key is resolved once for the whole run, and one that does not resolve exits 1. It prints one `decision tier
 reason` line per replayed record in input order, then `replayed N, skipped M`;
 lines without a request state, malformed ones included, are skipped. With
 `--log-level debug` each replay is logged with its own request, so two configs
