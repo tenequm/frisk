@@ -4585,11 +4585,16 @@ func readCapped(path string) ([]byte, error) {
 	if !info.Mode().IsRegular() {
 		return nil, errNotRegular
 	}
-	f, err := os.Open(path) // size-capped and credential-screened before leaving the machine
+	// Non-blocking, and checked again once open, so a path swapped for a FIFO
+	// after the stat cannot hang the hook.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0) // size-capped and credential-screened before leaving the machine
 	if err != nil {
 		return nil, fmt.Errorf("open script: %w", err)
 	}
 	defer f.Close()
+	if info, err = f.Stat(); err != nil || !info.Mode().IsRegular() {
+		return nil, errNotRegular
+	}
 	data, err := io.ReadAll(io.LimitReader(f, maxScriptBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("read script: %w", err)
