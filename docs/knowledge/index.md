@@ -92,3 +92,7 @@ Conventions:
 
 - [Jev API facts frisk depends on](jev-api-facts.md) - Pricing, limits, context
   size, how confidence is computed and measured latency for the pinned judge model.
+- [The judge request is served by more than one vendor](system-one-backends.md) -
+  TypeSafe's System One request shape is also served by OpenRouter, for Jev and for
+  other vendors' decision models, so the backend is configuration; calibration
+  differs per model.

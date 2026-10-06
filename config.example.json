@@ -43,9 +43,10 @@
     "hard_deny": ["$defaults"],
     "decisions": ["allow", "ask", "deny"]
   },
-  "jev": {
+  "backend": {
+    "endpoint": "https://api.typesafe.ai/v1/systemone",
     "model": "jev-1.13.0",
-    "keyCmd": ["gopass", "show", "-o", "api/typesafe"],
+    "apiKey": "$(gopass show -o api/typesafe)",
     "timeoutMs": 5000
   }
 }

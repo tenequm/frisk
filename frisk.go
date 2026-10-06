@@ -1,8 +1,9 @@
 // frisk - a quick pat-down for every command your agent runs.
 // The clean ones walk through. The rest wait for you.
 //
-// Claude Code PreToolUse hook for Bash: deterministic rules first, a Jev
-// Choice for the gray zone, silence otherwise. Every failure path is silence.
+// Claude Code PreToolUse hook for Bash: deterministic rules first, a judge
+// Choice (Jev by default) for the gray zone, silence otherwise. Every failure
+// path is silence.
 package main
 
 import (
@@ -13,6 +14,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	goflag "flag"
 	"fmt"
 	"io"
 	"io/fs"
@@ -30,13 +32,21 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 	"unicode"
 	"unicode/utf8"
 )
 
-// jevEndpoint is a var so tests can point it at a fake server.
-var jevEndpoint = "https://api.typesafe.ai/v1/systemone"
+// judgeClient never follows a redirect: Go re-sends Authorization to the same
+// host even when the hop drops to plain http.
+var judgeClient = &http.Client{
+	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+}
+
+// defaultEndpoint serves backend.endpoint when it is unset. A var so tests can
+// point it at a fake server.
+var defaultEndpoint = "https://api.typesafe.ai/v1/systemone"
 
 // gitFactsTimeout bounds all git lookups together, so a slow repo costs the
 // hook a fixed delay. A var so tests on a loaded machine can relax it.
@@ -59,10 +69,10 @@ const (
 	// nearly tied, so Claude Code's own flow decides those.
 	askConfidenceFloor = 0.50
 
-	maxScriptBytes    = 32 << 10
-	maxReasonChars    = 300
-	maxRuleChars      = 70
-	defaultJevTimeout = 5 * time.Second
+	maxScriptBytes        = 32 << 10
+	maxReasonChars        = 300
+	maxRuleChars          = 70
+	defaultBackendTimeout = 5 * time.Second
 
 	ruleNone = "none"
 
@@ -360,6 +370,29 @@ func (j judgeConfig) decisions() []string {
 	return j.Decisions
 }
 
+// backendConfig says where the judge's questions go. It speaks the System One
+// request shape, which TypeSafe and OpenRouter both serve.
+type backendConfig struct {
+	Endpoint string `json:"endpoint"`
+	Model    string `json:"model"`
+	// APIKey is read as the inside of a double-quoted shell string, so a
+	// literal, ${VAR} and $(command) all work as they would in sh.
+	APIKey    string `json:"apiKey"`
+	TimeoutMs int    `json:"timeoutMs"`
+}
+
+func (b backendConfig) endpoint() string {
+	return cmp.Or(b.Endpoint, defaultEndpoint)
+}
+
+func (b backendConfig) timeout() time.Duration {
+	if b.TimeoutMs > 0 {
+		return time.Duration(b.TimeoutMs) * time.Millisecond
+	}
+	return defaultBackendTimeout
+}
+
+// jevConfig is the pre-backend spelling, folded into backend on load.
 type jevConfig struct {
 	Model     string   `json:"model"`
 	KeyCmd    []string `json:"keyCmd"`
@@ -369,7 +402,10 @@ type jevConfig struct {
 type config struct {
 	Permissions permissionsConfig `json:"permissions"`
 	Judge       judgeConfig       `json:"judge"`
-	Jev         jevConfig         `json:"jev"`
+	Backend     backendConfig     `json:"backend"`
+	Jev         *jevConfig        `json:"jev"`
+	// flagged names the options a command-line flag set, for validate's report.
+	flagged map[string]bool
 }
 
 type toolInput struct {
@@ -406,6 +442,12 @@ func main() {
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout))
 }
 
+const (
+	cmdHook     = "hook"
+	cmdCheck    = "check"
+	cmdValidate = "validate"
+)
+
 func run(args []string, stdin io.Reader, stdout io.Writer) int {
 	// Global flags are answered before config or the log are touched.
 	if len(args) > 0 && slices.Contains([]string{"--version", "-V", "version"}, args[0]) {
@@ -413,32 +455,95 @@ func run(args []string, stdin io.Reader, stdout io.Writer) int {
 		return 0
 	}
 
-	lg := newLogger()
-	cfg, cfgErr := loadConfig()
-	if cfgErr != nil {
-		lg.Error("config unreadable, staying silent", "err", cfgErr.Error())
-	}
-
-	if len(args) == 0 {
+	if len(args) == 0 || !slices.Contains([]string{cmdHook, cmdCheck, cmdValidate}, args[0]) {
 		fmt.Fprintln(stdout, "usage: frisk [--version|-V] hook|check|validate|version")
 		return 2
+	}
+
+	lg := newLogger()
+	cfg, cfgErr := loadConfig()
+	flags := goflag.NewFlagSet("frisk "+args[0], goflag.ContinueOnError)
+	flags.SetOutput(stdout)
+	if args[0] == cmdHook {
+		// The hook must stay silent, so its usage text goes nowhere.
+		flags.SetOutput(io.Discard)
+	}
+	bindConfigFlags(flags, cfg)
+	var live bool
+	if args[0] == cmdValidate {
+		flags.BoolVar(&live, "live", false, "also make one real judge call")
+	}
+	if err := flags.Parse(args[1:]); err != nil {
+		if args[0] == cmdHook {
+			lg.Error("bad hook flags, staying silent", "err", err.Error())
+			return 0
+		}
+		return 2
+	}
+	cfg.flagged = map[string]bool{}
+	flags.Visit(func(f *goflag.Flag) { cfg.flagged[f.Name] = true })
+	if cfgErr == nil {
+		cfgErr = checkConfig(cfg)
+	}
+	if cfgErr != nil {
+		lg.Error("config invalid, staying silent", "err", cfgErr.Error())
 	}
 
 	switch args[0] {
-	case "hook":
+	case cmdHook:
 		return runHook(cfg, cfgErr, stdin, stdout, lg)
-	case "check":
-		if len(args) < 2 {
-			fmt.Fprintln(stdout, "usage: frisk check '<command>'")
+	case cmdCheck:
+		if flags.NArg() == 0 {
+			fmt.Fprintln(stdout, "usage: frisk check [flags] '<command>'")
 			return 2
 		}
-		return runCheck(cfg, cfgErr, strings.Join(args[1:], " "), stdout, lg)
-	case "validate":
-		return runValidate(cfg, cfgErr, args[1:], stdout, lg)
+		return runCheck(cfg, cfgErr, strings.Join(flags.Args(), " "), stdout, lg)
 	default:
-		fmt.Fprintln(stdout, "usage: frisk [--version|-V] hook|check|validate|version")
-		return 2
+		if flags.NArg() > 0 {
+			fmt.Fprintln(stdout, "usage: frisk validate [--live] [flags]")
+			return 2
+		}
+		v := &validation{out: stdout}
+		if ready := validateConfig(v.report, cfg, cfgErr); ready && live {
+			liveJudge(v.report, cfg, lg)
+		}
+		return v.code()
 	}
+}
+
+// bindConfigFlags lets the command line override the scalar options, named
+// as in the config file. The prose lists stay file-only, and no option is read
+// from the environment: a repository's settings can set the session's
+// environment, never the user's hook command.
+func bindConfigFlags(flags *goflag.FlagSet, cfg *config) {
+	flags.Func("backend.endpoint", "System One URL the judge calls", func(v string) error {
+		cfg.Backend.Endpoint = v
+		return nil
+	})
+	flags.Func("backend.model", "model that answers the judge", func(v string) error {
+		cfg.Backend.Model = v
+		return nil
+	})
+	// checkConfig refuses a literal here: a flag error would echo the value.
+	flags.Func("backend.apiKey", "API key expression, such as '$(gopass show -o api/x)' in single quotes", func(v string) error {
+		cfg.Backend.APIKey = v
+		return nil
+	})
+	flags.Func("backend.timeoutMs", "judge call timeout in milliseconds", func(v string) error {
+		ms, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("%q: %w", v, errTimeoutMs)
+		}
+		cfg.Backend.TimeoutMs = ms
+		return nil
+	})
+	flags.Func("judge.decisions", "comma-separated verdicts the judge may issue", func(v string) error {
+		cfg.Judge.Decisions = strings.Split(v, ",")
+		for i := range cfg.Judge.Decisions {
+			cfg.Judge.Decisions[i] = strings.TrimSpace(cfg.Judge.Decisions[i])
+		}
+		return nil
+	})
 }
 
 // buildVersion is what `go build` stamped from the VCS tag, so release and
@@ -472,7 +577,7 @@ func runHook(cfg *config, cfgErr error, stdin io.Reader, stdout io.Writer, lg *s
 	} else {
 		return 0
 	}
-	v.Tool, v.Entry = in.ToolName, "hook"
+	v.Tool, v.Entry = in.ToolName, cmdHook
 	logVerdict(lg, v, subject)
 	if v.Decision == "" {
 		return 0
@@ -497,7 +602,7 @@ func runCheck(cfg *config, cfgErr error, command string, stdout io.Writer, lg *s
 	}
 	cwd, _ := os.Getwd()
 	v := decide(cfg, command, cwd, lg)
-	v.Entry = "check"
+	v.Entry = cmdCheck
 	logVerdict(lg, v, command)
 	decision := v.Decision
 	if decision == "" {
@@ -525,8 +630,8 @@ func decide(cfg *config, command, cwd string, lg *slog.Logger) verdict {
 			return verdict{Decision: decisionAllow, Tier: "static", Reason: "every segment matches an allow rule: " + rule}
 		}
 	}
-	if len(cfg.Jev.KeyCmd) == 0 {
-		return verdict{Tier: "no-judge", Reason: "no jev key configured"}
+	if cfg.Backend.APIKey == "" {
+		return verdict{Tier: "no-judge", Reason: "no backend.apiKey configured"}
 	}
 	return judge(cfg, command, cwd, parsed, lg)
 }
@@ -2232,10 +2337,10 @@ func judge(cfg *config, command, cwd string, parsed parsedCommand, lg *slog.Logg
 		state["redactions"] = redactions
 	}
 
-	res, err := askJev(cfg.Jev, rules, state)
+	res, err := askBackend(cfg.Backend, rules, state)
 	if err != nil {
-		lg.Warn("jev call failed", "err", err.Error())
-		v.Reason = "jev unavailable"
+		lg.Warn("judge call failed", "err", err.Error())
+		v.Reason = "judge unavailable"
 		return v
 	}
 	ans := res.Decision
@@ -2252,27 +2357,27 @@ func judge(cfg *config, command, cwd string, parsed parsedCommand, lg *slog.Logg
 	} else {
 		floored += ", " + split
 	}
-	head, rule := "jev defer", ""
+	head, rule := "judge defer", ""
 	switch ans.Choice {
 	case decisionAllow:
-		head = fmt.Sprintf("jev allow below confidence floor (%s)", floored)
+		head = fmt.Sprintf("judge allow below confidence floor (%s)", floored)
 		if ans.Confidence >= allowConfidenceFloor {
 			v.Decision = decisionAllow
-			head = fmt.Sprintf("jev allow (%s)", plain)
+			head = fmt.Sprintf("judge allow (%s)", plain)
 		}
 	case decisionDeny:
 		v.Decision = decisionAsk
-		head = fmt.Sprintf("jev deny below confidence floor (%s), asking", floored)
+		head = fmt.Sprintf("judge deny below confidence floor (%s), asking", floored)
 		if ans.Confidence >= denyConfidenceFloor {
 			v.Decision = decisionDeny
-			head = fmt.Sprintf("jev deny (%s)", plain)
+			head = fmt.Sprintf("judge deny (%s)", plain)
 		}
 		rule = closestRule("hard_deny", res.DenyRule, rules.HardDeny)
 	case decisionAsk:
-		head = fmt.Sprintf("jev ask below confidence floor (%s)", floored)
+		head = fmt.Sprintf("judge ask below confidence floor (%s)", floored)
 		if ans.Confidence >= askConfidenceFloor {
 			v.Decision = decisionAsk
-			head = fmt.Sprintf("jev ask (%s)", plain)
+			head = fmt.Sprintf("judge ask (%s)", plain)
 			rule = closestRule("soft_deny", res.AskRule, rules.SoftDeny)
 		}
 	default:
@@ -3427,16 +3532,12 @@ func ruleQuestion(rules []string) map[string]any {
 	}
 }
 
-// askJev takes the judge lists already spliced with their defaults.
-func askJev(jc jevConfig, rules judgeConfig, state map[string]any) (jevResult, error) {
-	timeout := defaultJevTimeout
-	if jc.TimeoutMs > 0 {
-		timeout = time.Duration(jc.TimeoutMs) * time.Millisecond
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+// askBackend takes the judge lists already spliced with their defaults.
+func askBackend(b backendConfig, rules judgeConfig, state map[string]any) (jevResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), b.timeout())
 	defer cancel()
 
-	key, err := fetchKey(ctx, jc.KeyCmd)
+	key, err := resolveAPIKey(ctx, b.APIKey)
 	if err != nil {
 		return jevResult{}, err
 	}
@@ -3461,7 +3562,7 @@ func askJev(jc jevConfig, rules judgeConfig, state map[string]any) (jevResult, e
 			"value of that kind that was written in the command; `redactions` lists the kinds."
 	}
 	body := map[string]any{
-		"model": jc.Model,
+		"model": b.Model,
 		"state": state,
 		"questions": map[string]any{
 			"decision": map[string]any{
@@ -3480,35 +3581,35 @@ func askJev(jc jevConfig, rules judgeConfig, state map[string]any) (jevResult, e
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
-		return jevResult{}, fmt.Errorf("encoding jev request: %w", err)
+		return jevResult{}, fmt.Errorf("encoding judge request: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, jevEndpoint, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.endpoint(), bytes.NewReader(payload))
 	if err != nil {
-		return jevResult{}, fmt.Errorf("building jev request: %w", err)
+		return jevResult{}, fmt.Errorf("building judge request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+key)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := judgeClient.Do(req)
 	if err != nil {
-		return jevResult{}, fmt.Errorf("calling jev: %w", err)
+		return jevResult{}, fmt.Errorf("calling judge backend: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return jevResult{}, fmt.Errorf("jev status %d: %w", resp.StatusCode, errJevRequest)
+		return jevResult{}, fmt.Errorf("judge backend status %d: %w", resp.StatusCode, errBackendRequest)
 	}
 	var parsed jevResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&parsed); err != nil {
-		return jevResult{}, fmt.Errorf("decoding jev response: %w", err)
+		return jevResult{}, fmt.Errorf("decoding judge response: %w", err)
 	}
 	res := jevResult{Model: parsed.Model, Usage: parsed.Usage}
 	if err := json.Unmarshal(parsed.Answers["decision"], &res.Decision); err != nil {
-		return jevResult{}, fmt.Errorf("decoding jev decision: %w", errJevMalformed)
+		return jevResult{}, fmt.Errorf("decoding judge decision: %w", errBackendMalformed)
 	}
 	switch res.Decision.Choice {
 	case decisionAllow, decisionAsk, decisionDeny, decisionDefer:
 	default:
-		return jevResult{}, errJevMalformed
+		return jevResult{}, errBackendMalformed
 	}
 	// Attribution is best-effort: a bad answer leaves the zero value.
 	if json.Unmarshal(parsed.Answers["ask_rule"], &res.AskRule) != nil {
@@ -3521,24 +3622,53 @@ func askJev(jc jevConfig, rules judgeConfig, state map[string]any) (jevResult, e
 }
 
 var (
-	errJevRequest   = errors.New("jev request failed")
-	errJevMalformed = errors.New("jev answer malformed")
+	errBackendRequest   = errors.New("judge backend request failed")
+	errBackendMalformed = errors.New("judge backend answer malformed")
+	errJudgeDecisions   = errors.New("want a non-empty list drawn from allow, ask, deny")
+	errTimeoutMs        = errors.New("want a positive number of milliseconds")
+	errEndpoint         = errors.New("want an https URL, or http on a loopback host")
+	errJevConflict      = errors.New("set in both jev and backend; keep only backend")
+	errLiteralKeyFlag   = errors.New("a literal key on the command line is readable by every local process; pass a $(command) in single quotes")
 )
 
-// The key stays off argv, out of child env, and out of the log.
-func fetchKey(ctx context.Context, keyCmd []string) (string, error) {
-	if len(keyCmd) == 0 {
-		return "", errJevRequest
+// resolveAPIKey evaluates raw as the inside of a double-quoted sh string. The
+// expression travels in the environment rather than in the -c text, so the key
+// it yields stays off argv and out of the log.
+func resolveAPIKey(ctx context.Context, raw string) (string, error) {
+	if raw == "" {
+		return "", errBackendRequest
 	}
-	out, err := exec.CommandContext(ctx, keyCmd[0], keyCmd[1:]...).Output() //nolint:gosec // user-owned config, never repo-supplied
+	if !strings.ContainsAny(raw, "$`") {
+		return raw, nil
+	}
+	// An assignment exits with its last command substitution's status, so a
+	// failing $(...) fails here instead of printing nothing.
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", `eval "k=\"$FRISK_API_KEY_EXPR\"" && printf '%s' "$k"`)
+	cmd.Env = append(os.Environ(), "FRISK_API_KEY_EXPR="+raw)
+	// The key command runs below sh, so a timeout must kill the whole group.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	// A backstop for a descendant that left the group and holds stdout open.
+	cmd.WaitDelay = 100 * time.Millisecond
+	out, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("key command failed: %w", err)
+		return "", fmt.Errorf("expanding: %w", err)
 	}
 	key := strings.TrimSpace(string(out))
 	if key == "" {
-		return "", fmt.Errorf("key command returned nothing: %w", errJevRequest)
+		return "", fmt.Errorf("expanded to nothing: %w", errBackendRequest)
 	}
 	return key, nil
+}
+
+// shellQuote single-quotes each argument so the deprecated jev.keyCmd argv
+// runs unchanged inside $(...).
+func shellQuote(argv []string) string {
+	quoted := make([]string, len(argv))
+	for i, a := range argv {
+		quoted[i] = "'" + strings.ReplaceAll(a, "'", `'\''`) + "'"
+	}
+	return strings.Join(quoted, " ")
 }
 
 func loadConfig() (*config, error) {
@@ -3556,14 +3686,68 @@ func loadConfig() (*config, error) {
 	if err := dec.Decode(cfg); err != nil {
 		return cfg, fmt.Errorf("parsing %s: %w", path, err)
 	}
-	unknown := func(d string) bool { return !slices.Contains(judgeDecisions, d) }
-	if d := cfg.Judge.Decisions; d != nil && (len(d) == 0 || slices.ContainsFunc(d, unknown)) {
-		return cfg, fmt.Errorf("%s: judge.decisions %q: %w", path, d, errJudgeDecisions)
+	if err := foldJev(cfg); err != nil {
+		return cfg, fmt.Errorf("%s: %w", path, err)
 	}
 	return cfg, nil
 }
 
-var errJudgeDecisions = errors.New("want a non-empty list drawn from allow, ask, deny")
+// foldJev moves the deprecated jev block into backend, keeping cfg.Jev so
+// validate can warn about it.
+func foldJev(cfg *config) error {
+	j := cfg.Jev
+	if j == nil {
+		return nil
+	}
+	b := &cfg.Backend
+	for _, f := range []struct {
+		name     string
+		old, new bool
+	}{
+		{"model", j.Model != "", b.Model != ""},
+		{"timeoutMs", j.TimeoutMs != 0, b.TimeoutMs != 0},
+		{"keyCmd/apiKey", len(j.KeyCmd) > 0, b.APIKey != ""},
+	} {
+		if f.old && f.new {
+			return fmt.Errorf("%s: %w", f.name, errJevConflict)
+		}
+	}
+	b.Model = cmp.Or(b.Model, j.Model)
+	b.TimeoutMs = cmp.Or(b.TimeoutMs, j.TimeoutMs)
+	if len(j.KeyCmd) > 0 {
+		b.APIKey = "$(" + shellQuote(j.KeyCmd) + ")"
+	}
+	return nil
+}
+
+// redactURL hides any user:password an endpoint carries before it is printed.
+func redactURL(raw string) string {
+	if u, err := url.Parse(raw); err == nil {
+		return u.Redacted()
+	}
+	return raw
+}
+
+// checkConfig runs after flags apply, so a bad flag value fails like a bad file.
+func checkConfig(cfg *config) error {
+	unknown := func(d string) bool { return !slices.Contains(judgeDecisions, d) }
+	if d := cfg.Judge.Decisions; d != nil && (len(d) == 0 || slices.ContainsFunc(d, unknown)) {
+		return fmt.Errorf("judge.decisions %q: %w", d, errJudgeDecisions)
+	}
+	// A literal key on the command line sits in argv, which every local process can read.
+	if cfg.flagged["backend.apiKey"] && !strings.ContainsAny(cfg.Backend.APIKey, "$`") {
+		return errLiteralKeyFlag
+	}
+	if cfg.Backend.TimeoutMs < 0 {
+		return fmt.Errorf("backend.timeoutMs %d: %w", cfg.Backend.TimeoutMs, errTimeoutMs)
+	}
+	u, err := url.Parse(cfg.Backend.endpoint())
+	loopback := err == nil && slices.Contains([]string{"127.0.0.1", "localhost", "::1"}, u.Hostname())
+	if err != nil || u.Host == "" || (u.Scheme != "https" && (u.Scheme != "http" || !loopback)) {
+		return fmt.Errorf("backend.endpoint %q: %w", redactURL(cfg.Backend.endpoint()), errEndpoint)
+	}
+	return nil
+}
 
 func configPath() string {
 	return filepath.Join(configDir(), "frisk", "config.json")
@@ -3859,35 +4043,38 @@ func decideFile(cfg *config, path string) verdict {
 	return verdict{Tier: "no-rule", Reason: "no file rule matched"}
 }
 
-// runValidate exists because a malformed config silently disables the whole
-// gate; it reuses the hook's loader so it sees exactly what the hook sees.
-func runValidate(cfg *config, cfgErr error, args []string, stdout io.Writer, lg *slog.Logger) int {
-	live := false
-	for _, a := range args {
-		if a != "--live" {
-			fmt.Fprintln(stdout, "usage: frisk validate [--live]")
-			return 2
-		}
-		live = true
-	}
+type validation struct {
+	out      io.Writer
+	failures int
+}
 
-	failures := 0
-	report := func(level, format string, a ...any) {
-		if level == "error" {
-			failures++
-		}
-		fmt.Fprintf(stdout, "%s: %s\n", level, fmt.Sprintf(format, a...))
+func (v *validation) report(level, format string, a ...any) {
+	if level == "error" {
+		v.failures++
 	}
+	fmt.Fprintf(v.out, "%s: %s\n", level, fmt.Sprintf(format, a...))
+}
 
+func (v *validation) code() int {
+	if v.failures > 0 {
+		return 1
+	}
+	return 0
+}
+
+// validateConfig exists because a malformed config silently disables the
+// whole gate; it reads what the hook's loader read. It reports true when the
+// judge can run.
+func validateConfig(report func(level, format string, a ...any), cfg *config, cfgErr error) bool {
 	path := configPath()
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-		report("info", "config %s does not exist: nothing is allowed statically and the judge is off", path)
+		report("info", "config %s does not exist: nothing is allowed statically", path)
 	} else {
 		report("info", "config %s exists", path)
 	}
 	if cfgErr != nil {
 		report("error", "%s", cfgErr.Error())
-		return 1
+		return false
 	}
 
 	checkRules(report, "deny", cfg.Permissions.Deny)
@@ -3910,13 +4097,7 @@ func runValidate(cfg *config, cfgErr error, args []string, stdout io.Writer, lg 
 	}
 	report("info", "judge.decisions: %s", strings.Join(cfg.Judge.decisions(), ", "))
 
-	if keyOK := checkJev(report, cfg); keyOK && live {
-		liveJudge(report, cfg, lg)
-	}
-	if failures > 0 {
-		return 1
-	}
-	return 0
+	return checkBackend(report, cfg)
 }
 
 func listState(items []string) string {
@@ -3965,27 +4146,42 @@ func checkRules(report func(level, format string, a ...any), list string, rules 
 	}
 }
 
-// checkJev reports whether the key command works, i.e. the judge can run.
-func checkJev(report func(level, format string, a ...any), cfg *config) bool {
-	timeout := defaultJevTimeout
-	if cfg.Jev.TimeoutMs > 0 {
-		timeout = time.Duration(cfg.Jev.TimeoutMs) * time.Millisecond
+// checkBackend reports whether the API key resolves, i.e. the judge can run.
+func checkBackend(report func(level, format string, a ...any), cfg *config) bool {
+	b := cfg.Backend
+	source := func(flagName string, set bool) string {
+		switch {
+		case cfg.flagged[flagName]:
+			return "flag"
+		case set:
+			return "file"
+		default:
+			return "default"
+		}
 	}
-	report("info", "jev.model: %q", cfg.Jev.Model)
-	report("info", "jev.timeout: %s", timeout)
-	if len(cfg.Jev.KeyCmd) == 0 {
-		report("info", "judge disabled (no jev.keyCmd)")
+	if cfg.Jev != nil {
+		report("warning", "jev is deprecated: move it under backend (keyCmd becomes apiKey %q)", "$(<command>)")
+	}
+	report("info", "backend.endpoint: %s (%s)", redactURL(b.endpoint()), source("backend.endpoint", b.Endpoint != ""))
+	report("info", "backend.model: %q (%s)", b.Model, source("backend.model", b.Model != ""))
+	report("info", "backend.timeout: %s (%s)", b.timeout(), source("backend.timeoutMs", b.TimeoutMs > 0))
+	if b.APIKey == "" {
+		report("info", "judge disabled (no backend.apiKey)")
 		return false
+	}
+	report("info", "backend.apiKey: set (%s)", source("backend.apiKey", true))
+	if !strings.ContainsAny(b.APIKey, "$`") {
+		report("warning", "backend.apiKey is a literal key, readable by anything that reads the config; prefer %q", "$(<command that prints it>)")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), b.timeout())
 	defer cancel()
-	// fetchKey's errors never carry the key, so they are safe to print.
-	if _, err := fetchKey(ctx, cfg.Jev.KeyCmd); err != nil {
-		report("error", "jev.keyCmd failed: %v", err)
+	// resolveAPIKey's errors never carry the key, so they are safe to print.
+	if _, err := resolveAPIKey(ctx, b.APIKey); err != nil {
+		report("error", "backend.apiKey: %v", err)
 		return false
 	}
-	report("info", "jev.keyCmd succeeded, output non-empty")
+	report("info", "backend.apiKey resolved, output non-empty")
 	return true
 }
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"cmp"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -454,9 +456,9 @@ func TestLogVerdictRedacts(t *testing.T) {
 		subject  string
 		redacted []string
 	}{
-		{"command", verdict{Reason: "no jev key configured"}, "GH_TOKEN=" + token + " psql postgres://app:" + password + "@db/app", []string{"github-token", "url-password"}},
+		{"command", verdict{Reason: "no backend.apiKey configured"}, "GH_TOKEN=" + token + " psql postgres://app:" + password + "@db/app", []string{"github-token", "url-password"}},
 		{"file path", verdict{Reason: "no file rule matched", Tool: "Write"}, "/tmp/out/" + token + ".txt", []string{"github-token"}},
-		{"reason quoting the command", verdict{Reason: "jev ask (0.62); script " + token + ".py not attached: missing"}, "python3 " + token + ".py", []string{"github-token"}},
+		{"reason quoting the command", verdict{Reason: "judge ask (0.62); script " + token + ".py not attached: missing"}, "python3 " + token + ".py", []string{"github-token"}},
 		{"nothing to redact", verdict{Reason: "every segment is read-only: git status *"}, "git status", nil},
 	}
 	for _, tt := range tests {
@@ -538,7 +540,7 @@ func TestRedactionLeavesDecisionsAlone(t *testing.T) {
 }
 
 func TestCheckOutputCarriesNoSecret(t *testing.T) {
-	newHookEnv(t, `{"jev": {"model": "jev-test", "keyCmd": ["echo", "test-key"]}}`)
+	newHookEnv(t, `{"backend": {"model": "jev-test", "apiKey": "$(echo test-key)"}}`)
 	fakeJevCapture(t, jevAnswer{Choice: "ask", Confidence: 0.62})
 	token := "gh" + "p_" + fakeSecret(alnumChars, 36)
 
@@ -563,7 +565,7 @@ type judgedState struct {
 }
 
 func TestHookKeepsSecretFromJudgeAndLog(t *testing.T) {
-	newHookEnv(t, `{"jev": {"model": "jev-test", "keyCmd": ["echo", "test-key"]}}`)
+	newHookEnv(t, `{"backend": {"model": "jev-test", "apiKey": "$(echo test-key)"}}`)
 	_, capture := fakeJevCapture(t, jevAnswer{Choice: "ask", Confidence: 0.62})
 	token := "gh" + "p_" + fakeSecret(alnumChars, 36)
 	const template = "curl -X DELETE -H \"Authorization: token {S}\" https://api.example.com/v1/items/7"
@@ -821,7 +823,7 @@ func validateOutput(t *testing.T, cfg string, args ...string) (string, int) {
 
 func TestValidateMissingConfig(t *testing.T) {
 	out, code := validateOutput(t, "")
-	if code != 0 || !strings.Contains(out, "does not exist: nothing is allowed statically and the judge is off") {
+	if code != 0 || !strings.Contains(out, "does not exist: nothing is allowed statically") {
 		t.Fatalf("code = %d, out = %s", code, out)
 	}
 }
@@ -850,7 +852,7 @@ func TestValidateValidConfig(t *testing.T) {
 	if code != 0 || strings.Contains(out, "error:") || strings.Contains(out, "warning:") {
 		t.Fatalf("code = %d, out = %s", code, out)
 	}
-	if !strings.Contains(out, "info: config ") || !strings.Contains(out, "judge disabled (no jev.keyCmd)") {
+	if !strings.Contains(out, "info: config ") || !strings.Contains(out, "judge disabled (no backend.apiKey)") {
 		t.Fatalf("out = %s", out)
 	}
 }
@@ -903,30 +905,184 @@ func TestValidateJudgeListStates(t *testing.T) {
 	}
 }
 
-func TestValidateKeyCmd(t *testing.T) {
-	out, code := validateOutput(t, `{"jev":{"keyCmd":["echo","hunter2-not-for-output"],"model":"m1","timeoutMs":1500}}`)
-	if code != 0 || !strings.Contains(out, "jev.keyCmd succeeded, output non-empty") ||
-		!strings.Contains(out, `jev.model: "m1"`) || !strings.Contains(out, "jev.timeout: 1.5s") {
+func TestValidateBackend(t *testing.T) {
+	t.Setenv("FRISK_TEST_KEY", "hunter2-from-env")
+	tests := []struct {
+		name, cfg string
+		code      int
+		want      []string
+	}{
+		{
+			"command substitution", `{"backend":{"apiKey":"$(echo hunter2-not-for-output)","model":"m1","timeoutMs":1500}}`, 0,
+			[]string{"backend.apiKey resolved, output non-empty", `backend.model: "m1" (file)`, "backend.timeout: 1.5s (file)", "backend.endpoint: https://api.typesafe.ai/v1/systemone (default)"},
+		},
+		{"environment variable", `{"backend":{"apiKey":"${FRISK_TEST_KEY}"}}`, 0, []string{"backend.apiKey resolved"}},
+		{"literal warns", `{"backend":{"apiKey":"hunter2-literal"}}`, 0, []string{"warning: backend.apiKey is a literal key", "backend.apiKey resolved"}},
+		{"failing command", `{"backend":{"apiKey":"$(exit 7)"}}`, 1, []string{"error: backend.apiKey: expanding: exit status 7"}},
+		{"empty expansion", `{"backend":{"apiKey":"$(true)"}}`, 1, []string{"error: backend.apiKey: ", "expanded to nothing"}},
+		{"custom endpoint", `{"backend":{"endpoint":"https://openrouter.ai/api/v1/systemone"}}`, 0, []string{"backend.endpoint: https://openrouter.ai/api/v1/systemone (file)"}},
+		{"loopback http endpoint", `{"backend":{"endpoint":"http://127.0.0.1:8080/v1/systemone"}}`, 0, []string{"(file)"}},
+		{"plain http endpoint", `{"backend":{"endpoint":"http://example.com/v1/systemone"}}`, 1, []string{"error: backend.endpoint", "want an https URL"}},
+		{"negative timeout", `{"backend":{"timeoutMs":-1}}`, 1, []string{"error: backend.timeoutMs -1"}},
+		{
+			"jev alias", `{"jev":{"keyCmd":["echo","hunter2-not-for-output"],"model":"m1","timeoutMs":1500}}`, 0,
+			[]string{"warning: jev is deprecated", "backend.apiKey resolved", `backend.model: "m1" (file)`, "backend.timeout: 1.5s"},
+		},
+		{"jev and backend conflict", `{"jev":{"model":"a"},"backend":{"model":"b"}}`, 1, []string{"error:", "model: set in both jev and backend"}},
+		{"jev alias failing", `{"jev":{"keyCmd":["false"]}}`, 1, []string{"error: backend.apiKey: "}},
+	}
+	for _, tt := range tests {
+		out, code := validateOutput(t, tt.cfg)
+		if code != tt.code {
+			t.Errorf("%s: code = %d, out = %s", tt.name, code, out)
+		}
+		for _, want := range tt.want {
+			if !strings.Contains(out, want) {
+				t.Errorf("%s: missing %q in %s", tt.name, want, out)
+			}
+		}
+		if strings.Contains(out, "hunter2") {
+			t.Errorf("%s: key leaked into output: %s", tt.name, out)
+		}
+	}
+}
+
+func TestValidateFlagsOverrideFile(t *testing.T) {
+	out, code := validateOutput(t, `{"backend":{"model":"from-file","apiKey":"$(echo k)"}}`,
+		"--backend.model=from-flag", "--backend.timeoutMs", "900", "--judge.decisions", "allow, deny")
+	if code != 0 {
 		t.Fatalf("code = %d, out = %s", code, out)
 	}
-	if strings.Contains(out, "hunter2") {
-		t.Fatalf("key leaked into output: %s", out)
+	for _, want := range []string{`backend.model: "from-flag" (flag)`, "backend.timeout: 900ms (flag)", "backend.apiKey: set (file)", "judge.decisions: allow, deny\n"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in %s", want, out)
+		}
 	}
 
-	out, code = validateOutput(t, `{"jev":{"keyCmd":["false"]}}`)
-	if code != 1 || !strings.Contains(out, "error: jev.keyCmd failed") {
-		t.Fatalf("failing keyCmd: code = %d, out = %s", code, out)
+	if out, code = validateOutput(t, "", "--judge.decisions=allow,defer"); code != 1 || !strings.Contains(out, "error: judge.decisions") {
+		t.Errorf("bad decisions flag: code = %d, out = %s", code, out)
+	}
+	if out, code = validateOutput(t, "", "--backend.timeoutMs=soon"); code != 2 {
+		t.Errorf("bad timeout flag: code = %d, out = %s", code, out)
+	}
+	if out, code = validateOutput(t, "", "--backend.endpoint=http://example.com"); code != 1 || !strings.Contains(out, "error: backend.endpoint") {
+		t.Errorf("plain http flag: code = %d, out = %s", code, out)
+	}
+	if out, code = validateOutput(t, "", "stray"); code != 2 {
+		t.Errorf("stray argument: code = %d, out = %s", code, out)
+	}
+}
+
+func TestHookFlagErrorsStaySilent(t *testing.T) {
+	newHookEnv(t, `{"permissions":{"deny":["rm *"]}}`)
+	in := `{"tool_name":"Bash","tool_input":{"command":"rm -rf x"},"cwd":"/tmp"}`
+	for _, args := range [][]string{{"hook", "--backend.timeoutMs=soon"}, {"hook", "--nope"}, {"hook", "--backend.endpoint=http://example.com"}, {"hook", "--backend.apiKey=sk-literal"}} {
+		var out strings.Builder
+		if code := run(args, strings.NewReader(in), &out); code != 0 || out.Len() != 0 {
+			t.Errorf("%v: code = %d, out = %q", args, code, out.String())
+		}
+	}
+	if log, err := os.ReadFile(filepath.Join(os.Getenv("XDG_STATE_HOME"), "frisk", "frisk.log")); err != nil || strings.Contains(string(log), "sk-literal") {
+		t.Errorf("log unreadable or carries the key: err = %v", err)
+	}
+	var out strings.Builder
+	if code := run([]string{"hook", "--backend.model=x"}, strings.NewReader(in), &out); code != 0 || !strings.Contains(out.String(), `"deny"`) {
+		t.Errorf("valid flag: code = %d, out = %q", code, out.String())
+	}
+}
+
+func TestCheckTakesFlagsBeforeCommand(t *testing.T) {
+	newHookEnv(t, `{"permissions":{"allow":["ls *"]}}`)
+	var out strings.Builder
+	if code := run([]string{"check", "--backend.model=x", "ls", "-la"}, strings.NewReader(""), &out); code != 0 || !strings.HasPrefix(out.String(), "allow") {
+		t.Fatalf("code = %d, out = %q", code, out.String())
+	}
+}
+
+func TestFlagRules(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		code int
+		want string
+	}{
+		{"literal key flag refused", []string{"--backend.apiKey=sk-literal"}, 1, "error: a literal key on the command line"},
+		{"key expression flag", []string{"--backend.apiKey=$(echo k)"}, 0, "backend.apiKey: set (flag)"},
+		{"zero timeout means default", []string{"--backend.timeoutMs=0"}, 0, "backend.timeout: 5s (flag)"},
+		{"negative timeout flag", []string{"--backend.timeoutMs=-5"}, 1, "error: backend.timeoutMs -5"},
+		{"endpoint userinfo redacted", []string{"--backend.endpoint=https://user:hunter2@example.com/v1/systemone"}, 0, "backend.endpoint: https://user:xxxxx@example.com/v1/systemone (flag)"},
+	}
+	for _, tt := range tests {
+		out, code := validateOutput(t, "", tt.args...)
+		if code != tt.code || !strings.Contains(out, tt.want) || strings.Contains(out, "hunter2") || strings.Contains(out, "sk-literal") {
+			t.Errorf("%s: code = %d, out = %s", tt.name, code, out)
+		}
+	}
+}
+
+func TestJudgeIgnoresRedirects(t *testing.T) {
+	var followed atomic.Bool
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { followed.Store(true) }))
+	t.Cleanup(target.Close)
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(redirector.Close)
+	cfg := &config{Backend: backendConfig{Endpoint: redirector.URL, Model: "jev-test", APIKey: "k"}}
+	if v := decide(cfg, "terraform plan", t.TempDir(), testLogger); v.Decision != "" || v.Reason != "judge unavailable" {
+		t.Fatalf("verdict = %+v", v)
+	}
+	if followed.Load() {
+		t.Fatal("redirect followed: the key would reach the redirect target")
+	}
+}
+
+func TestResolveAPIKeyTimeoutKillsKeyCommand(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "survived")
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if _, err := resolveAPIKey(ctx, "$(sleep 1; touch "+marker+"; echo k)"); err == nil {
+		t.Fatal("want a timeout error")
+	}
+	time.Sleep(1500 * time.Millisecond)
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the key command outlived the timeout")
+	}
+}
+
+func TestResolveAPIKey(t *testing.T) {
+	t.Setenv("FRISK_TEST_KEY", "from-env")
+	ctx := context.Background()
+	tests := []struct{ raw, want string }{
+		{"plain-key", "plain-key"},
+		{"${FRISK_TEST_KEY}", "from-env"},
+		{"$(printf '%s\\n' from-cmd)", "from-cmd"},
+		{`$(echo "quoted value")`, "quoted value"},
+		{"pre-${FRISK_TEST_KEY}", "pre-from-env"},
+		{"$(" + shellQuote([]string{"printf", "%s", "it's"}) + ")", "it's"},
+	}
+	for _, tt := range tests {
+		if got, err := resolveAPIKey(ctx, tt.raw); err != nil || got != tt.want {
+			t.Errorf("resolveAPIKey(%q) = %q, %v; want %q", tt.raw, got, err, tt.want)
+		}
+	}
+	for _, raw := range []string{"", "$(false)", "$(true)", "${FRISK_UNSET_FOR_TEST}"} {
+		if got, err := resolveAPIKey(ctx, raw); err == nil {
+			t.Errorf("resolveAPIKey(%q) = %q, want an error", raw, got)
+		}
 	}
 
-	out, code = validateOutput(t, `{"jev":{"keyCmd":["true"]}}`)
-	if code != 1 || !strings.Contains(out, "error: jev.keyCmd failed") {
-		t.Fatalf("empty keyCmd output: code = %d, out = %s", code, out)
+	ctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := resolveAPIKey(ctx, "$(sleep 5)"); err == nil || time.Since(start) > 2*time.Second {
+		t.Errorf("hung helper: err = %v after %s", err, time.Since(start))
 	}
 }
 
 func TestValidateLive(t *testing.T) {
 	fakeJev(t, jevAnswer{Choice: "allow", Confidence: 0.98})
-	cfg := `{"jev":{"keyCmd":["echo","test-key"],"model":"jev-test"}}`
+	cfg := `{"backend":{"apiKey":"$(echo test-key)","model":"jev-test"}}`
 	out, code := validateOutput(t, cfg, "--live")
 	if code != 0 || !strings.Contains(out, "live judge call for `true`: allow") || !strings.Contains(out, "ms") {
 		t.Fatalf("code = %d, out = %s", code, out)
@@ -940,9 +1096,9 @@ func TestValidateLive(t *testing.T) {
 		t.Fatalf("no live call without --live: %s", out)
 	}
 
-	prev := jevEndpoint
-	jevEndpoint = "http://127.0.0.1:1"
-	t.Cleanup(func() { jevEndpoint = prev })
+	prev := defaultEndpoint
+	defaultEndpoint = "http://127.0.0.1:1"
+	t.Cleanup(func() { defaultEndpoint = prev })
 	out, code = validateOutput(t, cfg, "--live")
 	if code != 1 || !strings.Contains(out, "error: live judge call failed") {
 		t.Fatalf("unreachable judge: code = %d, out = %s", code, out)
@@ -1635,11 +1791,11 @@ func fakeJevAnswers(t *testing.T, answers map[string]any) (*config, *jevCapture)
 		})
 	}))
 	t.Cleanup(srv.Close)
-	prev := jevEndpoint
-	jevEndpoint = srv.URL
-	t.Cleanup(func() { jevEndpoint = prev })
+	prev := defaultEndpoint
+	defaultEndpoint = srv.URL
+	t.Cleanup(func() { defaultEndpoint = prev })
 	return &config{
-		Jev: jevConfig{Model: "jev-test", KeyCmd: []string{"echo", "test-key"}},
+		Backend: backendConfig{Model: "jev-test", APIKey: "test-key"},
 	}, capture
 }
 
@@ -1729,58 +1885,58 @@ func TestJudgeReasons(t *testing.T) {
 				"decision": jevAnswer{Choice: "ask", Confidence: 0.62, Probabilities: map[string]float64{"allow": 0.30, "ask": 0.62, "deny": 0.08}},
 				"ask_rule": jevAnswer{Choice: "r2", Confidence: 0.71},
 			},
-			decisionAsk, "jev ask (allow 0.30 / ask 0.62 / deny 0.08); " + softClosest,
+			decisionAsk, "judge ask (allow 0.30 / ask 0.62 / deny 0.08); " + softClosest,
 		},
-		{"no closest rule without an answer", "terraform apply", map[string]any{"decision": ask}, decisionAsk, "jev ask (0.62)"},
+		{"no closest rule without an answer", "terraform apply", map[string]any{"decision": ask}, decisionAsk, "judge ask (0.62)"},
 		{
 			"attribution none is omitted", "terraform apply",
 			map[string]any{"decision": ask, "ask_rule": jevAnswer{Choice: "none", Confidence: 0.90}},
-			decisionAsk, "jev ask (0.62)",
+			decisionAsk, "judge ask (0.62)",
 		},
 		{
 			"malformed attribution is ignored", "terraform apply",
 			map[string]any{"decision": ask, "ask_rule": "banana", "deny_rule": 7},
-			decisionAsk, "jev ask (0.62)",
+			decisionAsk, "judge ask (0.62)",
 		},
 		{
 			"unknown rule key is ignored", "terraform apply",
 			map[string]any{"decision": ask, "ask_rule": jevAnswer{Choice: "r9", Confidence: 0.90}},
-			decisionAsk, "jev ask (0.62)",
+			decisionAsk, "judge ask (0.62)",
 		},
 		{
 			"deny reads only the deny rule", "terraform apply",
 			map[string]any{"decision": jevAnswer{Choice: "deny", Confidence: 0.90}, "ask_rule": jevAnswer{Choice: "r2", Confidence: 0.99}, "deny_rule": r1},
-			decisionDeny, "jev deny (0.90); " + hardClosest,
+			decisionDeny, "judge deny (0.90); " + hardClosest,
 		},
 		{
 			"downgraded deny keeps its rule", "terraform apply",
 			map[string]any{"decision": jevAnswer{Choice: "deny", Confidence: 0.40}, "deny_rule": r1},
-			decisionAsk, "jev deny below confidence floor (0.40), asking; " + hardClosest,
+			decisionAsk, "judge deny below confidence floor (0.40), asking; " + hardClosest,
 		},
 		{
 			"silenced ask names no rule", "terraform apply",
 			map[string]any{"decision": jevAnswer{Choice: "ask", Confidence: 0.49}, "ask_rule": r1},
-			"", "jev ask below confidence floor (0.49)",
+			"", "judge ask below confidence floor (0.49)",
 		},
 		{
 			"floor form carries the split", "terraform apply",
 			map[string]any{"decision": jevAnswer{Choice: "ask", Confidence: 0.47, Probabilities: map[string]float64{"allow": 0.44, "ask": 0.48, "deny": 0.07}}},
-			"", "jev ask below confidence floor (0.47, allow 0.44 / ask 0.48 / deny 0.07)",
+			"", "judge ask below confidence floor (0.47, allow 0.44 / ask 0.48 / deny 0.07)",
 		},
 		{
 			"allow names no rule", "terraform apply",
 			map[string]any{"decision": jevAnswer{Choice: "allow", Confidence: 0.98}, "ask_rule": r1, "deny_rule": r1},
-			decisionAllow, "jev allow (0.98)",
+			decisionAllow, "judge allow (0.98)",
 		},
 		{
 			"missing script is named", "python3 nope.py",
 			map[string]any{"decision": ask},
-			decisionAsk, "jev ask (0.62); script nope.py not attached: missing",
+			decisionAsk, "judge ask (0.62); script nope.py not attached: missing",
 		},
 		{
 			"script lost after cd is named", "cd $DIR && python3 build.py",
 			map[string]any{"decision": ask},
-			decisionAsk, "jev ask (0.62); script build.py not attached: unresolvable after cd",
+			decisionAsk, "judge ask (0.62); script build.py not attached: unresolvable after cd",
 		},
 	}
 	for _, tt := range tests {
@@ -1820,47 +1976,47 @@ func TestJudgeDecisions(t *testing.T) {
 				"decision": jevAnswer{Choice: "ask", Confidence: 0.62, Probabilities: map[string]float64{"allow": 0.30, "ask": 0.62, "deny": 0.08}},
 				"ask_rule": jevAnswer{Choice: "r1", Confidence: 0.71},
 			},
-			"", "jev ask (allow 0.30 / ask 0.62 / deny 0.08); ask withheld by judge.decisions; " + softClosest,
+			"", "judge ask (allow 0.30 / ask 0.62 / deny 0.08); ask withheld by judge.decisions; " + softClosest,
 		},
 		{
 			"downgraded deny is withheld", noAsk, "terraform apply",
 			map[string]any{"decision": jevAnswer{Choice: "deny", Confidence: 0.40}, "deny_rule": r1},
-			"", "jev deny below confidence floor (0.40), asking; ask withheld by judge.decisions; " + hardClosest,
+			"", "judge deny below confidence floor (0.40), asking; ask withheld by judge.decisions; " + hardClosest,
 		},
 		{
 			"withheld ask keeps the probe note", noAsk, "python3 nope.py",
 			map[string]any{"decision": jevAnswer{Choice: "ask", Confidence: 0.62}},
-			"", "jev ask (0.62); ask withheld by judge.decisions; script nope.py not attached: missing",
+			"", "judge ask (0.62); ask withheld by judge.decisions; script nope.py not attached: missing",
 		},
 		{
 			"confident deny still denies", noAsk, "terraform apply",
 			map[string]any{"decision": jevAnswer{Choice: "deny", Confidence: 0.90}, "deny_rule": r1},
-			decisionDeny, "jev deny (0.90); " + hardClosest,
+			decisionDeny, "judge deny (0.90); " + hardClosest,
 		},
 		{
 			"confident allow still allows", noAsk, "terraform apply",
 			map[string]any{"decision": jevAnswer{Choice: "allow", Confidence: 0.98}},
-			decisionAllow, "jev allow (0.98)",
+			decisionAllow, "judge allow (0.98)",
 		},
 		{
 			"ask below the floor was silence already", noAsk, "terraform apply",
 			map[string]any{"decision": jevAnswer{Choice: "ask", Confidence: 0.49}},
-			"", "jev ask below confidence floor (0.49)",
+			"", "judge ask below confidence floor (0.49)",
 		},
 		{
 			"allow can be withheld too", noAllow, "terraform apply",
 			map[string]any{"decision": jevAnswer{Choice: "allow", Confidence: 0.98}},
-			"", "jev allow (0.98); allow withheld by judge.decisions",
+			"", "judge allow (0.98); allow withheld by judge.decisions",
 		},
 		{
 			"deny can be withheld too", noAsk[:1], "terraform apply",
 			map[string]any{"decision": jevAnswer{Choice: "deny", Confidence: 0.90}},
-			"", "jev deny (0.90); deny withheld by judge.decisions",
+			"", "judge deny (0.90); deny withheld by judge.decisions",
 		},
 		{
 			"unset key issues all three", nil, "terraform apply",
 			map[string]any{"decision": jevAnswer{Choice: "deny", Confidence: 0.40}},
-			decisionAsk, "jev deny below confidence floor (0.40), asking",
+			decisionAsk, "judge deny below confidence floor (0.40), asking",
 		},
 	}
 	for _, tt := range tests {
@@ -1937,8 +2093,8 @@ func TestLogsAttribution(t *testing.T) {
 
 func TestJoinReason(t *testing.T) {
 	t.Parallel()
-	got := joinReason("jev ask\n(0.62)", "", strings.Repeat("x", 400))
-	if strings.ContainsAny(got, "\n\r") || !strings.HasPrefix(got, "jev ask (0.62); xxx") {
+	got := joinReason("judge ask\n(0.62)", "", strings.Repeat("x", 400))
+	if strings.ContainsAny(got, "\n\r") || !strings.HasPrefix(got, "judge ask (0.62); xxx") {
 		t.Fatalf("reason = %q", got)
 	}
 	if n := len([]rune(got)); n != maxReasonChars+3 || !strings.HasSuffix(got, "...") {
@@ -2786,13 +2942,13 @@ func TestDescribeGit(t *testing.T) {
 	}
 }
 
-func TestJevUnreachableIsSilence(t *testing.T) {
-	prev := jevEndpoint
-	jevEndpoint = "http://127.0.0.1:1"
-	t.Cleanup(func() { jevEndpoint = prev })
-	cfg := &config{Jev: jevConfig{Model: "jev-test", KeyCmd: []string{"echo", "k"}, TimeoutMs: 200}}
+func TestBackendUnreachableIsSilence(t *testing.T) {
+	prev := defaultEndpoint
+	defaultEndpoint = "http://127.0.0.1:1"
+	t.Cleanup(func() { defaultEndpoint = prev })
+	cfg := &config{Backend: backendConfig{Model: "jev-test", APIKey: "k", TimeoutMs: 200}}
 	if v := decide(cfg, "terraform plan", t.TempDir(), testLogger); v.Decision != "" {
-		t.Fatalf("unreachable jev must be silence, got %q", v.Decision)
+		t.Fatalf("unreachable backend must be silence, got %q", v.Decision)
 	}
 }
 
