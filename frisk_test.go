@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,8 +25,8 @@ import (
 
 var testLogger = slog.New(slog.NewJSONHandler(io.Discard, nil))
 
-// exampleAllow is the permissions.allow list config.example.json ships. Core
-// has no allow rules, so tests take theirs from the file users copy.
+// exampleAllow is the permissions.allow list config.example.json ships: the
+// optional extras users copy on top of the builtin rules.
 func exampleAllow(t *testing.T) []string {
 	t.Helper()
 	return configFileAllow(t, "config.example.json")
@@ -798,7 +799,7 @@ func TestBareRulesAndFileRulesStaySeparate(t *testing.T) {
 		Deny: []string{"Edit(/a/**)", "Edit(git status)"}, Ask: []string{"Edit(*)"}, Allow: []string{"Edit(*)"},
 	}}
 	for _, cmd := range []string{"git status", "Edit(/a/x)", "ls /a/x"} {
-		if v := decide(fileOnly, cmd, t.TempDir(), testLogger); v.Decision != "" {
+		if v := decide(fileOnly, cmd, t.TempDir(), testLogger); v.Tier == "deny-rule" || v.Tier == "ask-rule" || strings.Contains(v.Reason, "Edit(") {
 			t.Errorf("Edit rule matched Bash command %q: %+v", cmd, v)
 		}
 	}
@@ -825,26 +826,21 @@ func validateOutput(t *testing.T, cfg string, args ...string) (string, int) {
 
 func TestValidateMissingConfig(t *testing.T) {
 	out, code := validateOutput(t, "")
-	if code != 0 || !strings.Contains(out, "does not exist: nothing is allowed statically") {
+	if code != 0 || !strings.Contains(out, "does not exist: only the builtin read-only rules apply") {
 		t.Fatalf("code = %d, out = %s", code, out)
 	}
 }
 
-// An allow list written for the builtins frisk once had still loads; validate
-// says the marker no longer brings any rules.
+// The marker in an allow list still loads; validate says it adds nothing,
+// since the builtin rules apply whatever the list says.
 func TestValidateDefaultsInAllowWarns(t *testing.T) {
 	out, code := validateOutput(t, `{"permissions":{"allow":["$defaults","just check"]}}`)
-	want := `warning: permissions.allow[0]: "$defaults" adds nothing: frisk has no default allow list`
-	if code != 0 || strings.Contains(out, "error:") || !strings.Contains(out, want) || !strings.Contains(out, "config.example.json") {
+	want := `warning: permissions.allow[0]: "$defaults" adds nothing: the builtin read-only rules always apply`
+	if code != 0 || strings.Contains(out, "error:") || !strings.Contains(out, want) {
 		t.Fatalf("code = %d, out = %s", code, out)
 	}
-	if strings.Contains(out, "permissions.allow has no rules") {
-		t.Fatalf("a list with a rule reported as empty: %s", out)
-	}
-
-	out, code = validateOutput(t, `{"permissions":{"allow":["$defaults"]}}`)
-	if code != 0 || !strings.Contains(out, want) || !strings.Contains(out, "info: permissions.allow has no rules: nothing is allowed statically") {
-		t.Fatalf("marker only: code = %d, out = %s", code, out)
+	if !strings.Contains(out, "info: "+strconv.Itoa(len(builtinAllow))+" builtin read-only allow rules apply") {
+		t.Fatalf("builtin rule count missing: %s", out)
 	}
 }
 
@@ -1379,9 +1375,12 @@ func TestDecideStaticTiers(t *testing.T) {
 	t.Parallel()
 	cfg := &config{
 		Permissions: permissionsConfig{
-			Allow: exampleAllow(t),
-			Deny:  []string{"gopass show -o *"},
-			Ask:   []string{"ssh prod *"},
+			// Rules that can print a secret are no longer in the example, but
+			// their screens still need a rule to screen.
+			Allow: append(exampleAllow(t), "printenv [A-Za-z_]*", "git remote -v", "git remote get-url *",
+				"git config --get *", "git config --list"),
+			Deny: []string{"gopass show -o *"},
+			Ask:  []string{"ssh prod *"},
 		},
 	}
 	tests := []struct {
@@ -1393,7 +1392,8 @@ func TestDecideStaticTiers(t *testing.T) {
 		{"deny wins", "gopass show -o api/KEY", decisionDeny, "deny-rule"},
 		{"deny wins inside chain", "cd x && gopass show -o k", decisionDeny, "deny-rule"},
 		{"ask rule", "ssh prod uptime", decisionAsk, "ask-rule"},
-		{"builtin readonly", "git -C /x log --oneline | head -3", decisionAllow, "static"},
+		{"builtin readonly", "git -C sub log --oneline | head -3", decisionAllow, "static"},
+		{"git aimed outside the project never static", "git -C /x log --oneline | head -3", "", "no-judge"},
 		{"config allow", "just check", decisionAllow, "static"},
 		{"write flag disqualifies", "sed -i s/a/b/ f.txt", "", "no-judge"},
 		{"find -delete disqualifies", "find . -name x -delete", "", "no-judge"},
@@ -1918,33 +1918,97 @@ func TestStaticReadings(t *testing.T) {
 	}
 }
 
-// Core ships no allow rules: what settles statically is what the config lists.
-func TestOnlyConfigRulesAllow(t *testing.T) {
+// The builtin read-only rules apply under any config; anything else settles
+// only through the config, and ask and deny rules override the builtins.
+func TestBuiltinAllowBaseline(t *testing.T) {
 	t.Parallel()
-	commands := []string{"ls", "pwd", "true", "cat README.md", "git status", "echo hi", "cd /tmp", "just check"}
+	builtin := []string{"ls", "pwd", "cat README.md", "git status", "echo hi", "cd /tmp"}
+	unlisted := []string{"true", "just check", "git fetch origin", "printenv HOME"}
 	for name, cfg := range map[string]*config{
 		"no config":      {},
 		"empty list":     {Permissions: permissionsConfig{Allow: []string{}}},
 		"marker only":    {Permissions: permissionsConfig{Allow: []string{defaultsMarker}}},
 		"deny rule only": {Permissions: permissionsConfig{Deny: []string{"rm *"}}},
 	} {
-		for _, command := range commands {
+		for _, command := range builtin {
+			if v := decide(cfg, command, t.TempDir(), testLogger); v.Decision != decisionAllow || !strings.HasSuffix(v.Reason, " (builtin)") {
+				t.Errorf("%s: decide(%q) = (%q, %q), want a builtin allow", name, command, v.Decision, v.Reason)
+			}
+		}
+		for _, command := range unlisted {
 			if v := decide(cfg, command, t.TempDir(), testLogger); v.Decision != "" || v.Tier != "no-judge" {
 				t.Errorf("%s: decide(%q) = (%q, %q), want silence", name, command, v.Decision, v.Tier)
 			}
 		}
 	}
 
-	cfg := &config{Permissions: permissionsConfig{Allow: []string{defaultsMarker, "just check"}}}
-	if v := decide(cfg, "ls", t.TempDir(), testLogger); v.Decision != "" {
-		t.Fatalf("ls has no rule and the marker brings none, got %q", v.Decision)
-	}
+	cfg := &config{Permissions: permissionsConfig{Allow: []string{"just check", "ls *"}}}
 	if v := decide(cfg, "just check", t.TempDir(), testLogger); v.Decision != decisionAllow {
 		t.Fatalf("just check should be allowed, got %q", v.Decision)
 	}
+	if v := decide(cfg, "ls -la", t.TempDir(), testLogger); v.Decision != decisionAllow || !strings.HasSuffix(v.Reason, ": ls *") {
+		t.Fatalf("a rule the config lists is reported as the config's: (%q, %q)", v.Decision, v.Reason)
+	}
+	cfg = &config{Permissions: permissionsConfig{Ask: []string{"cat *"}, Deny: []string{"git diff *"}}}
+	if v := decide(cfg, "cat README.md", t.TempDir(), testLogger); v.Decision != decisionAsk {
+		t.Fatalf("an ask rule overrides the builtin, got %q", v.Decision)
+	}
+	if v := decide(cfg, "git diff HEAD", t.TempDir(), testLogger); v.Decision != decisionDeny {
+		t.Fatalf("a deny rule overrides the builtin, got %q", v.Decision)
+	}
 	// The marker is not a rule: a command spelled like it matches nothing.
-	if v := decide(cfg, `'$defaults'`, t.TempDir(), testLogger); v.Decision != "" {
+	if v := decide(&config{Permissions: permissionsConfig{Allow: []string{defaultsMarker}}}, `'$defaults'`, t.TempDir(), testLogger); v.Decision != "" {
 		t.Fatalf("the marker matched a command, got %q", v.Decision)
+	}
+}
+
+// Forms that write, run foreign code or read credential directories never
+// settle, though a builtin rule names their verb.
+func TestBuiltinRulesKeepScreens(t *testing.T) {
+	t.Parallel()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cwd := t.TempDir()
+	for _, command := range []string{
+		"sed -l 'w " + home + "/.claude/settings.json' p",
+		"sed -nl 'w /tmp/x' p",
+		"echo x | uniq - /tmp/out",
+		"git --git-dir=/tmp/evil.git status",
+		"git --work-tree=/tmp/x status",
+		"git -C /tmp/x status",
+		"cd /tmp/x && git status",
+		"grep -rA50 'BEGIN OPENSSH' " + home,
+		"rg -uuu aws_secret ~",
+		"grep -r '' ~/.config/gh",
+		"diff -rN ~/.config/gh /tmp/empty",
+		"git diff --no-index ~/.config/gh /dev/null",
+		"rg secret /",
+		"cd " + home + " && rg aws_secret",
+		"cd " + home + " && grep -r token",
+		"grep -d recurse x ~",
+		"grep --directories=recurse x ~",
+		"git diff ~/.config /tmp/e",
+		"cd tenequm/Projects/frisk tenequm/.config && rg token",
+		"CDPATH=/ cd tmp && git status",
+		"tail ~/.zsh_history",
+		"rg x " + filepath.Dir(home) + "/*",
+		"grep -r x ~/.*",
+		"cat ~/.bash_history",
+		`awk 'BEGIN{ARGV[1]="/x/." "ssh/id"; ARGC=2} {print}'`,
+	} {
+		if v := decide(&config{}, command, cwd, testLogger); v.Decision != "" {
+			t.Errorf("decide(%q) = (%q, %q), want silence", command, v.Decision, v.Reason)
+		}
+	}
+	for _, command := range []string{
+		"git -C sub status", "cd sub && git log --oneline", "rg -n foo", "grep -rn foo sub",
+		"diff -r a b", "uniq f", "sed -n 1,5p f", "rg 'foo.*bar' sub", "git diff HEAD~1",
+	} {
+		if v := decide(&config{}, command, cwd, testLogger); v.Decision != decisionAllow {
+			t.Errorf("decide(%q) = (%q, %q), want a builtin allow", command, v.Decision, v.Reason)
+		}
 	}
 }
 
@@ -2127,7 +2191,7 @@ func TestJudgeRecordsProbabilities(t *testing.T) {
 func TestJudgeReasons(t *testing.T) {
 	const pushRule = "Publishing packages or pushing to a shared branch without review, which others may already have pulled."
 	softClosest := `closest rule: soft_deny "` + pushRule[:70] + `..." (0.71)`
-	const hardClosest = `closest rule: hard_deny "Reading, printing, or transmitting credentials or secret material. Mod..." (0.80)`
+	hardClosest := `closest rule: hard_deny "` + builtinJudge.HardDeny[0][:maxRuleChars] + `..." (0.80)`
 	ask := jevAnswer{Choice: "ask", Confidence: 0.62}
 	r1 := jevAnswer{Choice: "r1", Confidence: 0.80}
 	tests := []struct {
@@ -2141,7 +2205,7 @@ func TestJudgeReasons(t *testing.T) {
 			"split and closest rule", "terraform apply",
 			map[string]any{
 				"decision": jevAnswer{Choice: "ask", Confidence: 0.62, Probabilities: map[string]float64{"allow": 0.30, "ask": 0.62, "deny": 0.08}},
-				"ask_rule": jevAnswer{Choice: "r2", Confidence: 0.71},
+				"ask_rule": jevAnswer{Choice: "r" + strconv.Itoa(len(builtinJudge.SoftDeny)+1), Confidence: 0.71},
 			},
 			decisionAsk, "judge ask (allow 0.30 / ask 0.62 / deny 0.08); " + softClosest,
 		},
@@ -2206,8 +2270,15 @@ func TestJudgeReasons(t *testing.T) {
 				t.Fatalf("verdict = (%q, %q), want (%q, %q)", v.Decision, v.Reason, tt.decision, tt.reason)
 			}
 			_, req := capture.request()
-			wantAsk := map[string]string{"r1": builtinJudge.SoftDeny[0], "r2": pushRule, "none": "No rule fits."}
-			wantDeny := map[string]string{"r1": builtinJudge.HardDeny[0], "none": "No rule fits."}
+			criteria := func(rules ...string) map[string]string {
+				m := map[string]string{"none": "No rule fits."}
+				for i, rule := range rules {
+					m["r"+strconv.Itoa(i+1)] = rule
+				}
+				return m
+			}
+			wantAsk := criteria(append(slices.Clone(builtinJudge.SoftDeny), pushRule)...)
+			wantDeny := criteria(builtinJudge.HardDeny...)
 			if !maps.Equal(req.Questions["ask_rule"].Criteria, wantAsk) || !maps.Equal(req.Questions["deny_rule"].Criteria, wantDeny) {
 				t.Fatalf("rule questions = %+v", req.Questions)
 			}
@@ -2217,7 +2288,7 @@ func TestJudgeReasons(t *testing.T) {
 
 func TestJudgeDecisions(t *testing.T) {
 	softClosest := `closest rule: soft_deny "` + builtinJudge.SoftDeny[0][:maxRuleChars] + `..." (0.71)`
-	const hardClosest = `closest rule: hard_deny "Reading, printing, or transmitting credentials or secret material. Mod..." (0.80)`
+	hardClosest := `closest rule: hard_deny "` + builtinJudge.HardDeny[0][:maxRuleChars] + `..." (0.80)`
 	noAsk, noAllow := []string{decisionAllow, decisionDeny}, []string{decisionAsk, decisionDeny}
 	r1 := jevAnswer{Choice: "r1", Confidence: 0.80}
 	tests := []struct {
@@ -2441,7 +2512,7 @@ func TestGitFacts(t *testing.T) {
 			if !maps.Equal(facts, tt.want) {
 				t.Fatalf("git state = %v, want %v", req.State.Git, tt.want)
 			}
-			if strings.Contains(raw, "s3cretpass") || strings.Contains(raw, "deploy") {
+			if strings.Contains(raw, "s3cretpass") || strings.Contains(raw, "deploy:") {
 				t.Fatalf("remote userinfo leaked into the request: %s", raw)
 			}
 			explained := strings.Contains(req.Questions["decision"].Instructions, "`git.upstream`")

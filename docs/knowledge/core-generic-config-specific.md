@@ -1,61 +1,76 @@
 ---
 type: Decision
-title: Core understands commands, config decides
-description: Core parses commands and screens their arguments for any unix user and ships no allow rules; which commands settle, and one user's tools, hosts and policy, live in their config.
+title: Core ships generic defaults, config adds the user's facts
+description: Like Claude Code, core ships a measured read-only allow baseline and generic judge prose that any unix user can run; one user's tools, hosts, ownership and policy live in their config, which extends the judge prose with "$defaults".
 tags: [architecture, scope]
 status: stable
-generated: { by: claude-code/opus-5-5, at: "2026-09-30T15:58:00Z" }
+generated: { by: claude-code/opus-5-5, at: "2026-10-07T09:45:00+01:00" }
 sources:
   - id: maintainer
-    resource: maintainer instructions on 2026-09-30 (no durable link)
+    resource: maintainer instructions on 2026-10-07 (no durable link)
     title: Scope of the frisk core
-  - id: design
-    resource: repository file DESIGN.md
-    title: frisk design
+  - id: claude-code
+    resource: https://code.claude.com/docs/en/permissions#read-only-commands
+    title: Claude Code permissions, read-only commands
+  - id: coverage
+    resource: replay of 21,043 logged hook Bash calls from one machine's frisk.log, 2026-09-23 to 2026-10-07, through `frisk check` with the judge off, under a 40-rule and a 117-rule read-only list (results not committed)
+    title: Baseline coverage measurement
 ---
 
 # Decision
 
-The code in `frisk.go` understands commands and decides nothing about them. It
-ships no allow rules: with no config, every command passes through to Claude
-Code's own flow. What settles, and how, is written in
-`$XDG_CONFIG_HOME/frisk/config.json`.[^maintainer]
+frisk follows Claude Code's split.[^maintainer] Claude Code ships a built-in,
+non-configurable set of read-only Bash commands that run without a prompt, which
+`ask` and `deny` rules override, and classifier prose that config extends with
+`"$defaults"`; its `permissions.allow` has no defaults.[^claude-code]
 
-The test for anything in core: would it be correct for a stranger who installed
-frisk on Linux or macOS and has not told it what they allow?
+Core ships:
 
-# Where things go
+- `builtinAllow`, a read-only static baseline. It always applies,
+  `permissions.ask` and `permissions.deny` override it, and a static reason ends
+  in `(builtin)` when one of its rules matched.
+- `builtinJudge`, generic judge prose. Each judge list extends it with
+  `"$defaults"`, spliced in place, or replaces it by leaving the marker out.
+- The parser and the screens, which keep any allow rule, builtin or configured,
+  from matching a form it does not mean.
 
-Core:
+Config holds what is one user's: extra allow rules, ask and deny rules, and the
+facts the prose cannot know - which repositories, hosts and organizations are
+theirs, extra working areas, their daily work, policy for systems they operate
+for others.
 
-- Command parsing: quoting, separators, redirects, heredocs, and variables the
-  command itself sets to a literal.
-- The screens that keep a config rule from matching a form it does not mean. See
-  [Static allow needs argument screening](static-allow-needs-argument-screening.md).
-- Credential locations that are common across unix systems: `~/.ssh`, `~/.aws`,
-  `.gnupg`, `.netrc`, `.npmrc`, `.pypirc`, `.env` files, key and keychain files,
-  and the standard password-store directories.
+# What qualifies for core
 
-Config (per user):
+The test: would it be right for a stranger on Linux or macOS who has not told
+frisk anything?
 
-- Every `permissions.allow`, `ask` and `deny` rule, including the read verbs of
-  ubiquitous tools such as coreutils, `git` and `kubectl`.
-  `config.example.json` carries a read-only starting list to copy and trim.
-- Facts about their environment for the judge: which hosts, organizations and
-  directories are theirs, which branches are personal.
-- Policy for a specific secret manager, for example when piping a value from a
-  vault CLI into a consumer is routine and when it must prompt.
+- A baseline rule must be read-only under the screens and settle real traffic.
+  Forty rules settle 9,154 of 21,043 logged calls (43.5%); the 117-rule
+  read-only list the example once carried settles 9,346 (44.4%).[^coverage]
+  Rules that can print a secret in normal use stay out: `git config` and
+  `git remote -v` (a token in a remote URL), `printenv`.
+- Builtin prose makes no ownership claim. A generic "the working directory's
+  remotes are the user's own" would contradict a user's own fact that a client
+  repository is not theirs, and a command that half-fits two items scores low
+  on both. Without ownership facts, items that depend on them resolve to
+  silence, never to a wrong allow.
+- Builtin prose may name widely used secret sources (`gopass show`, `op read`,
+  `security find-*-password`): the exposure rule never fires without concrete
+  sources (see [Secret rules name the destination](secret-rules-name-the-destination.md)).
+- It assumes a single developer's own machine with an agent proposing commands.
+  A user in another setting replaces the environment list.
 
 # Why
 
-An allow list in core is a decision made for the user: it settles commands they
-never said they allow, and every install inherits it.[^maintainer] A screen is
-different in kind. It never produces a verdict; it only stops a rule such as
-`sed *` from matching `sed -i`, so the command passes through as if the rule
-were not there.[^design]
+Defaults that ship with the binary stay in step with what the binary sends the
+judge: the prose decides git commands from `git.commands` records and treats
+listed `data` as content, and only core knows when those records change. Before
+this decision the measured prose lived in one user's config while core kept
+unmeasured one-liners, and the example inherited the weak ones.[^maintainer]
 
-Config is read only from the user's config directory and never from the project,
-so a cloned repository cannot retarget the gate.[^design]
+Config is read only from the user's config directory and never from the
+project, so a cloned repository cannot retarget the gate.
 
 [^maintainer]: Scope of the frisk core
-[^design]: frisk design
+[^claude-code]: Claude Code permissions, read-only commands
+[^coverage]: Baseline coverage measurement

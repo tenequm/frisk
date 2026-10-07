@@ -24,9 +24,9 @@ parse into pipeline segments (|, &&, ||, ;, newline)
   |
 1. permissions.deny  match -> "deny"
 2. permissions.ask   match -> "ask"
-3. permissions.allow: EVERY segment matches a rule
-   and trips no screen (core ships no rules; bails on
-    $(), backticks, (), heredocs other than a literal
+3. allow: EVERY segment matches a permissions.allow
+   or builtin read-only rule and trips no screen
+   (bails on $(), backticks, (), heredocs other than a literal
     one no program runs, &, # comments, brace
     lists, variables the command does not set to a
     literal or that are not $HOME or $TMPDIR, and
@@ -48,15 +48,33 @@ silence -> Claude Code native flow (rules -> classifier -> prompt)
 
 `$XDG_CONFIG_HOME/frisk/config.json` - see [config.example.json](config.example.json).
 Never read from the project directory, so a cloned repo cannot retarget the
-gate. Missing file = no rules and the judge off, so every command passes
-through; malformed file = silent for the session (logged).
+gate. Missing file = only the builtin read-only rules and the judge off, so
+every other command passes through; malformed file = silent for the session
+(logged).
 
-Core understands commands and config decides about them. Core ships no allow
-list: the static tier allows only what `permissions.allow` lists, and with no
-rule a command passes through to the judge or to silence.
-[config.example.json](config.example.json) carries a starting list of read commands and temporary-file write scopes.
+Core ships what is right for any unix user, like Claude Code: a built-in set
+of read-only rules (`builtinAllow`) and generic judge prose (`builtinJudge`).
+The builtin rules are the read-only verbs that settle real traffic; they always
+apply, `permissions.ask` and `permissions.deny` override them, and a static
+reason ends in `(builtin)` when the rule it names is builtin. The reason names
+the last segment's rule, so `just check && ls` reads `ls * (builtin)` though
+`just check` needed the config's rule. Anything else settles only
+through `permissions.allow`, and with no rule a command passes through to the
+judge or to silence. [config.example.json](config.example.json) carries
+optional read-only extras and temporary-file write scopes.
 What core keeps is the parser and the screens - denied flags, risky arguments,
-program text, credential paths and globs, hijacking environment variables.
+program text, credential paths and globs, hijacking environment variables,
+a git command aimed outside the working directory (`-C`, a `cd`, `--git-dir`,
+`--work-tree`: git runs programs a repository's config names), and a recursive
+read (`rg`, `grep -r` or `-d recurse`, `diff -r`, `git diff`, which turns
+no-index by itself for a path outside the repository) of the home directory, a
+directory above it, or a hidden directory in it, where credential files sit
+under names no word shows. rg and grep walk "." with no path given, so they do
+not settle statically from such a directory either. A `cd` is followed only to
+one literal target: zsh's `cd old new` and `cd +1`, and any relative target
+while `CDPATH` is set, leave the directory unknown. `sed -l` takes a value in
+GNU sed and none in BSD sed, so a command carrying it never settles statically.
+Shell history files count as credential files.
 A screen never decides anything: it only stops a rule such as `sed *` from
 matching `sed -i`, a form the rule does not mean, and that command passes
 through too.
@@ -69,10 +87,12 @@ like a jq program. A `ps *` rule does not cover a call that prints the
 environment of other processes: `-E` on macOS, a BSD-style `e` as in `ps eww`
 on Linux, or an `environ` column.
 
-In the four `judge` lists `"$defaults"` splices the built-in prose,
-autoMode-style. The `permissions` lists have no built-in entries, so there the
-marker stands for nothing; it is accepted so that a config written for the
-default allow list frisk once had still loads.
+In the four `judge` lists `"$defaults"` splices the built-in prose in place,
+autoMode-style; a list without it replaces the builtins. The builtin prose
+claims no ownership: which repositories, hosts and organizations are the
+user's comes only from config, and without those facts the items that depend
+on them stay silent rather than allow. In the `permissions` lists the marker
+stands for nothing, since the builtin rules apply whatever the list says.
 
 Rules use Claude Code's `Bash(...)` rule-content syntax, matched against
 parsed segments - so `cd x && git push` still matches `git push *`. Trailing
@@ -217,7 +237,7 @@ stay. A remote written as a URL is always read from the words. A dry run
 description only; the instructions
 gain one sentence saying what it is, that it is trusted, that `unknown` means
 frisk could not determine the field and that an absent optional field is
-false. No allow or deny criterion in the builtin prose refers to it.
+false. The builtin prose decides git commands from these records.
 
 The lookups change nothing: git runs with `--no-optional-locks` and
 `core.fsmonitor=false`, so reading a repository neither rewrites its index nor
@@ -395,7 +415,7 @@ other program that may run it, gets no record, and neither does a file another
 statement names (`sh < f`, `source f`, `$(cat f)`). A file nothing in the
 command names may still run later, read by a git hook, `make` or a shell at
 startup, and the instruction says so. Like `git.commands` it is description only, with one sentence of
-instructions, and no builtin prose refers to it.
+instructions, and the builtin environment prose says listed text is content.
 
 `probe.status` tells the judge why a body is absent: `attached`, `missing`,
 `unresolvable`, `oversize`, `non-utf8`, `multiple-truncated`, `remote-only`.
@@ -550,7 +570,8 @@ everything under it, otherwise `filepath.Match` on the cleaned absolute path.
 Builtin guardrail paths (frisk's own config dir, the frisk binary,
 `~/.claude/settings*.json`, `~/.claude/hooks`) ask, checked raw and
 symlink-resolved. Precedence: config deny > config ask > guardrail ask > config
-allow > silence; as for Bash, the only allows are the config's.
+allow > silence; the builtin rules are Bash-only, so here the only allows are
+the config's.
 
 ## Validate
 
@@ -558,8 +579,9 @@ A malformed config makes the hook stay silent for the whole session, so
 `frisk validate` loads it with the hook's own loader and prints `error:`,
 `warning:` and `info:` lines (exit 1 only on errors): parse failures, empty or
 bad-glob rules, empty `Edit()` patterns, bare `*` in deny/ask, `$defaults` in
-`permissions.allow` (a warning: it adds no rules), an allow list with no rules,
-whether each judge list is unset, extends (`$defaults`) or replaces the builtins, the
+`permissions.allow` (a warning: it adds no rules), how many builtin read-only
+rules apply, whether each judge list is unset, extends (`$defaults`) or
+replaces the builtins, the
 effective `judge.decisions`, each `backend` value with where it came from
 (flag, file or default), and whether `backend.apiKey` resolves - never printing
 any part of the key. No network unless `--live`, which makes one real judge
