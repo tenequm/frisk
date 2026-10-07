@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.0](https://github.com/tenequm/frisk/compare/v0.3.0...v0.4.0) - 2026-10-07
+
+### <!-- 0 -->🛠 Breaking Changes
+- [**breaking**] ship a read-only allow baseline and generic judge prose ([#35](https://github.com/tenequm/frisk/pull/35)) ([0b1a133](https://github.com/tenequm/frisk/commit/0b1a13324e659dd2626efdbbe8618f897c1394ed))
+  frisk now ships a small read-only allow baseline (ls, cat, rg, git diff,
+  gh pr view and more) and measured judge prose. Put your ownership facts
+  in judge.environment after "$defaults"; ask and deny rules override the
+  builtins. Git aimed outside the project no longer settles statically.
+
+**Full Changelog**: https://github.com/tenequm/frisk/compare/v0.3.0...v0.4.0
+
 ## [0.3.0](https://github.com/tenequm/frisk/compare/v0.2.1...v0.3.0) - 2026-10-06
 
 **Upgrading:** upgrade the binary before editing the config, because an
