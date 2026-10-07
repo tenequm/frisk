@@ -13,8 +13,8 @@ Claude Code PreToolUse gate for Bash. Design: [DESIGN.md](DESIGN.md).
 - Config is read only from `$XDG_CONFIG_HOME/frisk/`, never from the project.
 - Reuse Claude Code vocabulary (`allow`/`ask`/`deny`/`defer`, `permissions.*`, `autoMode.*`); invent no new terms.
 - Comments explain why, never what.
-- Core stays generic for any unix user; one user's tools and policy live in config ([why](docs/knowledge/core-generic-config-specific.md)).
-- Core understands, config decides: core ships no allow rules, only the parser and the screens that keep a config rule from matching a form it does not mean. With no rule a command passes through. A starting list lives in [config.example.json](config.example.json).
+- Core ships only what is right for any unix user: a measured read-only allow baseline and generic judge prose, like Claude Code's built-in read-only set and autoMode defaults. One user's tools, hosts and policy live in config ([why](docs/knowledge/core-generic-config-specific.md)).
+- Core understands, config extends: the parser and the screens keep any allow rule, builtin or configured, from matching a form it does not mean. `"$defaults"` exists only in the judge lists; the builtin allow rules always apply and ask/deny rules override them. [config.example.json](config.example.json) shows the extension points.
 
 ## Workflow
 

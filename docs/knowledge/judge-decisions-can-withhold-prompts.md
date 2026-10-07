@@ -52,7 +52,7 @@ than they return.
 
 The default stays all three, because a user who runs frisk as the stricter layer
 wants the prompts. See
-[Core is generic, config is personal](core-generic-config-specific.md).
+[Core ships generic defaults, config adds the user's facts](core-generic-config-specific.md).
 
 # Cost
 

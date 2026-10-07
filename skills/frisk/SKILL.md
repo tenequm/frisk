@@ -10,8 +10,9 @@ A [Jev](https://docs.typesafe.ai) judgment covers the gray zone. Everything
 else is silence: the command falls through to Claude Code's own permission
 flow. frisk shortcuts, never bypasses. A frisk allow still passes Claude
 Code's deny/ask re-check. A frisk deny or ask holds in every mode, including
-`bypassPermissions`. Every failure path is silence. Core ships no allow rules:
-only the user's config allows anything. Full detail:
+`bypassPermissions`. Every failure path is silence. Like Claude Code, core
+ships a small read-only allow baseline and generic judge prose; config adds
+the user's own rules and facts. Full detail:
 [DESIGN.md](https://github.com/tenequm/frisk/blob/main/DESIGN.md).
 
 ## Set up
@@ -19,7 +20,8 @@ only the user's config allows anything. Full detail:
 1. Write the config to `~/.config/frisk/config.json` (`$XDG_CONFIG_HOME/frisk/`).
    Start from
    [config.example.json](https://github.com/tenequm/frisk/blob/main/config.example.json)
-   and trim its allow list. frisk never reads config from the project.
+   and trim its allow list: it holds optional extras on top of the builtin
+   read-only rules. frisk never reads config from the project.
 2. Register the hook in Claude Code settings. Use matcher
    `Bash|Edit|Write|NotebookEdit` to gate file edits too:
 
@@ -57,7 +59,8 @@ included.
   Claude Code prompt means frisk stayed silent.
 - `frisk check '<command>'` reproduces any decision and prints
   `decision tier reason`. Judge reasons include the probability split and the
-  closest prose rule. Tier `no-judge` means `backend.apiKey` is unset; reason
+  closest prose rule. A static reason ending in `(builtin)` matched a builtin
+  read-only rule; an ask or deny rule overrides it. Tier `no-judge` means `backend.apiKey` is unset; reason
   `judge unavailable` means the key or the endpoint failed (the log line says
   which).
 - To compare judge prose or models faithfully, add `--log-level debug` to the
@@ -94,7 +97,10 @@ segment to match.
 
 ## Tune the judge (judge.*)
 
-`"$defaults"` splices the builtin prose into a list. `soft_deny` maps to ask,
+`"$defaults"` splices the builtin prose into a list, in place; a list without
+it replaces the builtins. The builtin prose claims no ownership, so add which
+repositories, hosts and directories are the user's to `environment`.
+`soft_deny` maps to ask,
 `hard_deny` to deny. `judge.decisions` limits what the judge may issue:
 `["allow", "deny"]` means it never prompts. Withheld verdicts log as `silent`.
 

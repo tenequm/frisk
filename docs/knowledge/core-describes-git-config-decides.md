@@ -1,10 +1,10 @@
 ---
 type: Decision
-title: Core describes git, config decides
-description: frisk sends the judge a trusted record for each git command (class, forcing, push destination, files a discard would lose) and ships no git policy; the user's judge prose is written against the record's fields.
+title: Core describes git, prose decides
+description: frisk sends the judge a trusted record for each git command (class, forcing, push destination, files a discard would lose) and decides nothing by rule; judge prose, builtin and the user's, is written against the record's fields.
 tags: [git, judge, architecture]
 status: stable
-generated: { by: claude-code/opus-5-5, at: "2026-10-06T21:00:00Z" }
+generated: { by: claude-code/opus-5-5, at: "2026-10-07T09:45:00+01:00" }
 sources:
   - id: maintainer
     resource: maintainer instructions on 2026-09-30 (no durable link)
@@ -27,17 +27,22 @@ command the judge receives one record under `state.git.commands`: the
 subcommand, a class (`read`, `local`, `discard`, `remote`, `exec`, `unknown`),
 whether it forces, deletes a ref or skips hooks, where a push goes and whether
 that is the remote's default branch, and how many files a discard would
-lose.[^design] What to do with those facts is the user's `judge` prose. With no
-prose about git, git commands pass through like any other.[^maintainer]
+lose.[^design] What to do with those facts is `judge` prose: the builtin prose
+allows reads, local work and unforced pushes by record and asks about forced
+pushes and discards that lose files, and the user's ownership facts say which
+repositories and branches are theirs. A list that replaces the builtins without
+any prose about git leaves git commands to pass through like any
+other.[^maintainer]
 
 A field that cannot be determined says `unknown`. It is never guessed and never
 resolved toward the permissive value.
 
 # Why not rules in core, or a pattern list
 
-- A class table in core that allowed or denied by itself would be a decision
-  made for the user, which
-  [core does not make](core-generic-config-specific.md).[^maintainer]
+- A class table in core that allowed or denied by itself would bypass the
+  judge and the user's facts: whether a push is acceptable depends on whose
+  repository and branch it is, which only config knows (see
+  [Core ships generic defaults](core-generic-config-specific.md)).[^maintainer]
 - "Allow all git, deny a few patterns" leaks: git runs programs through
   `-c alias.x=!cmd`, `--exec` and `bisect run`, positional rules miss reordered
   flags, and whether a push is acceptable depends on the remote and the

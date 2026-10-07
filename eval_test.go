@@ -32,7 +32,8 @@ import (
 //
 // FRISK_EVAL_LIVE=1 replays against the config dir named by FRISK_EVAL_XDG
 // with the judge on. That calls a paid API once per fixture the static tiers
-// do not settle.
+// do not settle. FRISK_EVAL_EXPECTED=1 keeps only the fixtures that carry an
+// expectation, a small graded set for checking a prose change cheaply.
 //
 // Every run also writes the report plus one line per fixture to a file in the
 // system temp dir, so piping the test output through tail loses nothing.
@@ -117,6 +118,9 @@ func TestEvalFixtures(t *testing.T) {
 
 	sandbox := t.TempDir()
 	fixtures := loadEvalFixtures(t)
+	if os.Getenv("FRISK_EVAL_EXPECTED") == "1" {
+		fixtures = slices.DeleteFunc(fixtures, func(f evalFixture) bool { return f.Expect == "" })
+	}
 	results := make([]evalResult, 0, len(fixtures))
 	for _, f := range fixtures {
 		r := replay(t, bin, env, materialize(t, sandbox, f), f)

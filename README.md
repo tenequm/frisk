@@ -13,7 +13,7 @@ frisk check 'git status | head'
 
 Register `frisk hook` as a `PreToolUse` hook with matcher `Bash`. Design: [DESIGN.md](DESIGN.md).
 
-frisk allows nothing on its own. The static tier settles only the commands `permissions.allow` lists, and `config.example.json` carries a read-only starting list to copy and trim; with no config every command passes through to Claude Code's own flow.
+Like Claude Code, frisk ships a small built-in set of read-only commands (`ls`, `cat`, `rg`, `git diff`, `gh pr view` and others with real traffic) that settle statically under any config; `permissions.ask` and `permissions.deny` override them. Everything else settles only through your `permissions.allow`, and `config.example.json` carries optional read-only extras to copy. The judge ships generic prose too: extend each list with `"$defaults"` plus your own facts, such as which hosts and repositories are yours.
 
 To gate file edits too, use matcher `Bash|Edit|Write|NotebookEdit` and write `Edit(<path-pattern>)` rules in `permissions.*`; frisk's own config and Claude Code's settings and hooks always ask.
 

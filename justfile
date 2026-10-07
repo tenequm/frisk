@@ -42,7 +42,7 @@ test-cov:
 eval:
     gotestsum --format standard-verbose -- -tags eval -run TestEvalFixtures -count=1 .
 
-# Same replay against the real config with the judge on (paid API calls)
+# Same replay against the real config with the judge on (paid API calls); FRISK_EVAL_EXPECTED=1 replays only the graded fixtures
 [group('test')]
 eval-live:
     FRISK_EVAL_LIVE=1 FRISK_EVAL_XDG="${XDG_CONFIG_HOME:-$HOME/.config}" gotestsum --format standard-verbose -- -tags eval -run TestEvalFixtures -count=1 -timeout 60m .

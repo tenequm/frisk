@@ -35,10 +35,10 @@ Conventions:
 - [frisk front-runs Claude Code's permission flow](front-run-not-bypass.md) - frisk
   runs in front of auto mode and never as the only gate under bypassPermissions,
   because in that mode every frisk failure path would become an allow.
-- [Core understands commands, config decides](core-generic-config-specific.md) -
-  Core parses commands and screens their arguments for any unix user and ships no
-  allow rules; which commands settle, and one user's tools, hosts and policy, live
-  in their config.
+- [Core ships generic defaults, config adds the user's facts](core-generic-config-specific.md) -
+  Like Claude Code, core ships a measured read-only allow baseline and generic
+  judge prose that any unix user can run; one user's tools, hosts, ownership and
+  policy live in their config, which extends the judge prose with "$defaults".
 - [Weak judge verdicts are not acted on](confidence-floors.md) - A judge allow
   below 0.75, an ask below 0.50 or a deny below 0.50 is downgraded rather than
   enforced, because low-confidence verdicts were mostly wrong in live use.
@@ -46,10 +46,10 @@ Conventions:
   judge.decisions lists which of allow, ask and deny the judge may issue; a user
   who lists only allow and deny gets no judge prompts, and the withheld verdicts
   stay countable in the log.
-- [Core describes git, config decides](core-describes-git-config-decides.md) -
+- [Core describes git, prose decides](core-describes-git-config-decides.md) -
   frisk sends the judge a trusted record for each git command (class, forcing,
-  push destination, files a discard would lose) and ships no git policy; the
-  user's judge prose is written against the record's fields.
+  push destination, files a discard would lose) and decides nothing by rule;
+  judge prose, builtin and the user's, is written against the record's fields.
 - [Chained commands are judged whole](chains-are-judged-whole.md) - Judging each
   piece of a chain separately and keeping the strictest verdict moved as many
   chains out of allow as into it, at 1.8 times the judge calls, and loses the
