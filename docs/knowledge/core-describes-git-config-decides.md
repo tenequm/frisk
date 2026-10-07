@@ -4,7 +4,7 @@ title: Core describes git, prose decides
 description: frisk sends the judge a trusted record for each git command (class, forcing, push destination, files a discard would lose) and decides nothing by rule; judge prose, builtin and the user's, is written against the record's fields.
 tags: [git, judge, architecture]
 status: stable
-generated: { by: claude-code/opus-5-5, at: "2026-10-07T09:45:00+01:00" }
+generated: { by: codex/gpt-6, at: "2026-10-07T18:21:44Z" }
 sources:
   - id: maintainer
     resource: maintainer instructions on 2026-09-30 (no durable link)
@@ -102,6 +102,15 @@ with that prose dropped it allowed a forced push to a default branch.[^eval]
   not name. A user writes `git commit --no-verify *` once instead of one
   positional variant per flag position. `-c` and `--config-env` change what
   git runs, so a command carrying them matches only a rule that names them.
+
+Inline file-write facts use the same split. A compact lexer and the shell
+parser describe literal write destinations for Python, in-place sed and
+redirected cat under `state.writes`; judge prose decides whether the
+segment is an ordinary project edit.[^design] A full interpreter would add
+execution risk and a second runtime, while treating unsupported expressions
+as unknown preserves the existing judge path. The record describes only
+recognized operations and pre-execution paths, so other segments and unknown
+effects still require judgment.
 
 [^maintainer]: How frisk should treat git
 [^design]: frisk design

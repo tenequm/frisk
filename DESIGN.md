@@ -668,3 +668,26 @@ once joined to a literal `cd`, fed to a program that does not run stdin as code
 substitution, `<>`, clobber redirects and additional descriptor duplications
 stay unsound. These rules grant no command permission: the command still needs
 its own Bash allow rule.
+
+### Inline file-write facts
+
+The trusted `writes` state lists records for inline Python, in-place sed and
+cat writes, using the existing shell parser's redirects, heredocs and
+literal cwd tracking. Each record names the `program`, `writes` (a `path` and
+`scope`: `inside`, `outside` or `unresolved`), Python `imports`, optional `risks`
+(`process`, `network`, `delete`, `dynamic_code`), and `unknown`.
+
+A small Go lexer skips Python comments and quoted strings and follows simple
+module-level literal assignments, `open` write modes and Path write methods.
+It executes no Python. Dynamic paths, formatted strings, unsupported escapes,
+helpers, aliases and uncertain shell context stay unknown. Existing symlinks
+are checked, including parents of new files. An earlier non-cd segment can
+invalidate filesystem facts, so later records stay unknown. These are facts
+about the filesystem before execution, not a guarantee against concurrent
+changes or a proof of arbitrary Python behavior.
+
+The builtin judge prose treats a record with writes entirely inside cwd,
+no risks and no unknowns as an ordinary project edit for that segment. Other
+segments still need judgment. The record adds no static allow and changes no
+confidence floor. No script body or file contents are duplicated into it;
+paths are derived from the already-redacted command.

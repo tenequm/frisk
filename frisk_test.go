@@ -188,6 +188,7 @@ func TestParseCommand(t *testing.T) {
 		{"hash after a dollar is not a comment", "echo $#", [][]string{{"echo", "$#"}}, false},
 		{"hash in a parameter length is not a comment", "echo ${#x}", [][]string{{"echo", "${#x}"}}, true},
 		{"hash in an assignment value is not a comment", "a=b#c true", [][]string{{"true"}}, false},
+		{"empty quoted argument", "sed -i '' 's/a/b/' file", [][]string{{"sed", "-i", "", "s/a/b/", "file"}}, false},
 		{"hash after an empty quoted string is not a comment", "echo ''#x", [][]string{{"echo", "#x"}}, false},
 		{"brace expansion into flags is complex", "find . {-delete,-print}", nil, true},
 		{"brace expansion after a dash is complex", "find . -{delete,print}", nil, true},
@@ -2036,6 +2037,7 @@ type jevState struct {
 	Probe     *jevProbeState `json:"probe"`
 	Git       map[string]any `json:"git"`
 	Data      []any          `json:"data"`
+	Writes    []writeRecord  `json:"writes"`
 	Untrusted jevUntrusted   `json:"untrusted"`
 }
 
@@ -4395,5 +4397,151 @@ func TestKnownPathVariables(t *testing.T) {
 	command := `python3 "$HOME/run.py"`
 	if got := tokenize(command).probeSegments(command)[0][1]; got != "/home/frisk/run.py" {
 		t.Fatalf("probe path = %q", got)
+	}
+}
+
+func TestPythonWriteFacts(t *testing.T) {
+	for _, tt := range []struct {
+		name, code string
+		paths      []string
+		unknown    bool
+		risk       string
+	}{
+		{"replace", "p='HeyDan/CallController.swift'; s=open(p).read(); s=s.replace(a,b); open(p,'w').write(s)", []string{"HeyDan/CallController.swift"}, false, ""},
+		{"path read variable", "from pathlib import Path\np=Path('a'); s=p.read_text(); s=s.replace('old','new'); p.write_text(s)", []string{"a"}, false, ""},
+		{"path", "from pathlib import Path\np=Path('common.nix')\np.write_text(p.read_text().replace('old','new'))", []string{"common.nix"}, false, ""},
+		{"direct path", "import pathlib\npathlib.Path('hosts/bl.nix').write_bytes(b'new')", []string{"hosts/bl.nix"}, false, ""},
+		{"json", "import json\nex=json.load(open('config.example.json')); open('config.example.json','w').write(json.dumps(ex))", []string{"config.example.json"}, false, ""},
+		{"append", "open('notes.md','a').write('text')", []string{"notes.md"}, false, ""},
+		{"mode keyword", "open('notes.md',mode='r+').write('text')", []string{"notes.md"}, false, ""},
+		{"docstring", "'''open('x','w')'''\n# open('y','w')\nopen('z').read()", nil, false, ""},
+		{"raw", "open(r'docs/plan.md','w')", []string{"docs/plan.md"}, false, ""},
+		{"formatted", "open(f'{root}/plan.md','w')", []string{""}, true, ""},
+		{"unclosed", "open('x", []string{""}, true, ""},
+		{"dynamic", "open(root / 'x','w')", []string{""}, true, ""},
+		{"rebound", "p='a'; p=choose(); open(p,'w')", []string{""}, true, ""},
+		{"path expression", "p=Path('a') / 'b'; p.write_text('x')", []string{""}, true, ""},
+		{"subprocess", "import subprocess\nopen('a','w')", []string{"a"}, false, "process"},
+		{"socket", "import socket\nsocket.socket(); open('a','w')", []string{"a"}, true, "network"},
+		{"getattr", "getattr(obj,'write')('x'); open('a','w')", []string{"a"}, true, "dynamic_code"},
+		{"exec", "exec(code); open('a','w')", []string{"a"}, true, "dynamic_code"},
+		{"delete", "import os\nos.unlink('x'); open('a','w')", []string{"a"}, true, "delete"},
+		{"helper", "def sub(path):\n    p=Path(path)\n    p.write_text('x')\nsub('a')", []string{""}, true, ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			r := pythonWrites(tt.code)
+			var paths []string
+			for _, w := range r.Writes {
+				paths = append(paths, w.Path)
+			}
+			if !slices.Equal(paths, tt.paths) || r.Unknown != tt.unknown || tt.risk != "" && !slices.Contains(r.Risks, tt.risk) {
+				t.Fatalf("got %+v, paths %v; want %v unknown=%v risk=%s", r, paths, tt.paths, tt.unknown, tt.risk)
+			}
+		})
+	}
+}
+
+func TestWriteRecords(t *testing.T) {
+	cwd := t.TempDir()
+	if err := os.Mkdir(filepath.Join(cwd, "docs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(cwd, "escape")); err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		command, scope string
+		unknown        bool
+	}{
+		{"python3 - <<'EOF'\np='file.go'; s=open(p).read(); open(p,'w').write(s)\nEOF", "inside", false},
+		{"cd docs && python3 -I - <<'EOF'\nfrom pathlib import Path\nPath('plan.md').write_text('hi')\nEOF", "inside", false},
+		{"python3 -c \"open('file.go','w').write('x')\"", "inside", false},
+		{"python3 -c \"open('~/.ssh/config','w')\"", "unresolved", true},
+		{"sed -i '' 's/old/new/' docs/plan.md", "inside", false},
+		{"sed -i.bak 's/old/new/' docs/plan.md", "inside", false},
+		{"sed -iE 's/old/new/' docs/plan.md", "inside", false},
+		{"sed --in-place=.bak 's/old/new/' docs/plan.md", "inside", false},
+		{"sed -i 's/old/new/' ~/.ssh/config", "outside", true},
+		{"cat > docs/plan.md <<'EOF'\nopen('outside','w')\nEOF", "inside", false},
+		{"cat >> docs/plan.md <<'EOF'\nnotes\nEOF", "inside", false},
+		{"cat > ~/.zshrc <<'EOF'\nx\nEOF", "outside", false},
+		{"cat > /etc/hosts <<'EOF'\nx\nEOF", "outside", false},
+		{"cat > escape/new.md <<'EOF'\nx\nEOF", "outside", false},
+		{"sed -i 's/a/b/' docs/*.md", "unresolved", true},
+		{"cd /tmp || cat > x <<'EOF'\nx\nEOF", "unresolved", true},
+		{"cd escape/.. && python3 -c \"open('a','w')\"", "unresolved", true},
+	} {
+		t.Run(tt.command, func(t *testing.T) {
+			r := tokenize(tt.command).writeRecords(tt.command, cwd)
+			if len(r) != 1 || len(r[0].Writes) < 1 || r[0].Writes[0].Scope != tt.scope || r[0].Unknown != tt.unknown {
+				t.Fatalf("got %+v; want scope=%s unknown=%v", r, tt.scope, tt.unknown)
+			}
+		})
+	}
+}
+
+func TestWriteFactsConservative(t *testing.T) {
+	cwd := t.TempDir()
+	for _, code := range []string{
+		"open('a','w'); open('/etc/hosts','r' + '+')",
+		"p='a'; p: str='/etc/hosts'; open(p,'w')",
+		"p='a/' '../../outside'; open(p,'w')",
+		"import shutil; shutil.copyfile('source','/etc/hosts'); open('a','w')",
+		"import os; os.symlink('/etc/hosts','escape'); open('escape','w')",
+		"import custom; custom.write('a'); open('a','w')",
+		"open=other; open('a','w')",
+		"p='a'\np \\\n= '/etc/hosts'\nopen(p,'w')",
+		"from pathlib import Path; Path('a').replace('/etc/hosts'); open('b','w')",
+		"from pathlib import Path; p=Path('a'); s=p; s.replace('/etc/hosts'); open('b','w')",
+		"p='a'; p,q='/etc/hosts','b'; open(p,'w')",
+		"p='a'; (p)='/etc/hosts'; open(p,'w')",
+		"from os import replace; replace('a','/etc/hosts'); open('b','w')",
+		"from pathlib import Path; Path('/etc/hosts').open('w').write('x'); open('b','w')",
+		"p='a'; for_loop(p); open(p,'w')",
+		"open('escape/../victim','w')",
+	} {
+		command := "python3 -c " + shellQuote([]string{code})
+		r := tokenize(command).writeRecords(command, cwd)
+		if len(r) != 1 || !r[0].Unknown {
+			t.Fatalf("%s: %+v", code, r)
+		}
+	}
+	for _, command := range []string{
+		"sed -i'../*' 's/a/b/' file",
+		"sed -i -- 's/a/b/w /etc/hosts' file",
+		"sed -i -- 's/a/b/e' file",
+		"python3 -m arbitrary -c \"open('a','w')\"",
+		"sed '1e ln -s /etc/hosts escape' input; python3 -c \"open('escape','w')\"",
+	} {
+		r := tokenize(command).writeRecords(command, cwd)
+		if len(r) == 0 || !r[len(r)-1].Unknown {
+			t.Fatalf("%s: %+v", command, r)
+		}
+	}
+}
+
+func TestJudgeWriteFacts(t *testing.T) {
+	cwd := t.TempDir()
+	cfg, capture := fakeJevCapture(t, jevAnswer{Choice: "allow", Confidence: 0.9})
+	command := "python3 -c \"open('a','w')\""
+	v := decide(cfg, command, cwd, testLogger)
+	_, req := capture.request()
+	if v.Tier != tierJudge || len(req.State.Writes) != 1 || req.State.Writes[0].Unknown || req.State.Writes[0].Writes[0].Scope != "inside" {
+		t.Fatal("write facts not delivered to judge")
+	}
+	token := "ghp_" + strings.Repeat("a", 36)
+	for _, command = range []string{
+		"python3 -c \"open('" + token + "','w')\"",
+		"python3 - <<'EOF'\nopen('" + token + "','w')\nEOF",
+	} {
+		decide(cfg, command, cwd, testLogger)
+		_, req = capture.request()
+		data, err := json.Marshal(req.State.Writes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(req.State.Writes) != 1 || strings.Contains(string(data), token) {
+			t.Fatal("write facts were absent or contained an unredacted literal")
+		}
 	}
 }

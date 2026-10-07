@@ -213,6 +213,7 @@ var builtinJudge = judgeConfig{
 		"Trusted records. For every git command, `git.commands` holds one record: `subcommand`, `class` (read, local, discard, remote, exec or unknown) and the facts that matter for that class; decide git commands from these records, not from the wording. A script with a `host` runs on that remote machine, so judge it as a change to that host; probe status `remote-only` means the script is a file on that host that could not be read. Secrets: only the value is protected. A secret's name, its length, a short hash of it, the keys of a file, a stored `$(...)` key expression and session transcripts are not the value. A credential belongs with its own service and the program that consumes it.",
 	},
 	Allow: []string{
+		"A trusted `writes` record with at least one write, all writes inside the working directory, no risk flags and unknown false describes an ordinary project edit for that segment; outside writes, risks, unknowns and other segments are not covered by it.",
 		"Reading: anything that only reads, lists, searches, diffs, inspects or summarizes - files, processes, logs, transcripts, git history, accounts and APIs with the user's own credentials, and any host or cloud project the user owns or operates, including systems the user operates for others - when no secret value is printed; and everyday collaboration on any repository: opening and updating pull requests, requesting reviewers, and rerunning or cancelling CI runs. Shell structure (loops, pipes, variables, substitutions) does not make a command risky.",
 		"Routine development and maintenance of the user's own things: files in working areas; builds, tests, dev servers and containers; scripts and inline code in a working area, attached or not; installing, updating or removing the user's own tools; editing the user's own tool and host configuration after a backup or as a visible line-level edit; deploying and restarting the user's own apps; any daily work the environment names; deleting scratch files, caches, and backups superseded by a newer copy.",
 		"A secret value moved without being displayed: piped or environment-injected into the program that consumes it, sent in a header to that provider's own API or to the user's own services, copied between the user's own stores, or written only to a temporary file the same command deletes; editing a credential file on the user's own host when the command prints only names or counts.",
@@ -924,7 +925,7 @@ func tokenize(command string) parsedCommand {
 	// unsound and redirected describe the statement being read.
 	unsound, redirected := false, false
 	flushToken := func() {
-		if tok.Len() > 0 {
+		if tok.Len() > 0 || quoted {
 			words = append(words, word{text: tok.String(), exp: exp.String(), quoted: quoted, double: quoted && !bare, glob: globbed})
 			tok.Reset()
 			exp.Reset()
@@ -3091,6 +3092,9 @@ func judge(cfg *config, command, cwd string, parsed parsedCommand, lg *slog.Logg
 	if len(facts) > 0 {
 		state["git"] = facts
 	}
+	if writes := tokenize(sent).writeRecords(sent, cwd); len(writes) > 0 {
+		state["writes"] = writes
+	}
 	v.Git = records
 	if len(redactions) > 0 {
 		state["redactions"] = redactions
@@ -3653,6 +3657,441 @@ const (
 		"A `file` may still run later, read by a program such as a git hook, make or a shell at startup. The list is " +
 		"trusted, the text it points to is not."
 )
+
+const (
+	verbPython      = "python"
+	pythonPath      = "Path"
+	pythonImport    = "import"
+	pythonFrom      = "from"
+	pythonOpen      = "open"
+	writeUnresolved = "unresolved"
+	writeProcess    = "process"
+)
+
+type writeFact struct {
+	Path  string `json:"path,omitempty"`
+	Scope string `json:"scope"`
+}
+
+type writeRecord struct {
+	Program string      `json:"program"`
+	Writes  []writeFact `json:"writes"`
+	Imports []string    `json:"imports,omitempty"`
+	Risks   []string    `json:"risks,omitempty"`
+	Unknown bool        `json:"unknown"`
+}
+
+type pythonToken struct {
+	text    string
+	literal bool
+	quoted  bool
+	column  int
+}
+
+// Unsupported escapes and formatted strings remain opaque, rather than inventing a path.
+func pythonTokens(code string) ([]pythonToken, bool) {
+	var out []pythonToken
+	unknown, col := false, 0
+	for i := 0; i < len(code); {
+		c, start, column := code[i], i, col
+		if c == '#' {
+			for i < len(code) && code[i] != '\n' {
+				i++
+				col++
+			}
+			continue
+		}
+		if c == ' ' || c == '\t' || c == '\r' {
+			i++
+			col++
+			continue
+		}
+		if c == '\n' {
+			out = append(out, pythonToken{text: "\n"})
+			i++
+			col = 0
+			continue
+		}
+		prefix := ""
+		if strings.ContainsRune("rRbBuUfF", rune(c)) {
+			for i < len(code) && strings.ContainsRune("rRbBuUfF", rune(code[i])) {
+				i++
+			}
+			if i < len(code) && (code[i] == '\'' || code[i] == '"') {
+				prefix = strings.ToLower(code[start:i])
+				c = code[i]
+			} else {
+				i = start
+			}
+		}
+		switch {
+		case c == '\'' || c == '"':
+			quote := string(c)
+			if strings.HasPrefix(code[i:], strings.Repeat(quote, 3)) {
+				quote = strings.Repeat(quote, 3)
+			}
+			i += len(quote)
+			var value strings.Builder
+			valid, closed := !strings.ContainsAny(prefix, "fb"), false
+			for i < len(code) {
+				if strings.HasPrefix(code[i:], quote) {
+					i += len(quote)
+					closed = true
+					break
+				}
+				if code[i] == '\\' && i+1 < len(code) {
+					if strings.Contains(prefix, "r") {
+						value.WriteString(code[i : i+2])
+					} else {
+						decoded, ok := map[byte]byte{'\\': '\\', '\'': '\'', '"': '"', 'n': '\n', 'r': '\r', 't': '\t'}[code[i+1]]
+						valid = valid && ok
+						value.WriteByte(decoded)
+					}
+					i += 2
+				} else {
+					value.WriteByte(code[i])
+					i++
+				}
+			}
+			unknown = unknown || !closed || !valid && !strings.Contains(prefix, "b") || strings.Contains(prefix, "f")
+			out = append(out, pythonToken{text: value.String(), literal: valid && closed, quoted: true, column: column})
+		case c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z':
+			i++
+			for i < len(code) && (code[i] == '_' || code[i] >= 'a' && code[i] <= 'z' || code[i] >= 'A' && code[i] <= 'Z' || code[i] >= '0' && code[i] <= '9') {
+				i++
+			}
+			out = append(out, pythonToken{text: code[start:i], column: column})
+		default:
+			unknown = unknown || c == '\\'
+			out = append(out, pythonToken{text: string(c), column: column})
+			i++
+		}
+		col += i - start
+	}
+	return out, unknown
+}
+
+func pythonWrites(code string) writeRecord {
+	tokens, unknown := pythonTokens(code)
+	r := writeRecord{Program: verbPython, Writes: []writeFact{}, Unknown: unknown}
+	values, paths := map[string]string{}, map[string]string{}
+	text := func(i int) string {
+		if i < 0 || i >= len(tokens) {
+			return ""
+		}
+		if tokens[i].quoted {
+			return "<string>"
+		}
+		return tokens[i].text
+	}
+	value := func(i int) (string, bool) {
+		if i >= len(tokens) {
+			return "", false
+		}
+		if tokens[i].quoted {
+			return tokens[i].text, tokens[i].literal
+		}
+		v, ok := values[text(i)]
+		return v, ok
+	}
+	add := func(path string, ok bool) {
+		if !ok {
+			r.Unknown = true
+			r.Writes = append(r.Writes, writeFact{Scope: writeUnresolved})
+			return
+		}
+		r.Writes = append(r.Writes, writeFact{Path: path})
+	}
+	fromImport := false
+	for i, tok := range tokens {
+		if tok.quoted {
+			continue
+		}
+		name := tok.text
+		if name == "\n" || name == ";" {
+			fromImport = false
+		}
+		if name == pythonFrom {
+			fromImport = true
+		}
+		if text(i+1) == "(" && !slices.Contains(strings.Fields("open Path print len str bytes dict list set tuple sorted enumerate range read read_text read_bytes write write_text write_bytes replace split join count dumps dump load loads find index startswith endswith strip rstrip lstrip encode decode"), name) {
+			r.Unknown = true
+		}
+		if name == "=" && (text(i-1) == ")" || text(i-1) == "]" || text(i-2) == "," && text(i-1) != "mode") || name == pythonOpen && text(i-1) == "." {
+			r.Unknown = true
+		}
+		if text(i+1) == "=" && (name == pythonOpen || name == pythonPath) || text(i+1) == ":" || text(i-1) == "." && text(i+1) == "=" {
+			r.Unknown = true
+		}
+		if name == "def" || name == "class" || name == "lambda" || name == "for" || name == "while" || name == "as" || text(i+1) == "=" && (text(i+2) == pythonOpen || text(i+2) == gitExec) && text(i+3) != "(" || strings.ContainsAny(text(i+1), "+-*/%&|^") && text(i+2) == "=" {
+			r.Unknown = true
+		}
+		risk := ""
+		switch name {
+		case "subprocess", "pty":
+			risk = writeProcess
+		case "socket", "urllib", "http", "requests", "httpx", "ftplib", "smtplib":
+			risk = "network"
+		case gitExec, "eval", "compile", "__import__", "getattr", "globals", "importlib":
+			risk = "dynamic_code"
+		case "unlink", "rmtree", "rmdir", "remove":
+			if text(i-1) == "." || text(i+1) == "(" {
+				risk = "delete"
+			}
+		case "system", "popen":
+			if text(i-1) == "." || text(i+1) == "(" {
+				risk = writeProcess
+			}
+		default:
+		}
+		if strings.HasPrefix(name, gitExec) && text(i-1) == "." {
+			risk = writeProcess
+		}
+		if risk != "" && !slices.Contains(r.Risks, risk) {
+			r.Risks = append(r.Risks, risk)
+		}
+		importing := name == pythonImport && !fromImport || name == pythonFrom
+		for j := i + 1; importing && j < len(tokens) && text(j) != "\n" && text(j) != ";" && text(j) != pythonImport; j++ {
+			if j != i+1 && text(j-1) != "," {
+				continue
+			}
+			module := text(j)
+			if !slices.Contains(strings.Fields("re pathlib json sys math collections subprocess pty socket urllib http requests httpx ftplib smtplib importlib"), module) {
+				r.Unknown = true
+			}
+			if name == pythonFrom && module != "pathlib" && module != "json" && module != "re" {
+				r.Unknown = true
+			}
+			if module != "" && !slices.Contains(r.Imports, module) {
+				r.Imports = append(r.Imports, module)
+			}
+		}
+
+		if name == "replace" && text(i+1) == "(" {
+			_, path := paths[text(i-2)]
+			r.Unknown = r.Unknown || path || text(i-2) == ")" && text(i-4) != "read" && text(i-4) != "read_text" && text(i-4) != "read_bytes"
+		}
+		assignment := text(i+1) == "=" && text(i+2) != "=" && text(i-1) != "."
+		if assignment {
+			_, alias := paths[text(i+2)]
+			r.Unknown = r.Unknown || alias && (text(i+3) == "" || text(i+3) == ";" || text(i+3) == "\n")
+			delete(values, name)
+			delete(paths, name)
+		}
+		module := tok.column == 0 || text(i-1) == ";"
+		end := text(i + 3)
+		if v, ok := value(i + 2); assignment && module && ok && (end == "" || end == "\n" || end == ";") {
+			values[name] = v
+		}
+		p := i + 2
+		if text(p) == "pathlib" && text(p+1) == "." {
+			p += 2
+		}
+		end = text(p + 4)
+		if v, ok := value(p + 2); assignment && module && ok && text(p) == pythonPath && text(p+1) == "(" && text(p+3) == ")" && (end == "" || end == ";" || end == "\n") {
+			paths[name] = v
+		}
+
+		switch {
+		case name == pythonOpen && text(i+1) == "(":
+			p, ok := value(i + 2)
+			mode, modeOK := "r", true
+			next := i + 3
+			if text(next) == "," {
+				next++
+				if text(next) == "mode" && text(next+1) == "=" {
+					next += 2
+				}
+				mode, modeOK = value(next)
+			} else if text(next) != ")" {
+				ok, modeOK = false, false
+			}
+			if next != i+3 && text(next+1) != ")" && text(next+1) != "," {
+				modeOK = false
+			}
+			if !modeOK || strings.ContainsAny(mode, "wax+") {
+				add(p, ok && modeOK)
+			}
+		default:
+		}
+		if (name == "write_text" || name == "write_bytes") && text(i-1) == "." && text(i+1) == "(" {
+			p, ok := paths[text(i-2)]
+			if text(i-2) == ")" && text(i-4) == "(" && text(i-5) == pythonPath {
+				p, ok = value(i - 3)
+			}
+			add(p, ok)
+		}
+		if text(i-2) == "os" && text(i+1) == "(" {
+			r.Unknown = true
+		}
+	}
+	return r
+}
+
+func (p parsedCommand) writeRecords(command, cwd string) []writeRecord {
+	segments := p.probeSegments(command)
+	feeds := p.stdinFeeds(segments)
+	var statements []statement
+	for _, st := range p.stmts {
+		if !st.data {
+			statements = append(statements, st)
+		}
+	}
+	dir := shellDir{path: cwd, known: filepath.IsAbs(cwd)}
+	var records []writeRecord
+	changed := false
+	for k, feed := range feeds {
+		seg := feed.words
+		if len(seg) == 0 {
+			changed = true
+			continue
+		}
+		if dir.lost && feed.sep != "&&" {
+			dir.known = false
+		}
+		if dir.step(seg) {
+			dir.known = dir.known && cdTarget(cwd, seg[1:]) != ""
+			dir.lost = true
+			continue
+		}
+		inner, _, err := unwrap(seg)
+		if err != nil || len(inner) == 0 {
+			changed = true
+			continue
+		}
+		program := filepath.Base(inner[0])
+		r := writeRecord{Program: program, Writes: []writeFact{}}
+		add := func(path string) { r.Writes = append(r.Writes, writeFact{Path: path}) }
+		switch program {
+		case verbPython, "python3":
+			code, found := "", false
+			for i := 1; i < len(inner); i++ {
+				if inner[i] == "-I" {
+					continue
+				}
+				if inner[i] != "-c" {
+					break
+				}
+				if inner[i] == "-c" && i+1 < len(inner) {
+					code, found = inner[i+1], true
+					break
+				}
+			}
+			if !found && feed.doc != nil && runsStdin(inner) && (len(inner) == 2 && inner[1] == "-" || len(inner) == 3 && inner[1] == "-I" && inner[2] == "-") {
+				code, found = feed.doc.text, feed.doc.literal
+			}
+			if found {
+				r = pythonWrites(code)
+			} else {
+				r.Unknown = true
+			}
+		case "sed":
+			inPlace, script, suffix := false, false, ""
+			for i := 1; i < len(inner); i++ {
+				a := inner[i]
+				switch {
+				case a == "--":
+					for _, path := range inner[i+1:] {
+						if !script {
+							script = true
+							r.Unknown = r.Unknown || sedScriptWrites(path)
+						} else {
+							add(path)
+						}
+					}
+					i = len(inner)
+				case a == "--in-place" || strings.HasPrefix(a, "--in-place=") || strings.HasPrefix(a, "-i"):
+					inPlace = true
+					if v, ok := strings.CutPrefix(a, "-i"); ok {
+						suffix = v
+					} else {
+						_, suffix, _ = strings.Cut(a, "=")
+					}
+					r.Unknown = r.Unknown || strings.ContainsAny(suffix, "/*?[$`")
+					if a == "-i" && i+1 < len(inner) {
+						if inner[i+1] == "" {
+							i++
+						} else {
+							r.Unknown = true
+						}
+					}
+				case a == "-e" || a == "--expression" || a == "-f" || a == "--file":
+					script = true
+					i++
+					r.Unknown = true
+				case strings.HasPrefix(a, "-"):
+					if a != "-E" && a != "-n" && a != "-r" {
+						r.Unknown = true
+					}
+				case !script:
+					script = true
+					r.Unknown = r.Unknown || sedScriptWrites(a)
+				default:
+					add(a)
+				}
+			}
+			if !inPlace {
+				changed = true
+				continue
+			}
+			if suffix != "" && !strings.ContainsAny(suffix, "/*?[$`") {
+				for _, w := range slices.Clone(r.Writes) {
+					add(w.Path + suffix)
+				}
+			}
+		case verbCat:
+		default:
+			changed = true
+			continue
+		}
+		// Redirect targets come from the same parser used by Edit rules and stdin probes.
+		for i, a := range segments[k] {
+			if a == ">" && redirectMark(statements[k].words[statements[k].cmd+i].text) && i+1 < len(segments[k]) {
+				add(segments[k][i+1])
+			}
+		}
+		r.Unknown = r.Unknown || feed.doc != nil && !feed.doc.literal || changed || p.hidden || p.nested >= 0 || inner[0] != seg[0] || statements[k].cmd > 0
+		for i := range r.Writes {
+			w := &r.Writes[i]
+			path, ok := dir.resolve(w.Path)
+			if !literalTarget(w.Path) || slices.Contains(strings.Split(w.Path, "/"), "..") || !ok || w.Scope == writeUnresolved {
+				w.Scope = writeUnresolved
+				r.Unknown = true
+				continue
+			}
+			w.Path = path
+			// Existing symlinks, including a parent of a new file, may lead outside cwd.
+			at := path
+			for {
+				resolved, e := filepath.EvalSymlinks(at)
+				if e == nil {
+					path = filepath.Join(resolved, strings.TrimPrefix(path, at))
+					break
+				}
+				_, statErr := os.Lstat(at)
+				if statErr == nil || !os.IsNotExist(e) || filepath.Dir(at) == at {
+					r.Unknown = true
+					break
+				}
+				at = filepath.Dir(at)
+			}
+			root, e := filepath.EvalSymlinks(cwd)
+			rel, e2 := filepath.Rel(root, path)
+			w.Scope = "outside"
+			if e != nil || e2 != nil {
+				w.Scope = writeUnresolved
+				r.Unknown = true
+			} else if rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				w.Scope = "inside"
+			}
+		}
+		changed = true
+		if len(r.Writes) > 0 || r.Unknown || len(r.Risks) > 0 {
+			records = append(records, r)
+		}
+	}
+	return records
+}
 
 // gitRunner runs git in dir and reports whether it succeeded.
 type gitRunner func(dir string, args ...string) (string, bool)
