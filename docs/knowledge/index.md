@@ -97,6 +97,11 @@ Conventions:
   Bash splits an unquoted variable into words and zsh keeps it whole, so a static
   allow must pass both readings, and in zsh a command variable holding a path
   with a space runs that path.
+- [A files-written facts record does not lift the judge on inline edits](write-facts-do-not-lift-the-judge.md) -
+  A trusted record of the files an inline python, sed -i or cat > command writes
+  left judge verdicts on real traffic within run-to-run noise, because most real
+  edit scripts loop or define helpers and resolve to unknown, and an unknown record
+  pushes the judge toward ask.
 
 ## References
 
