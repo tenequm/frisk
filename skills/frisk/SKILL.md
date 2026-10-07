@@ -97,7 +97,8 @@ segment to match.
   endpoint passes through. That is the screen working, not a broken rule.
 - Git aimed outside the working directory (`git -C /other`, `cd /other && git`,
   `--git-dir`) and recursive reads of `~`, a directory above it, or a hidden
-  directory in it (`rg x ~`, `grep -r x ~/.config`) never settle statically:
+  directory in it (`rg x ~`, `grep -r x ~/.config`, a bare `rg x` run from
+  one of them) never settle statically:
   git runs programs a foreign repository's config names, and credential files
   hide under such directories. They go to the judge or fall through.
 

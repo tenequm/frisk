@@ -66,10 +66,15 @@ What core keeps is the parser and the screens - denied flags, risky arguments,
 program text, credential paths and globs, hijacking environment variables,
 a git command aimed outside the working directory (`-C`, a `cd`, `--git-dir`,
 `--work-tree`: git runs programs a repository's config names), and a recursive
-read (`rg`, `grep -r`, `diff -r`, `git diff --no-index`) of the home
-directory, a directory above it, or a hidden directory in it, where credential
-files sit under names no word shows. `sed -l` takes a value in GNU sed and none
-in BSD sed, so a command carrying it never settles.
+read (`rg`, `grep -r` or `-d recurse`, `diff -r`, `git diff`, which turns
+no-index by itself for a path outside the repository) of the home directory, a
+directory above it, or a hidden directory in it, where credential files sit
+under names no word shows. rg and grep walk "." with no path given, so they do
+not settle statically from such a directory either. A `cd` is followed only to
+one literal target: zsh's `cd old new` and `cd +1`, and any relative target
+while `CDPATH` is set, leave the directory unknown. `sed -l` takes a value in
+GNU sed and none in BSD sed, so a command carrying it never settles statically.
+Shell history files count as credential files.
 A screen never decides anything: it only stops a rule such as `sed *` from
 matching `sed -i`, a form the rule does not mean, and that command passes
 through too.

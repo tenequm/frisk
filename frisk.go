@@ -90,6 +90,7 @@ const (
 	verbGH     = "gh"
 	verbGit    = "git"
 	verbGrep   = "grep"
+	verbDiff   = "diff"
 	verbPrint  = "printf"
 	verbSed    = "sed"
 	verbSet    = "set"
@@ -142,6 +143,7 @@ var lessDenyFlags = []string{
 var clusterVerbs = map[string]bool{
 	verbSed: true, "sort": true, "fd": true, verbXXD: true, verbAwk: true, "yq": true,
 	"jq": true, "tree": true, "less": true, "more": true, "date": true, verbPrint: true,
+	verbGrep: true, verbDiff: true,
 }
 
 // kubeSecret matches the secret resource in a kubectl get: bare, plural,
@@ -171,7 +173,7 @@ var hijackEnv = regexp.MustCompile(`^(` +
 	// files, a child shell's options and trace prompt, and zsh's command for
 	// a bare redirect, its argv[0] override and its stty hook. COMMAND_MODE
 	// switches macOS utilities to legacy option meanings.
-	`PATH|path|FPATH|fpath|MODULE_PATH|module_path|EXECIGNORE|HOME|ENV|BASH_ENV|ZDOTDIR|COMMAND_MODE` +
+	`PATH|path|FPATH|fpath|MODULE_PATH|module_path|EXECIGNORE|HOME|CDPATH|cdpath|ENV|BASH_ENV|ZDOTDIR|COMMAND_MODE` +
 	`|SHELLOPTS|BASHOPTS|POSIXLY_CORRECT|PS4|PROMPT4|BASH_XTRACEFD|NULLCMD|READNULLCMD|ARGV0|STTY` +
 	// Code the dynamic loader or an interpreter pulls in.
 	`|LD_[A-Z0-9_]+|DYLD_[A-Z0-9_]+|PYTHON(STARTUP|PATH|HOME|INSPECT|USERBASE|BREAKPOINT)` +
@@ -276,6 +278,8 @@ var credentialPath = regexp.MustCompile(
 	`(?i)(^|[/=])(\.ssh|\.gnupg|\.config/gopass)(/|$)|(^|[/=])\.aws/credentials` +
 		`|(^|[/=])(\.kube/config|\.docker/config\.json|\.config/gh/hosts\.yml|\.cargo/credentials(\.toml)?)$` +
 		`|(^|[/=])(id_(rsa|dsa|ecdsa|ed25519)|\.netrc|\.npmrc|\.pypirc|\.pgpass|\.my\.cnf|\.git-credentials|\.zshenv|\.envrc|\.env(\.[^/]+)?)$` +
+		// Shell history keeps every command typed, tokens passed as arguments included.
+		`|(^|[/=])(\.(zsh|bash|sh)_history|\.histfile|fish_history)$` +
 		`|(^|[/=])[^./][^/]*\.(pem|key|keychain-db)$`,
 )
 
@@ -2467,7 +2471,8 @@ func gitElsewhere(cwd, dir string, seg []string) bool {
 	for _, d := range g.dirs {
 		target = cdTarget(target, []string{d})
 	}
-	return !inside(cwd, expandHome(target))
+	path, ok := literalPath(target, "", false)
+	return !ok || !inside(cwd, path)
 }
 
 // recursesIntoSecrets reports a recursive read of the home directory, a
@@ -2483,54 +2488,35 @@ func recursesIntoSecrets(dir string, seg []string) bool {
 		return true
 	}
 	return slices.ContainsFunc(paths, func(p string) bool {
-		p = expandHome(p)
-		if !filepath.IsAbs(p) {
-			if !filepath.IsAbs(dir) {
-				return true
-			}
-			p = filepath.Join(dir, p)
+		// A glob or a pattern is judged by its literal head: "/Users/*" walks
+		// home, "foo.*" stays where it is.
+		if i := strings.IndexAny(p, "$`*?[{"); i >= 0 {
+			p = cmp.Or(p[:i], ".")
 		}
-		p = filepath.Clean(p)
-		if inside(p, home) {
-			return true
-		}
-		rel, err := filepath.Rel(home, p)
-		return err == nil && !strings.HasPrefix(rel, "..") && strings.HasPrefix(rel, ".") && rel != "."
+		p, ok := literalPath(p, dir, filepath.IsAbs(dir))
+		return !ok || inside(p, home) || strings.HasPrefix(p, home+string(filepath.Separator)+".")
 	})
 }
 
 // recursiveReadPaths lists the paths a recursive read may walk: rg always
-// recurses, grep and diff with -r, git diff with --no-index. A search pattern
-// stays in the list, since an empty one leaves no word to tell it apart.
+// recurses, grep with -r or -d recurse, diff with -r, git diff with
+// --no-index or on its own when a path is outside the repository. A search
+// pattern stays in the list, since an empty one leaves no word to tell it
+// apart, and so does ".", which rg and grep walk when no path is given.
 func recursiveReadPaths(seg []string) ([]string, bool) {
 	args := seg[1:]
-	// Short flags bundle, as in "grep -rA50", whatever the verb.
 	flagged := func(names ...string) bool {
 		return slices.ContainsFunc(args, func(a string) bool {
-			return slices.ContainsFunc(names, func(n string) bool {
-				if strings.HasPrefix(n, "--") {
-					name, _, _ := strings.Cut(a, "=")
-					return abbreviates(name, n)
-				}
-				return len(a) > 1 && a[0] == '-' && a[1] != '-' && strings.IndexByte(a[1:], n[1]) >= 0
-			})
+			return slices.ContainsFunc(names, func(n string) bool { return flagMatches(seg[0], a, n) })
 		})
 	}
-	var operands []string
-	for _, a := range args {
-		if a == "-" || !strings.HasPrefix(a, "-") {
-			operands = append(operands, a)
-		}
-	}
+	operands := slices.DeleteFunc(slices.Clone(args), func(a string) bool { return strings.HasPrefix(a, "-") })
 	switch {
-	case seg[0] == "rg", seg[0] == verbGrep && flagged("-r", "-R", "--recursive", "--dereference-recursive"):
-		if len(operands) == 0 {
-			operands = []string{"."}
-		}
+	case seg[0] == "rg", seg[0] == verbGrep && flagged("-r", "-R", "--recursive", "--dereference-recursive", "-d", "--directories"):
+		return append(operands, "."), true
+	case seg[0] == verbDiff && flagged("-r", "--recursive"):
 		return operands, true
-	case seg[0] == "diff" && flagged("-r", "--recursive"):
-		return operands, true
-	case seg[0] == verbGit && slices.Contains(args, "--no-index"):
+	case seg[0] == verbGit && slices.Contains(args, verbDiff):
 		return operands, true
 	default:
 		return nil, false
@@ -2546,34 +2532,26 @@ func inside(dir, path string) bool {
 	return path == dir || strings.HasPrefix(path, strings.TrimSuffix(dir, string(filepath.Separator))+string(filepath.Separator))
 }
 
-func expandHome(path string) string {
-	if path != "~" && !strings.HasPrefix(path, "~/") {
-		return path
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(home, path[1:])
-}
-
 // cdTarget follows a cd as far as the words allow: "" when the target is not
-// named, as in "cd -".
+// named, as in "cd -". zsh reads "cd old new" as a substitution in $PWD and
+// "cd +1" as a stack entry, and a CDPATH in the environment can send a
+// relative target anywhere, so none of those is followed.
 func cdTarget(dir string, args []string) string {
 	if slices.ContainsFunc(args, func(arg string) bool { return slices.Contains(strings.Split(arg, "/"), "..") }) {
 		return ""
 	}
-	i := slices.IndexFunc(args, func(arg string) bool { return !strings.HasPrefix(arg, "-") })
-	if i < 0 {
+	operands := slices.DeleteFunc(slices.Clone(args), func(arg string) bool { return strings.HasPrefix(arg, "-") })
+	if len(operands) != 1 || strings.HasPrefix(operands[0], "+") {
 		return ""
 	}
-	if strings.HasPrefix(args[i], "/") || strings.HasPrefix(args[i], "~") {
-		return args[i]
+	target := operands[0]
+	if strings.HasPrefix(target, "/") || strings.HasPrefix(target, "~") {
+		return target
 	}
-	if dir == "" {
+	if dir == "" || os.Getenv("CDPATH") != "" {
 		return ""
 	}
-	return filepath.Join(dir, args[i])
+	return filepath.Join(dir, target)
 }
 
 // allowedReads screens files fed on stdin as an operand naming them would be:

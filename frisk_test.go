@@ -1985,6 +1985,17 @@ func TestBuiltinRulesKeepScreens(t *testing.T) {
 		"diff -rN ~/.config/gh /tmp/empty",
 		"git diff --no-index ~/.config/gh /dev/null",
 		"rg secret /",
+		"cd " + home + " && rg aws_secret",
+		"cd " + home + " && grep -r token",
+		"grep -d recurse x ~",
+		"grep --directories=recurse x ~",
+		"git diff ~/.config /tmp/e",
+		"cd tenequm/Projects/frisk tenequm/.config && rg token",
+		"CDPATH=/ cd tmp && git status",
+		"tail ~/.zsh_history",
+		"rg x /Users/*",
+		"grep -r x ~/.*",
+		"cat ~/.bash_history",
 		`awk 'BEGIN{ARGV[1]="/x/." "ssh/id"; ARGC=2} {print}'`,
 	} {
 		if v := decide(&config{}, command, cwd, testLogger); v.Decision != "" {
@@ -1993,7 +2004,7 @@ func TestBuiltinRulesKeepScreens(t *testing.T) {
 	}
 	for _, command := range []string{
 		"git -C sub status", "cd sub && git log --oneline", "rg -n foo", "grep -rn foo sub",
-		"diff -r a b", "uniq f", "sed -n 1,5p f",
+		"diff -r a b", "uniq f", "sed -n 1,5p f", "rg 'foo.*bar' sub", "git diff HEAD~1",
 	} {
 		if v := decide(&config{}, command, cwd, testLogger); v.Decision != decisionAllow {
 			t.Errorf("decide(%q) = (%q, %q), want a builtin allow", command, v.Decision, v.Reason)
