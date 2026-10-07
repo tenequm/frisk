@@ -136,12 +136,27 @@ func TestEvalFixtures(t *testing.T) {
 		}
 	}
 
-	saved := filepath.Join(os.TempDir(), "frisk-eval-"+run.mode+"-"+time.Now().Format("20060102T150405")+".txt")
+	saved := evalResultPath(t, "frisk-eval-"+run.mode, ".txt")
 	if err := os.WriteFile(saved, []byte(out.report+"\n"+fixtureLines(results)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	// Last on purpose: `just eval | tail -1` still shows the verdict and where the rest is.
 	t.Logf("%s; full report: %s", out.summary, saved)
+}
+
+// evalResultPath names a new results file in the system temp dir. The random
+// suffix keeps runs started in the same second, such as one per config in
+// parallel, from overwriting each other.
+func evalResultPath(t *testing.T, prefix, ext string) string {
+	t.Helper()
+	f, err := os.CreateTemp("", prefix+"-"+time.Now().Format("20060102T150405")+"-*"+ext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return f.Name()
 }
 
 // grade applies the fixture's scope, then compares decisions.
@@ -575,9 +590,9 @@ func TestEvalGit(t *testing.T) {
 	report := fmt.Sprintf("frisk git eval: fixtures=%d (skipped %d: no FRISK_EVAL_DIRECT_REMOTE) config=%s\n\nwrong verdicts\n%s\n%s",
 		len(fixtures), skipped, filepath.Join(configHome, "frisk", "config.json"), wrong.String(), table.String())
 
-	saved := filepath.Join(os.TempDir(), "frisk-eval-git-"+time.Now().Format("20060102T150405")+".jsonl")
-	if out := os.Getenv("FRISK_EVAL_OUT"); out != "" {
-		saved = out
+	saved := os.Getenv("FRISK_EVAL_OUT")
+	if saved == "" {
+		saved = evalResultPath(t, "frisk-eval-git", ".jsonl")
 	}
 	var lines bytes.Buffer
 	enc := json.NewEncoder(&lines)
