@@ -1993,7 +1993,7 @@ func TestBuiltinRulesKeepScreens(t *testing.T) {
 		"cd tenequm/Projects/frisk tenequm/.config && rg token",
 		"CDPATH=/ cd tmp && git status",
 		"tail ~/.zsh_history",
-		"rg x /Users/*",
+		"rg x " + filepath.Dir(home) + "/*",
 		"grep -r x ~/.*",
 		"cat ~/.bash_history",
 		`awk 'BEGIN{ARGV[1]="/x/." "ssh/id"; ARGC=2} {print}'`,
