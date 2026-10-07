@@ -4,7 +4,7 @@ title: Static allow rules are a speed cache with a ceiling near half of all call
 description: A few dozen high-volume rules settle about half of real Bash calls; most of the rest have a shape no static rule can settle, so the judge prose, not the allow list, decides the interruption rate.
 tags: [static, allow, judge]
 status: stable
-generated: { by: claude-code/opus-5-5, at: "2026-10-06T18:15:00Z" }
+generated: { by: claude-code/opus-5-5, at: "2026-10-07T10:00:00+01:00" }
 sources:
   - id: corpus
     resource: classification of 19,544 real hook Bash calls from one machine's frisk.log, 2026-09-30 to 2026-10-06, through `frisk check` with no backend configured, under several allow lists (results not committed)

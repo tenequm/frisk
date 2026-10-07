@@ -69,7 +69,8 @@ not to a wrong allow.
 
 - environment: agent framing (verbatim); working areas defined generically (the
   working directory and its repository, directories under version control, temp
-  dirs, caches) plus the recoverability facts; text is content, not action
+  dirs, caches) plus the recoverability facts and a line that a working area
+  says nothing about ownership; text is content, not action
   (verbatim); trusted records and secret semantics (verbatim).
 - allow: reading and everyday PR/CI collaboration (de-named); routine
   development of the user's own things (helmfile dropped); a secret moved
@@ -86,10 +87,20 @@ not to a wrong allow.
 Splicing is unchanged: in-place at the marker, autoMode semantics. Positional
 `r1..rN` rule ids stay; the log's `reason` carries the rule text.
 
+### Screens the baseline needed
+
+The polish review found forms the screens let through for anyone whose config
+listed these verbs; the baseline would have opened them for everyone:
+`sed -l` (BSD takes no value, hiding a `w FILE` script), `uniq - FILE`, git aimed
+outside the working directory (`-C`, `cd`, `--git-dir`, `--work-tree`), recursive
+reads of home, its parents or its hidden directories, and awk `ARGV`. None of
+them settles statically now.
+
 ### config.example.json
 
-- `permissions.allow`: the old list minus the 40 baseline rules, as optional
-  extras to copy.
+- `permissions.allow`: the old list minus the 40 baseline rules and the rules
+  that can print a secret (`printenv`, `git config --get*/--list`,
+  `git remote -v/get-url/show`), as optional extras to copy.
 - Judge lists: `["$defaults", "<one example addition>"]` showing where a
   user's ownership facts and policy go.
 

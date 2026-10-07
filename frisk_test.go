@@ -25,8 +25,8 @@ import (
 
 var testLogger = slog.New(slog.NewJSONHandler(io.Discard, nil))
 
-// exampleAllow is the permissions.allow list config.example.json ships. Core
-// has no allow rules, so tests take theirs from the file users copy.
+// exampleAllow is the permissions.allow list config.example.json ships: the
+// optional extras users copy on top of the builtin rules.
 func exampleAllow(t *testing.T) []string {
 	t.Helper()
 	return configFileAllow(t, "config.example.json")
@@ -799,7 +799,7 @@ func TestBareRulesAndFileRulesStaySeparate(t *testing.T) {
 		Deny: []string{"Edit(/a/**)", "Edit(git status)"}, Ask: []string{"Edit(*)"}, Allow: []string{"Edit(*)"},
 	}}
 	for _, cmd := range []string{"git status", "Edit(/a/x)", "ls /a/x"} {
-		if v := decide(fileOnly, cmd, t.TempDir(), testLogger); v.Tier == "deny-rule" || v.Tier == "ask-rule" || v.Decision == decisionAllow && !strings.HasSuffix(v.Reason, " (builtin)") {
+		if v := decide(fileOnly, cmd, t.TempDir(), testLogger); v.Tier == "deny-rule" || v.Tier == "ask-rule" || strings.Contains(v.Reason, "Edit(") {
 			t.Errorf("Edit rule matched Bash command %q: %+v", cmd, v)
 		}
 	}
@@ -839,7 +839,7 @@ func TestValidateDefaultsInAllowWarns(t *testing.T) {
 	if code != 0 || strings.Contains(out, "error:") || !strings.Contains(out, want) {
 		t.Fatalf("code = %d, out = %s", code, out)
 	}
-	if !strings.Contains(out, "info: permissions.allow: "+strconv.Itoa(len(builtinAllow))+" builtin read-only rules apply") {
+	if !strings.Contains(out, "info: "+strconv.Itoa(len(builtinAllow))+" builtin read-only allow rules apply") {
 		t.Fatalf("builtin rule count missing: %s", out)
 	}
 }
@@ -1375,9 +1375,12 @@ func TestDecideStaticTiers(t *testing.T) {
 	t.Parallel()
 	cfg := &config{
 		Permissions: permissionsConfig{
-			Allow: exampleAllow(t),
-			Deny:  []string{"gopass show -o *"},
-			Ask:   []string{"ssh prod *"},
+			// Rules that can print a secret are no longer in the example, but
+			// their screens still need a rule to screen.
+			Allow: append(exampleAllow(t), "printenv [A-Za-z_]*", "git remote -v", "git remote get-url *",
+				"git config --get *", "git config --list"),
+			Deny: []string{"gopass show -o *"},
+			Ask:  []string{"ssh prod *"},
 		},
 	}
 	tests := []struct {
@@ -1389,7 +1392,8 @@ func TestDecideStaticTiers(t *testing.T) {
 		{"deny wins", "gopass show -o api/KEY", decisionDeny, "deny-rule"},
 		{"deny wins inside chain", "cd x && gopass show -o k", decisionDeny, "deny-rule"},
 		{"ask rule", "ssh prod uptime", decisionAsk, "ask-rule"},
-		{"builtin readonly", "git -C /x log --oneline | head -3", decisionAllow, "static"},
+		{"builtin readonly", "git -C sub log --oneline | head -3", decisionAllow, "static"},
+		{"git aimed outside the project never static", "git -C /x log --oneline | head -3", "", "no-judge"},
 		{"config allow", "just check", decisionAllow, "static"},
 		{"write flag disqualifies", "sed -i s/a/b/ f.txt", "", "no-judge"},
 		{"find -delete disqualifies", "find . -name x -delete", "", "no-judge"},
@@ -1942,8 +1946,8 @@ func TestBuiltinAllowBaseline(t *testing.T) {
 	if v := decide(cfg, "just check", t.TempDir(), testLogger); v.Decision != decisionAllow {
 		t.Fatalf("just check should be allowed, got %q", v.Decision)
 	}
-	if v := decide(cfg, "ls -la", t.TempDir(), testLogger); strings.HasSuffix(v.Reason, " (builtin)") {
-		t.Fatalf("a rule the config lists is not reported as builtin: %q", v.Reason)
+	if v := decide(cfg, "ls -la", t.TempDir(), testLogger); v.Decision != decisionAllow || !strings.HasSuffix(v.Reason, ": ls *") {
+		t.Fatalf("a rule the config lists is reported as the config's: (%q, %q)", v.Decision, v.Reason)
 	}
 	cfg = &config{Permissions: permissionsConfig{Ask: []string{"cat *"}, Deny: []string{"git diff *"}}}
 	if v := decide(cfg, "cat README.md", t.TempDir(), testLogger); v.Decision != decisionAsk {
@@ -1955,6 +1959,45 @@ func TestBuiltinAllowBaseline(t *testing.T) {
 	// The marker is not a rule: a command spelled like it matches nothing.
 	if v := decide(&config{Permissions: permissionsConfig{Allow: []string{defaultsMarker}}}, `'$defaults'`, t.TempDir(), testLogger); v.Decision != "" {
 		t.Fatalf("the marker matched a command, got %q", v.Decision)
+	}
+}
+
+// Forms that write, run foreign code or read credential directories never
+// settle, though a builtin rule names their verb.
+func TestBuiltinRulesKeepScreens(t *testing.T) {
+	t.Parallel()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cwd := t.TempDir()
+	for _, command := range []string{
+		"sed -l 'w " + home + "/.claude/settings.json' p",
+		"sed -nl 'w /tmp/x' p",
+		"echo x | uniq - /tmp/out",
+		"git --git-dir=/tmp/evil.git status",
+		"git --work-tree=/tmp/x status",
+		"git -C /tmp/x status",
+		"cd /tmp/x && git status",
+		"grep -rA50 'BEGIN OPENSSH' " + home,
+		"rg -uuu aws_secret ~",
+		"grep -r '' ~/.config/gh",
+		"diff -rN ~/.config/gh /tmp/empty",
+		"git diff --no-index ~/.config/gh /dev/null",
+		"rg secret /",
+		`awk 'BEGIN{ARGV[1]="/x/." "ssh/id"; ARGC=2} {print}'`,
+	} {
+		if v := decide(&config{}, command, cwd, testLogger); v.Decision != "" {
+			t.Errorf("decide(%q) = (%q, %q), want silence", command, v.Decision, v.Reason)
+		}
+	}
+	for _, command := range []string{
+		"git -C sub status", "cd sub && git log --oneline", "rg -n foo", "grep -rn foo sub",
+		"diff -r a b", "uniq f", "sed -n 1,5p f",
+	} {
+		if v := decide(&config{}, command, cwd, testLogger); v.Decision != decisionAllow {
+			t.Errorf("decide(%q) = (%q, %q), want a builtin allow", command, v.Decision, v.Reason)
+		}
 	}
 }
 
@@ -2216,14 +2259,15 @@ func TestJudgeReasons(t *testing.T) {
 				t.Fatalf("verdict = (%q, %q), want (%q, %q)", v.Decision, v.Reason, tt.decision, tt.reason)
 			}
 			_, req := capture.request()
-			wantAsk := map[string]string{"none": "No rule fits."}
-			for i, rule := range append(slices.Clone(builtinJudge.SoftDeny), pushRule) {
-				wantAsk["r"+strconv.Itoa(i+1)] = rule
+			criteria := func(rules ...string) map[string]string {
+				m := map[string]string{"none": "No rule fits."}
+				for i, rule := range rules {
+					m["r"+strconv.Itoa(i+1)] = rule
+				}
+				return m
 			}
-			wantDeny := map[string]string{"none": "No rule fits."}
-			for i, rule := range builtinJudge.HardDeny {
-				wantDeny["r"+strconv.Itoa(i+1)] = rule
-			}
+			wantAsk := criteria(append(slices.Clone(builtinJudge.SoftDeny), pushRule)...)
+			wantDeny := criteria(builtinJudge.HardDeny...)
 			if !maps.Equal(req.Questions["ask_rule"].Criteria, wantAsk) || !maps.Equal(req.Questions["deny_rule"].Criteria, wantDeny) {
 				t.Fatalf("rule questions = %+v", req.Questions)
 			}

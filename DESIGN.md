@@ -24,10 +24,9 @@ parse into pipeline segments (|, &&, ||, ;, newline)
   |
 1. permissions.deny  match -> "deny"
 2. permissions.ask   match -> "ask"
-3. allow: EVERY segment matches a builtin read-only
-   rule or a permissions.allow rule and trips no
-   screen (bails on
-    $(), backticks, (), heredocs other than a literal
+3. allow: EVERY segment matches a permissions.allow
+   or builtin read-only rule and trips no screen
+   (bails on $(), backticks, (), heredocs other than a literal
     one no program runs, &, # comments, brace
     lists, variables the command does not set to a
     literal or that are not $HOME or $TMPDIR, and
@@ -57,12 +56,20 @@ Core ships what is right for any unix user, like Claude Code: a built-in set
 of read-only rules (`builtinAllow`) and generic judge prose (`builtinJudge`).
 The builtin rules are the read-only verbs that settle real traffic; they always
 apply, `permissions.ask` and `permissions.deny` override them, and a static
-reason ends in `(builtin)` when one of them matched. Anything else settles only
+reason ends in `(builtin)` when the rule it names is builtin. The reason names
+the last segment's rule, so `just check && ls` reads `ls * (builtin)` though
+`just check` needed the config's rule. Anything else settles only
 through `permissions.allow`, and with no rule a command passes through to the
 judge or to silence. [config.example.json](config.example.json) carries
 optional read-only extras and temporary-file write scopes.
 What core keeps is the parser and the screens - denied flags, risky arguments,
-program text, credential paths and globs, hijacking environment variables.
+program text, credential paths and globs, hijacking environment variables,
+a git command aimed outside the working directory (`-C`, a `cd`, `--git-dir`,
+`--work-tree`: git runs programs a repository's config names), and a recursive
+read (`rg`, `grep -r`, `diff -r`, `git diff --no-index`) of the home
+directory, a directory above it, or a hidden directory in it, where credential
+files sit under names no word shows. `sed -l` takes a value in GNU sed and none
+in BSD sed, so a command carrying it never settles.
 A screen never decides anything: it only stops a rule such as `sed *` from
 matching `sed -i`, a form the rule does not mean, and that command passes
 through too.
@@ -568,8 +575,8 @@ A malformed config makes the hook stay silent for the whole session, so
 `warning:` and `info:` lines (exit 1 only on errors): parse failures, empty or
 bad-glob rules, empty `Edit()` patterns, bare `*` in deny/ask, `$defaults` in
 `permissions.allow` (a warning: it adds no rules), how many builtin read-only
-rules apply,
-whether each judge list is unset, extends (`$defaults`) or replaces the builtins, the
+rules apply, whether each judge list is unset, extends (`$defaults`) or
+replaces the builtins, the
 effective `judge.decisions`, each `backend` value with where it came from
 (flag, file or default), and whether `backend.apiKey` resolves - never printing
 any part of the key. No network unless `--live`, which makes one real judge

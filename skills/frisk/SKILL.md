@@ -5,7 +5,7 @@ description: Set up, diagnose and tune frisk, the PreToolUse permission gate for
 
 # frisk
 
-frisk is a Claude Code `PreToolUse` hook. Config rules decide clear commands.
+frisk is a Claude Code `PreToolUse` hook. Rules decide clear commands.
 A [Jev](https://docs.typesafe.ai) judgment covers the gray zone. Everything
 else is silence: the command falls through to Claude Code's own permission
 flow. frisk shortcuts, never bypasses. A frisk allow still passes Claude
@@ -59,8 +59,9 @@ included.
   Claude Code prompt means frisk stayed silent.
 - `frisk check '<command>'` reproduces any decision and prints
   `decision tier reason`. Judge reasons include the probability split and the
-  closest prose rule. A static reason ending in `(builtin)` matched a builtin
-  read-only rule; an ask or deny rule overrides it. Tier `no-judge` means `backend.apiKey` is unset; reason
+  closest prose rule. A static reason ending in `(builtin)` names a builtin
+  read-only rule, the one the last segment matched; an ask or deny rule
+  overrides it. Tier `no-judge` means `backend.apiKey` is unset; reason
   `judge unavailable` means the key or the endpoint failed (the log line says
   which).
 - To compare judge prose or models faithfully, add `--log-level debug` to the
@@ -94,14 +95,18 @@ segment to match.
 - A `gh api *` rule covers plain GETs only. A field flag (`-f`, `-F`,
   `--field`, `--raw-field`), `--input`, a non-GET method, or the `graphql`
   endpoint passes through. That is the screen working, not a broken rule.
+- Git aimed outside the working directory (`git -C /other`, `cd /other && git`,
+  `--git-dir`) and recursive reads of `~`, a directory above it, or a hidden
+  directory in it (`rg x ~`, `grep -r x ~/.config`) never settle statically:
+  git runs programs a foreign repository's config names, and credential files
+  hide under such directories. They go to the judge or fall through.
 
 ## Tune the judge (judge.*)
 
 `"$defaults"` splices the builtin prose into a list, in place; a list without
 it replaces the builtins. The builtin prose claims no ownership, so add which
 repositories, hosts and directories are the user's to `environment`.
-`soft_deny` maps to ask,
-`hard_deny` to deny. `judge.decisions` limits what the judge may issue:
+`soft_deny` maps to ask, `hard_deny` to deny. `judge.decisions` limits what the judge may issue:
 `["allow", "deny"]` means it never prompts. Withheld verdicts log as `silent`.
 
 Measured findings:
