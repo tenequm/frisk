@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.4.3](https://github.com/tenequm/frisk/compare/v0.4.2...v0.4.3) - 2026-10-08
+
+### <!-- 2 -->🐛 Bug Fixes
+- **probe:** stop reading a longer variable name as a write of a shorter one ([#41](https://github.com/tenequm/frisk/pull/41)) ([0bc1005](https://github.com/tenequm/frisk/commit/0bc1005c66571f0ca8c0b0d46d8b6c78b710bd78))
+  A script path built from a variable is no longer reported unresolvable
+  just because the command also assigns or reads a longer variable whose
+  name ends the same way, such as $S beside WS=$(...) or $WS.
+- **probe:** refuse variable resolution through indirect writes ([#42](https://github.com/tenequm/frisk/pull/42)) ([4715e87](https://github.com/tenequm/frisk/commit/4715e87fde388c42554e3fc25be41ad73a545d55))
+  Variable-based script paths are now reported unresolvable when a builtin
+  may write through an indirect name, a nameref or indirect expansion.
+  This also closes the same gap in static variable resolution. No
+  configuration changes are needed.
+
+### <!-- 5 -->📚 Documentation
+- **skill:** tune frisk config before changing agent instructions ([#40](https://github.com/tenequm/frisk/pull/40)) ([c8e2b6a](https://github.com/tenequm/frisk/commit/c8e2b6a088342260bd81d6287890ae7fcaf09af2))
+  Documentation only: the frisk skill now says to fix a routine ask in
+  frisk's own config before changing other agents' instructions, and to
+  split log lines by entry so frisk check runs are not mistaken for hook
+  prompts.
+
+**Full Changelog**: https://github.com/tenequm/frisk/compare/v0.4.2...v0.4.3
+
 ## [0.4.2](https://github.com/tenequm/frisk/compare/v0.4.1...v0.4.2) - 2026-10-08
 
 ### <!-- 1 -->🎉 New Features
