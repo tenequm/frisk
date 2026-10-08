@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.4.1](https://github.com/tenequm/frisk/compare/v0.4.0...v0.4.1) - 2026-10-08
+
+### <!-- 1 -->🎉 New Features
+- **git:** record what a branch or tag deletion loses ([0b88e4e](https://github.com/tenequm/frisk/commit/0b88e4ef16babd83ecf527d04d5341e1af6ea7ff))
+- **gh:** record each gh command's class and repository for the judge ([00e4675](https://github.com/tenequm/frisk/commit/00e4675a739290bde16d66ac705560257b24050a))
+
+### <!-- 2 -->🐛 Bug Fixes
+- **gh:** close record gaps that let foreign or destructive gh commands read as routine ([75253cd](https://github.com/tenequm/frisk/commit/75253cd5dbd6ba2963e1cab85bba0a02fe0fc54a))
+
+### <!-- 4 -->🚜 Refactor
+- move git parsing and repository facts into git.go ([13c8a27](https://github.com/tenequm/frisk/commit/13c8a27c9007b195318d25f261ceb4af0ad17f7e))
+
+### <!-- 5 -->📚 Documentation
+- drop the one-file rule, keep stdlib only ([51a36c6](https://github.com/tenequm/frisk/commit/51a36c60de90a5597f6e0395f1af887dba9279b8))
+
+### <!-- 6 -->🧹 Chores
+- **eval:** keep same-second eval runs from overwriting each other's results ([#37](https://github.com/tenequm/frisk/pull/37)) ([94777f9](https://github.com/tenequm/frisk/commit/94777f908f092f37a70d538cb08761e7d0962a67))
+  Eval runs started in the same second no longer overwrite each other's
+  results file; each run now writes its own file in the system temp dir.
+
+**Full Changelog**: https://github.com/tenequm/frisk/compare/v0.4.0...v0.4.1
+
 ## [0.4.0](https://github.com/tenequm/frisk/compare/v0.3.0...v0.4.0) - 2026-10-07
 
 ### <!-- 0 -->🛠 Breaking Changes
