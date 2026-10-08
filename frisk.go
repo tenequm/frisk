@@ -1732,7 +1732,7 @@ func rawWrites(command, name string) int {
 		at, end := i+j, i+j+len(name)
 		i = end
 		before, after := command[:at], command[end:]
-		if after != "" && len(identifier.FindString("_"+after[:1])) == 2 {
+		if after != "" && len(identifier.FindString("_"+after[:1])) == 2 || endsLongerName(before) {
 			continue // a longer name
 		}
 		assigns := strings.HasPrefix(after, "=") || strings.HasPrefix(after, ":=") || strings.HasPrefix(after, "::=")
@@ -1740,6 +1740,28 @@ func rawWrites(command, name string) int {
 			n++
 		}
 	}
+}
+
+// endsLongerName reports whether text ends in name characters the shell reads
+// as the start of a longer name: at the start of the text, after a blank or
+// an operator, or after the $ or ${ of a reference. After anything else, such
+// as an option dash, a quote or a brace, they may join with what follows into
+// a word that writes a shorter name (printf -"v"S, printf -{v,}S).
+func endsLongerName(text string) bool {
+	head := strings.TrimRightFunc(text, func(r rune) bool {
+		return r == '_' || 'a' <= r && r <= 'z' || 'A' <= r && r <= 'Z' || '0' <= r && r <= '9'
+	})
+	if head == text {
+		return false
+	}
+	if ref := strings.TrimSuffix(head, "{"); strings.HasSuffix(ref, "$") {
+		// $1S is $1 then S, and $$vS the shell's PID then vS.
+		return identifier.MatchString(text[len(head):]) && !strings.HasSuffix(ref, "$$")
+	}
+	if strings.HasSuffix(head, "\\\n") {
+		return false // a line continuation joins the words around it
+	}
+	return head == "" || strings.ContainsAny(head[len(head)-1:], " \t\n;&|")
 }
 
 // backgrounded reports an and-or list run in the background from statement
