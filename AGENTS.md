@@ -4,7 +4,7 @@ Claude Code PreToolUse gate for Bash. Design: [DESIGN.md](DESIGN.md).
 
 ## Core rules
 
-- **KISS** - the simplest thing that works. One file, stdlib only, no new abstractions.
+- **KISS** - the simplest thing that works. Stdlib only, no new abstractions. A file holds one domain (git, shell parsing, judge, config); split when a second domain grows in, never just for size.
 - **YAGNI** - build nothing until real traffic in `frisk.log` asks for it. No speculative config keys, flags, or tiers.
 
 ## Invariants

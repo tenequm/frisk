@@ -3,7 +3,7 @@
 A quick pat-down for every command your agent runs.
 The clean ones walk through. The rest wait for you.
 
-A Claude Code `PreToolUse` hook for Bash: one Go file, stdlib only.
+A Claude Code `PreToolUse` hook for Bash, stdlib only.
 Deterministic rules decide first, a [Jev](https://docs.typesafe.ai) judgment
 covers the gray zone, everything else is silence - which lands exactly where
 it lands today: Claude Code's own rules, then the auto-mode classifier, then you.
