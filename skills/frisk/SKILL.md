@@ -78,6 +78,14 @@ binary, `~/.claude/settings*.json`, `~/.claude/hooks`) are hardcoded.
 
 ## Tune rules (permissions.allow / deny / ask)
 
+Tune frisk first. A routine command that asks or falls silent is a config
+gap: fix it with a `permissions.allow` rule, or with `judge.allow` and
+`judge.environment` prose naming that work and which repositories, hosts and
+directories are the user's. Do not edit agents' instructions or skills, or
+tell agents to rephrase commands, just to get past frisk. Do that only when
+the config cannot express the work safely. When the command shape itself is
+what frisk misreads, that is a frisk limitation: propose a frisk issue or PR.
+
 Rules use Claude Code `Bash(...)` syntax. frisk matches them per pipeline
 segment, so `cd x && git push` matches `git push *`. A trailing `*` matches
 the rest. A mid-pattern `*` matches one token. Static allow needs every
@@ -131,12 +139,3 @@ Measured findings:
 Tuning loop: find repeated asks in the log, add a static rule or name the
 work in allow prose, run `frisk validate`, then `frisk check` the exact
 logged commands, or `frisk check --replay` their debug lines.
-
-Tune frisk first. A routine command that asks or falls silent is a config
-gap: fix it with a `permissions.allow` rule, or with `judge.allow` and
-`judge.environment` prose naming that work and which repositories, hosts and
-directories are the user's. Do not tell agents to rephrase commands, or edit
-their instructions or skills, to fit what frisk already allows. Do that only
-when the config cannot express the work safely. When the command shape itself
-is what frisk misreads, that is a frisk limitation: propose a frisk issue or
-PR.
