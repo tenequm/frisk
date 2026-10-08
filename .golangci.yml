@@ -57,7 +57,7 @@ linters:
         # twice), so an allowlist does not work here - only `disabled` takes effect.
         - name: unhandled-error
           disabled: true
-        # Single-file CLI: rule/prose tables and the tier walk trip line-count
+        # CLI: rule/prose tables and the tier walk trip line-count
         # and literal-count heuristics without being wrong.
         - name: add-constant
           disabled: true
