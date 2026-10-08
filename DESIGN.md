@@ -328,7 +328,10 @@ variable (`S=~$R`). Past a substitution the tokenizer may read quotes apart
 from the shell, and builtins write names in forms no word shows (`printf -vS`,
 `read {S,T}`, `$[S=1]`), so the probe also reads the raw command: a name
 resolves only when the text names it nowhere but in its one assignment and in
-plain reads (`$S`, `${S}`, `${S:-x}`), heredoc bodies included. HOME and
+plain reads (`$S`, `${S}`, `${S:-x}`), heredoc bodies included. A longer
+name is not the name (`WS=$(curl ...)`, `$WS`) when it starts the text,
+follows a blank or an operator, or follows the `$` of a reference; after
+anything else (`printf -"v"S`, `-\vS`, `-v$1S`) it may be. HOME and
 TMPDIR resolve only when the text never names them that way. Code that may
 assign where no word shows it - arithmetic (`((`, `$((`, `$[`), a `(` inside a
 word, a zsh glob qualifier that can run code, `command .` or `builtin .` -
