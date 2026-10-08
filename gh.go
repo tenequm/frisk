@@ -273,29 +273,16 @@ func ghRepoShaped(sub, w string) bool {
 		!strings.ContainsAny(w, " \t\n:")
 }
 
-// ghAPIClass reads gh api: a GET, or a GraphQL query written inline with no
-// mutation, only reads. A query from a file, stdin or a variable stays unknown.
+// ghAPIClass reads gh api: only a GET reads. GraphQL needs a POST whether it
+// queries or mutates, so it stays unknown.
 func ghAPIClass(rest []string, a ghArgs) string {
-	if firstOf(a.operands) != "graphql" {
-		if ghAPIReads(rest) {
-			return gitRead
-		}
-		return gitRemote
-	}
-	var queries []string
-	for _, field := range slices.Concat(a.values["-f"], a.values["--raw-field"], a.values["-F"], a.values["--field"]) {
-		if query, ok := strings.CutPrefix(field, "query="); ok {
-			queries = append(queries, query)
-		}
-	}
 	switch {
-	case a.has("--input"), len(queries) == 0,
-		slices.ContainsFunc(queries, func(q string) bool { return strings.HasPrefix(q, "@") || strings.Contains(q, "$") }):
+	case firstOf(a.operands) == "graphql":
 		return gitUnknown
-	case slices.ContainsFunc(queries, func(q string) bool { return strings.Contains(strings.ToLower(q), "mutation") }):
-		return gitRemote
-	default:
+	case ghAPIReads(rest):
 		return gitRead
+	default:
+		return gitRemote
 	}
 }
 

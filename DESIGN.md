@@ -263,7 +263,7 @@ The classes reuse git's where the meaning carries over and add two:
 
 | class | gh commands |
 |-------|-------------|
-| `read` | `pr view/list/checks/diff/status`, `issue view/list/status`, `run view/list/watch`, `release view/list`, `repo view/list`, `workflow view/list`, `search`, `status`, `browse`, list and get commands, `api` with a GET or an inline GraphQL query without `mutation` (a query from a file, stdin or a variable is `unknown`) |
+| `read` | `pr view/list/checks/diff/status`, `issue view/list/status`, `run view/list/watch`, `release view/list`, `repo view/list`, `workflow view/list`, `search`, `status`, `browse`, list and get commands, `api` with a GET (GraphQL, which always posts, is `unknown`) |
 | `local` | `pr checkout`, `run download`, `release download`, `repo clone`, `repo set-default`, `config set` of a key that names no program |
 | `collaborate` | pull requests, issues and comments: create, edit, comment, review, ready, close, reopen; `run rerun/cancel` |
 | `merge` | `pr merge`, and `pr review` with `-a`/`--approve`, bundled or not |
