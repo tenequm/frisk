@@ -919,9 +919,28 @@ func (t gitTarget) record(git gitRunner) map[string]any {
 		t.discardCounts(rec, git)
 	}
 	if deletion {
-		rec["deleted_refs"] = t.deletedRefFacts(git)
+		refs := t.deletedRefFacts(git)
+		rec["deleted_refs"], rec["loses_commits"] = refs, losesCommits(refs)
 	}
 	return rec
+}
+
+// losesCommits sums deleted_refs up for the judge: true when any ref holds
+// commits no other ref does, false only when every count is a current 0.
+// It counts reachable commits, not reflog history.
+func losesCommits(refs []map[string]any) any {
+	settled := true
+	for _, ref := range refs {
+		n, ok := ref["unique_commits"].(int)
+		if ok && n > 0 {
+			return true
+		}
+		settled = settled && ok
+	}
+	if !settled {
+		return gitUnknown
+	}
+	return false
 }
 
 // deletedRefFacts says, per ref, whether deleting it loses commits:

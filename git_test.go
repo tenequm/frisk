@@ -346,34 +346,34 @@ func TestGitRecords(t *testing.T) {
 		},
 		{
 			"a deleted branch last set by a fetch", "git branch -D pr/7",
-			`[{"class":"local","deleted_refs":[{"ref":"refs/heads/pr/7","tip_fetched":true,"unique_commits":1}],"state":"current","subcommand":"branch"}]`,
+			`[{"class":"local","deleted_refs":[{"ref":"refs/heads/pr/7","tip_fetched":true,"unique_commits":1}],"loses_commits":true,"state":"current","subcommand":"branch"}]`,
 			"branch:local",
 		},
 		{
 			"a deleted branch whose commits other refs hold", "git branch -d merged",
-			`[{"class":"local","deleted_refs":[{"ref":"refs/heads/merged","unique_commits":0}],"state":"current","subcommand":"branch"}]`,
+			`[{"class":"local","deleted_refs":[{"ref":"refs/heads/merged","unique_commits":0}],"loses_commits":false,"state":"current","subcommand":"branch"}]`,
 			"branch:local",
 		},
 		{
 			"refs deleted together do not hold each other's commits", "git branch -D pr/7 merged main",
 			`[{"class":"local","deleted_refs":[{"ref":"refs/heads/pr/7","tip_fetched":true,"unique_commits":1},` +
-				`{"ref":"refs/heads/merged","unique_commits":0},{"ref":"refs/heads/main","unique_commits":0}],"state":"current","subcommand":"branch"}]`,
+				`{"ref":"refs/heads/merged","unique_commits":0},{"ref":"refs/heads/main","unique_commits":0}],"loses_commits":true,"state":"current","subcommand":"branch"}]`,
 			"branch:local",
 		},
 		{
 			"a missing ref leaves its count unknown", "git tag -d v9",
-			`[{"class":"local","deleted_refs":[{"ref":"refs/tags/v9","unique_commits":"unknown"}],"state":"current","subcommand":"tag"}]`,
+			`[{"class":"local","deleted_refs":[{"ref":"refs/tags/v9","unique_commits":"unknown"}],"loses_commits":"unknown","state":"current","subcommand":"tag"}]`,
 			"tag:local",
 		},
 		{
 			"a remote-tracking deletion names refs/remotes", "git branch -d -r origin/topic",
-			`[{"class":"local","deleted_refs":[{"ref":"refs/remotes/origin/topic","unique_commits":0}],"state":"current","subcommand":"branch"}]`,
+			`[{"class":"local","deleted_refs":[{"ref":"refs/remotes/origin/topic","unique_commits":0}],"loses_commits":false,"state":"current","subcommand":"branch"}]`,
 			"branch:local",
 		},
 		{
 			"a commit before a deletion makes its facts unknown", "git commit -m x && git branch -D pr/7",
 			`[{"class":"local","state":"current","subcommand":"commit"},` +
-				`{"class":"local","deleted_refs":[{"ref":"refs/heads/pr/7","unique_commits":"unknown"}],"state":"unknown","subcommand":"branch"}]`,
+				`{"class":"local","deleted_refs":[{"ref":"refs/heads/pr/7","unique_commits":"unknown"}],"loses_commits":"unknown","state":"unknown","subcommand":"branch"}]`,
 			"commit:local,branch:local",
 		},
 		{
