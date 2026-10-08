@@ -51,6 +51,8 @@ The log is the ground truth: `~/.local/state/frisk/frisk.log`
 (`$XDG_STATE_HOME/frisk/`). Every decision writes one JSON line, silences
 included.
 
+- Split lines by `entry` before blaming the hook: `hook` is a real tool call,
+  `check` is a `frisk check` run, and a burst of those reads like prompt spam.
 - A command prompted, but the log has no line for it: the hook is not firing.
   Check the settings entry and that `frisk` is on Claude Code's PATH.
 - A malformed config disables frisk silently for the whole session. Run
@@ -128,4 +130,13 @@ Measured findings:
 
 Tuning loop: find repeated asks in the log, add a static rule or name the
 work in allow prose, run `frisk validate`, then `frisk check` the exact
-commands.
+logged commands, or `frisk check --replay` their debug lines.
+
+Tune frisk first. A routine command that asks or falls silent is a config
+gap: fix it with a `permissions.allow` rule, or with `judge.allow` and
+`judge.environment` prose naming that work and which repositories, hosts and
+directories are the user's. Do not tell agents to rephrase commands, or edit
+their instructions or skills, to fit what frisk already allows. Do that only
+when the config cannot express the work safely. When the command shape itself
+is what frisk misreads, that is a frisk limitation: propose a frisk issue or
+PR.
