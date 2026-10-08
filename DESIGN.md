@@ -195,6 +195,7 @@ runs in (`-C`, or the directory a literal `cd` led to).
 | `subcommand`, `class` | always | as described, or `unknown` |
 | `forced`, `deletes_ref` | class `remote` and every push; otherwise only when true, and never on a branch or tag deletion | boolean |
 | `deleted_refs` | a branch or tag deletion | one entry per ref: `ref` (full refname); `unique_commits`, the commits no other ref holds with the refs deleted alongside excluded, or `unknown` (out of time, or past the first five refs) - one `rev-list --count` over all of them settles the usual 0, and only a non-zero total is counted per ref; `tip_fetched` when the ref's newest reflog entry is a fetch |
+| `loses_commits` | a branch or tag deletion | `true` when any deleted ref holds commits no other ref does, `false` only when every `unique_commits` is a current 0, else `unknown`; it counts reachable commits, not reflog history, and `tip_fetched` plays no part, since a reflog subject proves no remote still holds the commits |
 | `no_verify`, `amend`, `config_override` | only when true | `true` |
 | `remote` | push | host/owner/repo of the push URL, or `unknown` |
 | `destination` | push | the branch the arguments name; with no refspec the upstream branch, when the push goes to the upstream's remote; `HEAD` is the current branch; else `unknown` |
