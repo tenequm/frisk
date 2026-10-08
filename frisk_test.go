@@ -2611,6 +2611,79 @@ func TestProbeScripts(t *testing.T) {
 		{"write hidden by quotes read apart", ".", "S={root}/proj; echo \"$(echo \"'\")\"; S=/b; echo \\'; python3 $S/run.py", probeUnresolvable, nil},
 		{"heredoc inside a parameter default", ".", "S={root}/proj\necho ${X:-<<EOF}\ntrue\nS=/b\nEOF}\npython3 $S/run.py", probeUnresolvable, nil},
 		{"printf -v bundled", ".", "S={root}/proj; printf -vS /b; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write printf indirect target", ".", "S={root}/proj; N=$(printf '\\x53'); printf -v \"$N\" /evil; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write declare indirect target", ".", "S={root}/proj; N=$(printf '\\x53'); declare \"$N=/b\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write read indirect target", ".", "S={root}/proj; N=$(printf '\\x53'); read \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write nameref indirect target", ".", "S={root}/proj; N=$(printf '\\x53'); declare -n R=$N; R=/b; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write printf attached indirect target", ".", "S={root}/proj; printf -v$XS /b; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write printf quoted flag indirect target", ".", "S={root}/proj; printf -\"v\"\"$N\" /b; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write printf expanded option", ".", "S={root}/proj; printf \"$FLAGS\" /b; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write printf positional target", ".", "S={root}/proj; printf -v$1S /b; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write printf brace target", ".", "S={root}/proj; printf -v{A,B} /b; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write printf array target", ".", "S={root}/proj; printf -v 'A[N]' /b; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write printf percent n target", ".", "S={root}/proj; printf '%n' \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write read indexed array indirect target", ".", "S={root}/proj; read -a \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write read associative array indirect target", ".", "S={root}/proj; read -A \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write read attached array indirect target", ".", "S={root}/proj; read -a$XS; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write read bundled array indirect target", ".", "S={root}/proj; read -ra\"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write read associative attached indirect target", ".", "S={root}/proj; read -A$XS; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write read multiple indirect targets", ".", "S={root}/proj; read T \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write read builtin indirect target", ".", "S={root}/proj; builtin read -- \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write read command indirect target", ".", "S={root}/proj; command read \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write read brace targets", ".", "S={root}/proj; read {A,B}; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write typeset indirect operand", ".", "S={root}/proj; typeset \"$N=/b\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write export indirect operand", ".", "S={root}/proj; export \"$N=/b\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write local indirect operand", ".", "S={root}/proj; local \"$N=/b\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write readonly indirect operand", ".", "S={root}/proj; readonly \"$N=/b\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write integer indirect operand", ".", "S={root}/proj; integer \"$N=1\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write float indirect operand", ".", "S={root}/proj; float \"$N=1\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write declare indirect name only", ".", "S={root}/proj; declare \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write declare concatenated indirect name", ".", "S={root}/proj; declare \"A${N}=x\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write declare brace operands", ".", "S={root}/proj; declare {A,B}=x; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write declare expanded flags", ".", "S={root}/proj; declare \"$FLAGS\" R=x; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write literal nameref target", ".", "S={root}/proj; declare -n R=T; R=/b; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write bundled nameref flag", ".", "S={root}/proj; declare -gn R=$N; R=/b; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write typeset nameref", ".", "S={root}/proj; typeset -n R=$N; R=/b; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write local nameref", ".", "S={root}/proj; local -n R=$N; R=/b; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write eval indirect assignment", ".", "S={root}/proj; eval \"$N=/b\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write zsh indirect assignment", ".", "S={root}/proj; : ${(P)N::=x}; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write zsh quoted indirect assignment", ".", "S={root}/proj; : \"${(P)N::=x}\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write zsh bundled indirect flag", ".", "S={root}/proj; : \"${(eP)N::=x}\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write bash assigning indirect expansion", ".", "S={root}/proj; : \"${!N:=x}\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write bash indirect builtin target", ".", "S={root}/proj; read \"${!N}\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write mapfile indirect target", ".", "S={root}/proj; mapfile \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write readarray indirect target", ".", "S={root}/proj; readarray \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write unset indirect target", ".", "S={root}/proj; unset \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write indirect write before assignment", ".", "S={root}/proj; read \"$N\"; T=/b; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write hidden by quotes read apart", ".", "S={root}/proj; N=$(printf '\\x53'); echo \"$(echo \"'\")\"; printf -v \"$N\" /b; echo \\'; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write expanding heredoc zsh", ".", "S={root}/proj; cat <<EOF\n\"${(P)N::=x}\"\nEOF\npython3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write expanding heredoc bash", ".", "S={root}/proj; cat <<EOF\n${!N:=x}\nEOF\npython3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write nested zsh assignment", ".", "S={root}/proj; : \"${${(P)N}::=x}\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write printf percent n width", ".", "S={root}/proj; printf -- '%10n' \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write zsh print target", ".", "S={root}/proj; N=$(printf '\\x53'); print -v \"$N\" /evil; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write zsh print attached target", ".", "S={root}/proj; print -v$XS /evil; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write printf percent n dynamic width", ".", "S={root}/proj; N=$(printf '\\x53'); printf '%*n' 1 \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write printf percent n dynamic precision", ".", "S={root}/proj; printf '%.*n' 1 \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write zsh flag delimiter hides parenthesis", ".", "S={root}/proj; N=$(printf '\\x53'); : \"${(j:):P)N::=/evil}\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write zsh evaluating flag", ".", "S={root}/proj; : \"${(e)N}\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write printf empty precision", ".", "S={root}/proj; printf '%.n' \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write printf length modifier", ".", "S={root}/proj; printf '%hhn' \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write expanded builtin verb", ".", "S={root}/proj; B=read; N=$(printf '\\x53'); $B \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write expanded builtin bundled words", ".", "S={root}/proj; B=\"declare -n\"; $B R=$N; R=/b; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write expanded builtin wrapper", ".", "S={root}/proj; B=read; command -p \"$B\" \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write unknown builtin verb", ".", "S={root}/proj; $CMD \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write expanded eval verb", ".", "S={root}/proj; B=eval; $B true; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write expanded read literal operand", ".", "S={root}/proj; B=read; $B T; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write expanded wrapper option", ".", "S={root}/proj; B=read; O=-p; command \"$O\" \"$B\" \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write brace expanded builtin verb", ".", "S={root}/proj; N=$(printf '\\x53'); r{ea,ea}d \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write glob expanded builtin verb", ".", "S={root}/proj; r*d \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write expanded verb hidden by quotes", ".", "S={root}/proj; B=read; N=$(printf '\\x53'); echo \"$(echo \"'\")\"; $B \"$N\"; echo \\'; python3 $S/run.py", probeUnresolvable, nil},
+		{"printf literal separate target", ".", "S={root}/proj; printf -v S /b; python3 $S/run.py", probeUnresolvable, nil},
+		{"printf literal other target", ".", "S={root}/proj; printf -v T /b; python3 $S/run.py", probeAttached, []string{"proj/run.py"}},
+		{"printf literal format expanded data", ".", "S={root}/proj; printf %s \"$N\"; python3 $S/run.py", probeAttached, []string{"proj/run.py"}},
+		{"declare literal name expanded value", ".", "S={root}/proj; declare T=$N; python3 $S/run.py", probeAttached, []string{"proj/run.py"}},
+		{"read literal other target", ".", "S={root}/proj; read T; python3 $S/run.py", probeAttached, []string{"proj/run.py"}},
+		{"indirect write literal script path", "proj", "read \"$N\"; python3 run.py", probeAttached, []string{"proj/run.py"}},
 		{"zsh foreach", ".", "S={root}/proj\nforeach S (/b)\ntrue\nend\npython3 $S/run.py", probeUnresolvable, nil},
 		{"subscript arithmetic in an expanding body", ".", "S={root}/proj\n: <<EOF\n${A[S=5]}\nEOF\npython3 $S/run.py", probeUnresolvable, nil},
 		{"command . sources stdin", ".", "S={root}/proj\ncommand . /dev/stdin <<'EOF'\ntrue\nEOF\npython3 $S/run.py", probeUnresolvable, nil},
@@ -2798,6 +2871,30 @@ func TestProbeScripts(t *testing.T) {
 			}
 			if !slices.Equal(got, tt.paths) {
 				t.Fatalf("scripts = %v, want %v", got, tt.paths)
+			}
+		})
+	}
+}
+
+func TestIndirectWritesResolveNothing(t *testing.T) {
+	t.Setenv("HOME", "/home/frisk")
+	t.Setenv("TMPDIR", "/tmp/frisk")
+	for _, form := range []string{
+		`printf -v "$N" x`, `printf -v$XS x`, `printf '%*n' 1 "$N"`, `printf '%.n' "$N"`,
+		`printf '%hhn' "$N"`, `B=read; $B "$N"`, `B=read; $B T`, `B=eval; $B true`, `print -v "$N" x`, `read "$N"`, `read -a "$N"`,
+		`read -A "$N"`, `declare "$N=x"`, `typeset "$N=x"`, `export "$N=x"`,
+		`local "$N=x"`, `readonly "$N=x"`, `declare -n R=T; R=x`,
+		`typeset -n R=$N; R=x`, `eval "$N=x"`, `: "${(P)N::=x}"`, `: "${!N:=x}"`,
+	} {
+		t.Run(form, func(t *testing.T) {
+			command := `S=/safe; N=T; ` + form + `; cat $S/a $HOME/a $TMPDIR/a`
+			parsed := tokenize(command)
+			for tier, vars := range map[string]map[string]literalVar{
+				"static": parsed.literalVars(), "probe": parsed.probeVars(command),
+			} {
+				if len(vars) != 0 {
+					t.Errorf("%s resolved variables: %v", tier, vars)
+				}
 			}
 		})
 	}

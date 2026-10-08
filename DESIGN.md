@@ -333,9 +333,14 @@ TMPDIR resolve only when the text never names them that way. Code that may
 assign where no word shows it - arithmetic (`((`, `$((`, `$[`), a `(` inside a
 word, a zsh glob qualifier that can run code, `command .` or `builtin .` -
 leaves the whole command unresolved, and so does an assignment in an and-or
-list run in the background. A shell reading a literal heredoc body expands it
-itself, in an environment this command does not settle (`env -i`, `sudo -H`),
-so nothing resolves there.
+list run in the background. A builtin writing through a non-literal target
+(`printf -v "$N"`, `read -a "$N"`, `declare "$N=x"`), a nameref or an indirect
+expansion (`${(P)N::=x}`, `${!N}`) disables all variable resolution in both
+tiers; builtins invoked through a command variable are checked after that
+variable resolves, and after a substitution the probe also checks with quotes
+removed rather than trusting token boundaries. A shell reading a literal
+heredoc body expands it itself, in an environment this command does not settle
+(`env -i`, `sudo -H`), so nothing resolves there.
 
 A file the command writes with a redirect before running it is not read from
 disk, which does not hold what will run yet. When the write is `cat > file`
