@@ -336,7 +336,21 @@ TMPDIR resolve only when the text never names them that way. Code that may
 assign where no word shows it - arithmetic (`((`, `$((`, `$[`), a `(` inside a
 word, a zsh glob qualifier that can run code, `command .` or `builtin .` -
 leaves the whole command unresolved, and so does an assignment in an and-or
-list run in the background. A shell reading a literal heredoc body expands it
+list run in the background. A builtin writing through a computed target
+(`printf -v "$N"`, `read -a "$N"`, `declare "$N=x"`, a `%n` argument), a
+nameref, `let`, or an indirect expansion (`${(P)N::=x}`, `${!N}`) disables all
+variable resolution in both tiers. A literal operand writes only the name it
+shows (`read -t 5 x`), so it is counted as a write rather than refused, and a
+computed format with no argument after it (`printf "Found $n\n"`) or bash's
+key lists (`${!arr[@]}`, `${!pre*}`) write nothing. A command word that is a
+variable is checked once vars resolve, and one that stays unresolved disables
+resolution entirely, unless it is double-quoted with a `/` of its own
+(`"$VENV/bin/python"`), which names a file and never a builtin; a globbed
+command word does too unless it may expand to a builtin's name. After a
+substitution the probe also reads the command with quotes removed, every
+heredoc body there read as commands, except a literal body the shell reads as
+data that ends before the first substitution, where quotes are still read as
+the shell reads them. A shell reading a literal heredoc body expands it
 itself, in an environment this command does not settle (`env -i`, `sudo -H`),
 so nothing resolves there.
 

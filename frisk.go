@@ -851,6 +851,7 @@ type heredoc struct {
 	line  int
 	piped bool
 	text  string // the body, terminator excluded and leading tabs kept
+	start int    // the body's byte offset in the command
 }
 
 // heredocAt reads the heredoc operator at s[i] and returns its length, or 0
@@ -1064,7 +1065,7 @@ func tokenize(command string) parsedCommand {
 			}
 			flushStatement(next)
 			if c == '\n' && len(docs) > 0 {
-				rest := p.heredocBodies(docs, command[i+1:], sep == "|")
+				rest := p.heredocBodies(docs, command, i+1, sep == "|")
 				read = append(read, docs...)
 				docs, i = nil, len(command)-len(rest)-1
 			}
@@ -1172,13 +1173,16 @@ func wordEnd(s string, j int) bool {
 	return j == len(s) || strings.IndexByte(" \t\n;|&", s[j]) >= 0
 }
 
-// heredocBodies consumes the bodies that open s, one per pending operator, and
-// returns what follows the last terminator line. An unterminated body runs to
-// the end of the command. piped reports an operator line that ends in "|".
-func (p *parsedCommand) heredocBodies(docs []heredoc, s string, piped bool) string {
+// heredocBodies consumes the bodies that open command[at:], one per pending
+// operator, and returns what follows the last terminator line. An unterminated
+// body runs to the end of the command. piped reports an operator line that
+// ends in "|".
+func (p *parsedCommand) heredocBodies(docs []heredoc, command string, at int, piped bool) string {
 	line := len(p.stmts)
+	s := command[at:]
 	for n := range docs {
 		d := &docs[n]
+		d.start = len(command) - len(s)
 		body := s
 		s = ""
 		for rest := body; rest != ""; {
@@ -1315,6 +1319,10 @@ func runsStdin(seg []string) bool {
 
 // redirectMarks puts back the operators the tokenizer marked.
 var redirectMarks = strings.NewReplacer("\x01>", ">", "\x01<", "<")
+
+// unquoted drops every quote, for a second reading of a command whose quotes
+// the tokenizer may have read apart from the shell.
+var unquoted = strings.NewReplacer("\"", "", "'", "")
 
 // redirectMark reports a word the tokenizer marked as a redirect operator,
 // which the "\x01cwd" staticSegments appends is not.
@@ -1620,8 +1628,14 @@ var (
 	// variableRef also takes a following ":" or "[": zsh reads those after a
 	// bare $NAME as a modifier ($S:h) or subscript ($S[1]), so that reference
 	// is left alone. After ${NAME} they are literal in bash and zsh alike.
-	variableRef = regexp.MustCompile(`\$([A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})[:\[]?`)
-	identifier  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*`)
+	variableRef       = regexp.MustCompile(`\$([A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})[:\[]?`)
+	identifier        = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*`)
+	indirectExpansion = regexp.MustCompile(`\$\{[!(]`)
+	// keyList is bash's list of an array's keys or of the names with a
+	// prefix, which reads and never dereferences a name.
+	keyList = regexp.MustCompile(`\$\{![A-Za-z_][A-Za-z0-9_]*(\[[@*]\]|[@*])\}`)
+	// printfNameWrite matches a %n conversion; "%%" before it is a literal percent.
+	printfNameWrite = regexp.MustCompile(`(^|[^%])(%%)*%[-+ #0']*([0-9]+|\*)?(\.([0-9]*|\*))?(hh|h|ll|l|j|z|t|L)?n`)
 	// shellOwned names are rewritten by bash or zsh themselves (cd updates
 	// PWD, every command updates _), so one literal write proves nothing.
 	shellOwned = regexp.MustCompile(`^(_|PWD|OLDPWD|DIRSTACK|RANDOM|SRANDOM|SECONDS|EPOCHSECONDS|EPOCHREALTIME|LINENO|REPLY|reply|OPTARG|OPTIND|OPTERR|PPID|UID|EUID|GID|EGID|GROUPS|USERNAME|HISTCMD|PIPESTATUS|pipestatus|status|ERRNO|FUNCNAME|funcstack|COLUMNS|LINES|SHLVL|MAPFILE|COPROC|TTYIDLE|ARGC|argv|MATCH|MBEGIN|MEND|match|mbegin|mend|signals)$|^(BASH|ZSH|zsh|COMP_|READLINE_|TRY_BLOCK_)`)
@@ -1638,6 +1652,14 @@ const (
 	wordSelect   = "select"
 	wordFunction = "function"
 	wordRead     = "read"
+	wordExport   = "export"
+	wordLocal    = "local"
+	wordReadonly = "readonly"
+	wordPrint    = "print"
+	wordDeclare  = "declare"
+	wordTypeset  = "typeset"
+	wordBuiltin  = "builtin"
+	wordLet      = "let"
 	wordWhile    = "while"
 	wordUntil    = "until"
 	wordFor      = "for"
@@ -1660,11 +1682,22 @@ var prefixWords = map[string]bool{
 // cannot see, which may set any variable.
 var (
 	writerVerbs = map[string]bool{
-		"export": true, "readonly": true, "local": true, "declare": true,
-		"typeset": true, "integer": true, "float": true, "unset": true, wordRead: true,
+		wordExport: true, wordReadonly: true, wordLocal: true, wordDeclare: true,
+		wordTypeset: true, "integer": true, "float": true, "unset": true, wordRead: true,
 		wordFor: true, wordSelect: true, "getopts": true, "mapfile": true,
-		"readarray": true, "let": true, verbPrint: true, verbSet: true,
+		"readarray": true, wordLet: true, verbPrint: true, wordPrint: true, verbSet: true,
 	}
+	// operandWriters write each operand they name. Of the other writerVerbs,
+	// for and select take one name the shell refuses unless it is literal,
+	// printf and print name theirs with -v, set writes positional parameters,
+	// and let reads its operands as arithmetic.
+	operandWriters = func() map[string]bool {
+		verbs := maps.Clone(writerVerbs)
+		for _, verb := range []string{wordFor, wordSelect, verbPrint, wordPrint, verbSet, wordLet} {
+			delete(verbs, verb)
+		}
+		return verbs
+	}()
 	// trap and alias can change a variable or a verb later on; setopt and
 	// emulate change how zsh expands every word.
 	opaqueVerbs = map[string]bool{
@@ -1703,9 +1736,30 @@ func (p parsedCommand) probeVars(command string) map[string]literalVar {
 	if p.hidden {
 		return nil
 	}
+	// After a substitution, quotes may hide a writer from the tokenizer, so the
+	// command is read again with them removed. A literal body that is data and
+	// ends before the first substitution was read as the shell reads it, and
+	// holds no command: its statements become ":" lines first.
+	var loose parsedCommand
+	if p.nested >= 0 {
+		text := command
+		for _, d := range slices.Backward(p.docs) {
+			if d.literal && d.body[1] <= p.nested && !slices.ContainsFunc(p.stmts[d.body[0]:d.body[1]], func(st statement) bool { return !st.data }) {
+				text = text[:d.start] + strings.Repeat(":\n", d.body[1]-d.body[0]) + text[d.start+len(d.text):]
+			}
+		}
+		loose = tokenize(unquoted.Replace(text))
+		for i, st := range loose.stmts {
+			// A heredoc this reading finds may be quoted text to the shell.
+			loose.stmts[i].data = false
+			if indirectWrites(st.words) {
+				return nil
+			}
+		}
+	}
 	for _, st := range p.stmts {
 		// "command ." and "builtin ." source a file, which may assign anything.
-		if rest := st.words[st.cmd:]; len(rest) > 1 && (rest[0].text == verbCmd || rest[0].text == "builtin") && rest[1].text == "." {
+		if rest := st.words[st.cmd:]; len(rest) > 1 && (rest[0].text == verbCmd || rest[0].text == wordBuiltin) && rest[1].text == "." {
 			return nil
 		}
 	}
@@ -1717,7 +1771,11 @@ func (p parsedCommand) probeVars(command string) map[string]literalVar {
 		return rawWrites(command, identifier.FindString(c.w.text)) != 1 || p.backgrounded(c.at) ||
 			strings.HasPrefix(value, "~") && strings.Contains(value, "$")
 	})
-	return p.settleVars(vars, vars, candidates)
+	vars = p.settleVars(vars, vars, candidates)
+	if loose.indirectCommandWrites(vars) {
+		return nil
+	}
+	return vars
 }
 
 // rawWrites counts the places the raw command names a variable other than in
@@ -1784,6 +1842,121 @@ type varCandidate struct {
 	at int
 }
 
+// indirectWrites reports a statement that may write a variable whose name
+// no word shows: a computed operand of a builtin that writes its operands, a
+// nameref, let, an indirect expansion, or printf's -v and %n. Such a name may
+// control expansion, so no literal assignment can be kept. A literal operand
+// writes only the name it shows, which rawWrites and writerVerbs count. One
+// pass: every word after any writer verb is checked once as its operand.
+func indirectWrites(words []word) bool {
+	if verb := commandWord(words); verb < len(words) && words[verb].text == wordLet {
+		return true // let x assigns whatever expression x holds
+	}
+	// risky[j]: a word from j on is computed or holds a subscript, which is
+	// arithmetic, so it may name any variable for %n.
+	risky := make([]bool, len(words)+1)
+	for j := len(words) - 1; j >= 0; j-- {
+		risky[j] = risky[j+1] || words[j].computed() || strings.Contains(words[j].exp, "[")
+	}
+	writer, nameref := false, false
+	for i, w := range words {
+		if hasIndirectExpansion(w.exp) {
+			return true
+		}
+		if (w.text == verbPrint || w.text == wordPrint) && printfIndirectWrites(w.text, words[i+1:], risky[i+1:]) {
+			return true
+		}
+		if writer {
+			name, _, _ := strings.Cut(w.exp, "=")
+			if strings.ContainsAny(name, "$`[") || w.glob {
+				return true
+			}
+			if nameref && (strings.HasPrefix(name, "-") || strings.HasPrefix(name, "+")) && strings.Contains(name, "n") {
+				return true
+			}
+		}
+		writer = writer || operandWriters[w.text]
+		nameref = nameref || w.text == wordDeclare || w.text == wordTypeset || w.text == wordLocal
+	}
+	return false
+}
+
+// commandWord returns the index of the word a statement runs, past
+// assignments, prefix words, and command or builtin with their options.
+func commandWord(words []word) int {
+	at := 0
+	for at < len(words) && (assignmentPattern.MatchString(words[at].text) || prefixWords[words[at].text] ||
+		words[at].text == verbCmd || words[at].text == wordBuiltin || strings.HasPrefix(words[at].text, "-")) {
+		at++
+	}
+	return at
+}
+
+func hasIndirectExpansion(text string) bool {
+	return strings.Contains(text, "${") && indirectExpansion.MatchString(keyList.ReplaceAllString(text, ""))
+}
+
+// computed reports a word the shell may change: an expansion, a substitution
+// or a glob.
+func (w word) computed() bool {
+	return strings.ContainsAny(w.exp, "$`") || w.glob
+}
+
+// printfIndirectWrites reports a printf or zsh print that may write a variable
+// no word names: through -v, or through %n, which writes the variable its
+// argument names, here when risky marks a computed one. zsh print reads a
+// format only after -f.
+func printfIndirectWrites(verb string, args []word, risky []bool) bool {
+	optionsWithName := "v"
+	if verb == wordPrint {
+		optionsWithName = "vf"
+	}
+	var format *word
+	at := 0
+	for at < len(args) {
+		a := args[at]
+		at++
+		if a.computed() {
+			// Unquoted it may split into an option and its operands; quoted it
+			// may be -vNAME or a format holding %n, taking the words after it,
+			// or the argument of a format print -f already took.
+			return !a.double || at < len(args) || format != nil && (format.computed() || printfNameWrite.MatchString(format.text))
+		}
+		if a.text == "--" {
+			break
+		}
+		if a.text == "-" || !strings.HasPrefix(a.text, "-") {
+			at--
+			break
+		}
+		k := strings.IndexAny(a.text[1:], optionsWithName)
+		if k < 0 {
+			continue
+		}
+		op := word{text: a.text[k+2:], exp: a.text[k+2:]}
+		if op.text == "" && at < len(args) {
+			op = args[at]
+			at++
+		}
+		if a.text[k+1] == 'f' {
+			format = &op
+		} else if op.computed() || identifier.FindString(op.text) != op.text {
+			return true
+		}
+	}
+	if format == nil {
+		if verb == wordPrint || at == len(args) {
+			return false
+		}
+		format = &args[at]
+		at++
+	}
+	if format.computed() && !format.double {
+		return true
+	}
+	return (format.computed() || printfNameWrite.MatchString(format.text)) && risky[at]
+}
+
 // varCandidates returns HOME and TMPDIR when the command leaves them alone,
 // and, in order, each literal-looking assignment to a name written exactly
 // once. Both are nil when the command may change how any word expands.
@@ -1801,6 +1974,9 @@ func (p parsedCommand) varCandidates() (map[string]literalVar, []varCandidate) {
 	writes := map[string]int{}
 	for _, d := range p.docs {
 		if !d.literal {
+			if hasIndirectExpansion(d.text) {
+				return nil, nil
+			}
 			for _, m := range variableWrite.FindAllStringSubmatch(d.text, -1) {
 				writes[m[1]+m[3]+m[4]]++
 			}
@@ -1811,6 +1987,9 @@ func (p parsedCommand) varCandidates() (map[string]literalVar, []varCandidate) {
 	for i, st := range p.stmts {
 		if _, inBody := body[i]; inBody {
 			continue
+		}
+		if indirectWrites(st.words) {
+			return nil, nil
 		}
 		rest := st.words[st.cmd:]
 		topLevel = topLevel && (len(rest) == 0 || !controlWords[rest[0].text])
@@ -1869,7 +2048,92 @@ func (p parsedCommand) settleVars(vars, known map[string]literalVar, candidates 
 			vars[identifier.FindString(c.w.text)] = literalVar{value: value, at: c.at}
 		}
 	}
+	if p.indirectCommandWrites(vars) {
+		return nil
+	}
 	return vars
+}
+
+// indirectCommandWrites reports a command word that may run a builtin with an
+// indirect target, or any writer, once vars are substituted into it; its
+// operands stay unexpanded. Any other computed command word may be one.
+func (p parsedCommand) indirectCommandWrites(vars map[string]literalVar) bool {
+	for at, st := range p.stmts {
+		if st.data {
+			continue
+		}
+		rest := st.words[st.cmd:]
+		for len(rest) > 0 && prefixWords[rest[0].text] {
+			rest = rest[1:]
+		}
+		for len(rest) > 0 {
+			if rest[0].glob && rest[0].text != "[" && rest[0].text != "[[" &&
+				(strings.ContainsAny(rest[0].exp, "$`") || globMayNameBuiltin(rest[0].text)) {
+				return true
+			}
+			if namesPath(rest[0]) {
+				break
+			}
+			if strings.ContainsAny(rest[0].exp, "$`") {
+				verb := p.substitute(vars, at, rest[0])
+				if strings.ContainsAny(verb, "$`") {
+					return true
+				}
+				var expanded []word
+				for field := range strings.FieldsSeq(verb) {
+					expanded = append(expanded, word{text: field, exp: field})
+				}
+				rest = append(expanded, rest[1:]...)
+				if indirectWrites(rest) || len(rest) > 0 && (opaqueVerbs[rest[0].text] || writerVerbs[rest[0].text] || rest[0].text == "." || strings.HasPrefix(rest[0].text, "-")) {
+					return true
+				}
+			}
+			if len(rest) == 0 || rest[0].text != verbCmd && rest[0].text != wordBuiltin {
+				break
+			}
+			rest = rest[1:]
+			for len(rest) > 0 && strings.HasPrefix(rest[0].text, "-") {
+				rest = rest[1:]
+			}
+		}
+	}
+	return false
+}
+
+// bracketClass is a glob's bracket expression; a "]" right after the "[" or
+// its negation is a member.
+var bracketClass = regexp.MustCompile(`\[[!^]?\]?[^\]]*\]`)
+
+// globMayNameBuiltin reports whether a glob may expand to a builtin's name,
+// which is "." or made of letters, digits, "_" and "-". A literal byte of any
+// other kind outside a bracket expression rules that out (".rows[].x"). Brace
+// expansion builds any name.
+func globMayNameBuiltin(text string) bool {
+	if open := strings.IndexByte(text, '{'); open >= 0 && strings.Contains(text[open:], "}") {
+		return true
+	}
+	classes := 0
+	rest := bracketClass.ReplaceAllStringFunc(text, func(string) string {
+		classes++
+		return ""
+	})
+	literal := strings.Map(func(r rune) rune {
+		if strings.ContainsRune("*?[]", r) {
+			return -1
+		}
+		return r
+	}, rest)
+	if literal == "." {
+		return classes == 0 && !strings.Contains(rest, "?")
+	}
+	return strings.Trim(literal, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") == ""
+}
+
+// namesPath reports a double-quoted word with a "/" of its own beside plain
+// variable references: one field naming a file, never a builtin.
+func namesPath(w word) bool {
+	rest := variableRef.ReplaceAllString(w.exp, "")
+	return w.double && strings.Contains(rest, "/") && !strings.ContainsAny(rest, "$`")
 }
 
 // bodyLines maps each statement that is a heredoc body line to whether the
@@ -2563,7 +2827,7 @@ func riskyArgs(seg []string) bool {
 		return len(args) > 1 && args[0] == "env" && (slices.Contains(args[1:], "-w") || slices.Contains(args[1:], "-u"))
 	case "uniq", verbXXD:
 		return len(slices.DeleteFunc(slices.Clone(args), func(arg string) bool { return arg != "-" && strings.HasPrefix(arg, "-") })) > 1
-	case "export", "declare", "typeset", "readonly", "local":
+	case wordExport, wordDeclare, wordTypeset, wordReadonly, wordLocal:
 		return slices.ContainsFunc(args, func(arg string) bool {
 			return assignmentPattern.MatchString(arg) && (hijackEnv.MatchString(arg) || credentialPath.MatchString(arg) || expansion.MatchString(arg))
 		})
