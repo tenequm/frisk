@@ -132,10 +132,12 @@ func gitRepos(t *testing.T) string {
 		{"-C", repo, "add", "staged.txt"},
 		{"-C", repo, "update-ref", "refs/remotes/origin/topic", "HEAD"},
 		{"init", "-q", "-b", "trunk", other},
-		{"-C", other, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "init"},
+		{"-C", other, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "other"},
 		{"-C", other, "remote", "add", "origin", "git@git.example.com:team/other.git"},
 		{"-C", other, "update-ref", "refs/remotes/origin/trunk", "HEAD"},
 		{"-C", other, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk"},
+		{"-C", repo, "fetch", "-q", other, "trunk:pr/7"},
+		{"-C", repo, "branch", "-q", "merged", "main"},
 	} {
 		gitDo(t, args...)
 	}
@@ -341,6 +343,38 @@ func TestGitRecords(t *testing.T) {
 			"a write before a discard makes its counts unknown", "echo x > f && git reset --hard",
 			`[{"class":"discard","state":"unknown","subcommand":"reset","uncommitted_files":"unknown","untracked_files":"unknown"}]`,
 			"reset:discard",
+		},
+		{
+			"a deleted branch last set by a fetch", "git branch -D pr/7",
+			`[{"class":"local","deleted_refs":[{"ref":"refs/heads/pr/7","tip_fetched":true,"unique_commits":1}],"state":"current","subcommand":"branch"}]`,
+			"branch:local",
+		},
+		{
+			"a deleted branch whose commits other refs hold", "git branch -d merged",
+			`[{"class":"local","deleted_refs":[{"ref":"refs/heads/merged","unique_commits":0}],"state":"current","subcommand":"branch"}]`,
+			"branch:local",
+		},
+		{
+			"refs deleted together do not hold each other's commits", "git branch -D pr/7 merged main",
+			`[{"class":"local","deleted_refs":[{"ref":"refs/heads/pr/7","tip_fetched":true,"unique_commits":1},` +
+				`{"ref":"refs/heads/merged","unique_commits":0},{"ref":"refs/heads/main","unique_commits":0}],"state":"current","subcommand":"branch"}]`,
+			"branch:local",
+		},
+		{
+			"a missing ref leaves its count unknown", "git tag -d v9",
+			`[{"class":"local","deleted_refs":[{"ref":"refs/tags/v9","unique_commits":"unknown"}],"state":"current","subcommand":"tag"}]`,
+			"tag:local",
+		},
+		{
+			"a remote-tracking deletion names refs/remotes", "git branch -d -r origin/topic",
+			`[{"class":"local","deleted_refs":[{"ref":"refs/remotes/origin/topic","unique_commits":0}],"state":"current","subcommand":"branch"}]`,
+			"branch:local",
+		},
+		{
+			"a commit before a deletion makes its facts unknown", "git commit -m x && git branch -D pr/7",
+			`[{"class":"local","state":"current","subcommand":"commit"},` +
+				`{"class":"local","deleted_refs":[{"ref":"refs/heads/pr/7","unique_commits":"unknown"}],"state":"unknown","subcommand":"branch"}]`,
+			"commit:local,branch:local",
 		},
 		{
 			"a new file before a clean makes its counts unknown", "touch n && git clean -fd",

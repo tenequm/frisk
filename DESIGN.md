@@ -193,7 +193,8 @@ runs in (`-C`, or the directory a literal `cd` led to).
 | field | when | value |
 |-------|------|-------|
 | `subcommand`, `class` | always | as described, or `unknown` |
-| `forced`, `deletes_ref` | class `remote` and every push; otherwise only when true | boolean |
+| `forced`, `deletes_ref` | class `remote` and every push; otherwise only when true, and never on a branch or tag deletion | boolean |
+| `deleted_refs` | a branch or tag deletion | one entry per ref: `ref` (full refname); `unique_commits`, the commits no other ref holds with the refs deleted alongside excluded, from one `rev-list --count`, or `unknown`; `tip_fetched` when the ref's newest reflog entry is a fetch |
 | `no_verify`, `amend`, `config_override` | only when true | `true` |
 | `remote` | push | host/owner/repo of the push URL, or `unknown` |
 | `destination` | push | the branch the arguments name; with no refspec the upstream branch, when the push goes to the upstream's remote; `HEAD` is the current branch; else `unknown` |
@@ -229,7 +230,8 @@ can make it `unknown`, by what the record depends on:
 - a discard's counts hold only while nothing but a `cd` or a git read has run
   before it. Any other earlier segment, git or not, and any redirect to a
   file may have written one: `touch n && git clean -fd` reports `unknown`,
-  never zero.
+  never zero. A deletion's `deleted_refs` follow the same rule, since such a
+  segment may also have moved a ref.
 
 The repository fields are then `unknown` and the ones read from the words
 stay. A remote written as a URL is always read from the words. A dry run

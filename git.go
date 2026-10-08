@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -373,9 +374,10 @@ type gitCommand struct {
 	// upstream, which moves can change, and by the remotes, which rewires can.
 	moves, rewires bool
 
-	remote      string // push: the remote operand, "" when the words name none
-	destination string // push: a branch, gitHead, "" with no refspec, or gitUnknown
-	ambiguous   string // checkout: the lone word that may name a branch or a path
+	remote      string   // push: the remote operand, "" when the words name none
+	destination string   // push: a branch, gitHead, "" with no refspec, or gitUnknown
+	ambiguous   string   // checkout: the lone word that may name a branch or a path
+	deletedRefs []string // branch or tag deletion: the full refnames it removes
 }
 
 // gitArgs is what follows the subcommand, split at "--".
@@ -514,12 +516,30 @@ func (g *gitCommand) describeArgs(words []string) {
 	case subBranch:
 		g.deletesRef = a.has("-d", "-D", flagDelete)
 		g.forced = g.forced || a.has("-D", "-M", "-C")
+		prefix := "refs/heads/"
+		if a.has("-r", "--remotes") {
+			prefix = "refs/remotes/"
+		}
+		if g.deletesRef {
+			g.deletedRefs = refnames(prefix, a.operands)
+		}
 	case subTag:
 		g.deletesRef = a.has("-d", flagDelete)
+		if g.deletesRef {
+			g.deletedRefs = refnames("refs/tags/", a.operands)
+		}
 	case subPush, "fetch", "pull":
 		g.describeRefspecs(a)
 	default:
 	}
+}
+
+func refnames(prefix string, names []string) []string {
+	refs := make([]string, 0, len(names))
+	for _, name := range names {
+		refs = append(refs, prefix+name)
+	}
+	return refs
 }
 
 // describeRefspecs reads the remote and refspec operands of push, fetch and
@@ -750,13 +770,15 @@ func gitFacts(segments, env [][]string, cwd string) (map[string]any, string) {
 			// moved the branch if the push leaves its remote or destination to
 			// the branch.
 			byBranch := cmd.remote == "" || cmd.destination == "" || cmd.destination == gitHead
-			stale := cmd.subcommand == subPush && (rewired || moved && byBranch) || cmd.class == gitDiscard && changed
+			stale := cmd.subcommand == subPush && (rewired || moved && byBranch) ||
+				(cmd.class == gitDiscard || len(cmd.deletedRefs) > 0) && changed
 			targets = append(targets, gitTarget{cmd: cmd, dir: at.path, current: at.known && !stale})
 			moved = moved || cmd.moves
 			rewired = rewired || cmd.rewires || cmd.class == gitExec || cmd.class == gitUnknown
 		}
-		// A discard's counts hold only while nothing but a cd or a git read has
-		// run before it: any other segment, or a redirect, may have written a file.
+		// A discard's counts and a deletion's ref facts hold only while nothing
+		// but a cd or a git read has run before it: any other segment, or a
+		// redirect, may have written a file or moved a ref.
 		redirects := slices.ContainsFunc(seg, func(w string) bool { return strings.Contains(w, ">") })
 		changed = changed || !isGit || cmd.class != gitRead || redirects
 		inner, _, err := unwrap(seg)
@@ -830,15 +852,18 @@ func (g *gitCommand) settleCheckout(dir string, git gitRunner) {
 }
 
 // record renders one git command for the judge: what its words say, then
-// what its repository says about a push or a discard.
+// what its repository says about a push, a discard or a ref deletion.
 func (t gitTarget) record(git gitRunner) map[string]any {
 	c := t.cmd
 	rec := map[string]any{"subcommand": c.subcommand, "class": c.class, "state": gitUnknown}
 	if t.current {
 		rec["state"] = "current"
 	}
+	// A ref deletion reports what it loses in deleted_refs instead: forced and
+	// deletes_ref read as a push's, which a local deletion is not.
+	local := len(c.deletedRefs) > 0
 	for name, on := range map[string]bool{
-		"forced": c.forced, "deletes_ref": c.deletesRef, "no_verify": c.noVerify,
+		"forced": c.forced && !local, "deletes_ref": c.deletesRef && !local, "no_verify": c.noVerify,
 		"amend": c.amend, "config_override": c.override,
 	} {
 		if on {
@@ -865,7 +890,40 @@ func (t gitTarget) record(git gitRunner) map[string]any {
 	if c.class == gitDiscard {
 		t.discardCounts(rec, git)
 	}
+	if local {
+		rec["deleted_refs"] = t.deletedRefFacts(git)
+	}
 	return rec
+}
+
+// deletedRefFacts says, per ref, whether deleting it loses commits:
+// unique_commits counts those no other ref holds, refs deleted alongside it
+// excluded, and tip_fetched marks a ref last set by a fetch, whose commits the
+// remote holds. Out of time, the count stays unknown.
+func (t gitTarget) deletedRefFacts(git gitRunner) []map[string]any {
+	others := make([]string, 0, len(t.cmd.deletedRefs)+2)
+	others = append(others, "--not")
+	for _, ref := range t.cmd.deletedRefs {
+		others = append(others, "--exclude="+ref)
+	}
+	others = append(others, "--all")
+	facts := make([]map[string]any, 0, len(t.cmd.deletedRefs))
+	for _, ref := range t.cmd.deletedRefs {
+		fact := map[string]any{"ref": ref, "unique_commits": gitUnknown}
+		facts = append(facts, fact)
+		if !t.current || !gitRef.MatchString(ref) {
+			continue
+		}
+		if out, ok := git(t.dir, slices.Concat([]string{"rev-list", "--count", ref}, others)...); ok {
+			if n, err := strconv.Atoi(out); err == nil {
+				fact["unique_commits"] = n
+			}
+		}
+		if subject, ok := git(t.dir, "reflog", "show", "-n1", "--format=%gs", ref); ok && strings.HasPrefix(subject, "fetch") {
+			fact["tip_fetched"] = true
+		}
+	}
+	return facts
 }
 
 // discardCounts adds what a discard could destroy: tracked files with
