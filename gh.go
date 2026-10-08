@@ -2,7 +2,6 @@ package main
 
 import (
 	"cmp"
-	"context"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -15,28 +14,30 @@ const (
 	ghMerge       = "merge"       // merges or approves a pull request
 )
 
-const ghAPI = "api"
-
 const (
+	ghAPI                 = "api"
+	ghSetDefault          = "repo set-default"
+	ghDefaultHost         = "github.com"
+	ghPRReview            = "pr review"
 	ghCommandsInstruction = " `gh.commands` lists each gh command in `untrusted.command`, in order, as read from its " +
 		"words and checked against its repository: `subcommand`, `class` (read, local, collaborate, merge, remote, " +
-		"exec or unknown) and `repo`, the host/owner/repo it acts on. It is trusted. A field whose value is " +
-		"`unknown` could not be determined."
+		"exec or unknown) and `repo`, the host/owner/repo it acts on, which for a gh command outranks `git.remote`. " +
+		"It is trusted. A field whose value is `unknown` could not be determined."
 	ghTruncatedInstruction = " `gh.commands_truncated` means the command holds more gh commands than are listed."
 )
 
 type ghSub struct {
-	class string
-	repo  bool // acts on one repository: -R, GH_REPO or the checkout's remote
+	class  string
+	scoped bool // acts on one repository: named in the words, or the checkout's
 }
 
 // ghSubs classes gh by "group verb", or by group alone where every verb
 // shares a class. Anything missing, a user alias or an extension, is unknown.
 var ghSubs = func() map[string]ghSub {
 	subs := map[string]ghSub{}
-	add := func(class string, repo bool, names ...string) {
+	add := func(class string, scoped bool, names ...string) {
 		for _, name := range names {
-			subs[name] = ghSub{class: class, repo: repo}
+			subs[name] = ghSub{class: class, scoped: scoped}
 		}
 	}
 	add(gitRead, true,
@@ -48,10 +49,10 @@ var ghSubs = func() map[string]ghSub {
 		"search", "status", "org list", "repo list", "gist view", "gist list", "auth status", "config get",
 		"config list", "alias list", "extension list", "extension search", "extension browse", "completion",
 		"version", "help")
-	add(gitLocal, true, "pr checkout", "run download", "release download", "repo set-default")
+	add(gitLocal, true, "pr checkout", "run download", "release download", ghSetDefault)
 	add(gitLocal, false, "repo clone", "gist clone", "config set", "config clear-cache")
 	add(ghCollaborate, true,
-		"pr create", "pr edit", "pr comment", "pr review", "pr ready", "pr close", "pr reopen", "pr lock",
+		"pr create", "pr edit", "pr comment", ghPRReview, "pr ready", "pr close", "pr reopen", "pr lock",
 		"pr unlock", "pr update-branch", "pr revert", "issue create", "issue edit", "issue comment",
 		"issue close", "issue reopen", "issue lock", "issue unlock", "issue pin", "issue unpin",
 		"issue transfer", "issue develop", "run rerun", "run cancel")
@@ -70,20 +71,95 @@ var ghSubs = func() map[string]ghSub {
 	return subs
 }()
 
-// ghValueFlags take the next word as their value when it is not attached:
-// the repository flag and the flags of the two commands whose operand names
-// a repository, api and repo clone. A short flag means another thing in other
-// commands, so the list stops there.
-var ghValueFlags = []string{
-	"-R", "--repo", "-q", "--jq", "-t", "--template", "-X", "--method", "-H", "--header", "-f", "--raw-field",
-	"-F", "--field", "--input", "-p", "--preview", "--cache", "--hostname", "-u", "--upstream-remote-name",
+// ghValueFlags names, per gh command, the flags beyond ghTextFlags that take
+// a value. Every command shares -R/--repo, -q/--jq, --template and --json. The
+// lists are complete where a value hides what the record reads: api's
+// endpoint and fields, the approve flag of pr review, the key of config set.
+var ghValueFlags = map[string][]string{
+	ghAPI: {
+		"-X", "--method", "-H", "--header", "-f", "--raw-field", "-F", "--field", "--input", "-p", "--preview",
+		"--cache", "--hostname", "-t",
+	},
+	ghPRReview:   {"-F", "--body-file"},
+	"pr merge":   {"-F", "--body-file", "-A", "--author-email", "--match-head-commit"},
+	"repo clone": {"-u", "--upstream-remote-name"},
+	"config set": {"-h", "--host"},
 }
+
+var ghSharedValueFlags = []string{"-R", "--repo", "-q", "--jq", "--template", "--json"}
+
+// ghProgramKeys are gh config keys that name a program gh runs later.
+var ghProgramKeys = []string{"editor", "pager", "browser"}
 
 type ghCommand struct {
 	subcommand string
 	class      string
-	scoped     bool   // acts on one repository, named or the checkout's
-	repo       string // from the words: -R, GH_REPO or an api endpoint; "" when they name none
+	scoped     bool
+	// repos are the repositories the words name, which must all agree.
+	// checkout adds the checkout's repository to them: the words name none
+	// for certain, or name one where a misread flag could have put it.
+	repos    []string
+	checkout bool
+}
+
+// ghArgs is a gh command's words after the subcommand, as gh's flag parser
+// splits them: short flags unbundled, a value flag taking the rest of its
+// word or the next one.
+type ghArgs struct {
+	values   map[string][]string // every value of each flag, in order; a flag without one maps to "true"
+	operands []string
+	repoFlag string // the last -R or --repo value, which is the one gh keeps
+}
+
+func (a ghArgs) has(names ...string) bool {
+	return slices.ContainsFunc(names, func(name string) bool { return len(a.values[name]) > 0 })
+}
+
+func parseGHArgs(sub string, words []string) ghArgs {
+	takes := slices.Concat(ghSharedValueFlags, ghTextFlags[sub], ghValueFlags[sub])
+	a := ghArgs{values: map[string][]string{}}
+	set := func(name, value string) {
+		a.values[name] = append(a.values[name], value)
+		if name == "-R" || name == "--repo" {
+			a.repoFlag = value
+		}
+	}
+	for i := 0; i < len(words); i++ {
+		w := words[i]
+		switch {
+		case w == "--":
+			a.operands = append(a.operands, words[i+1:]...)
+			return a
+		case strings.HasPrefix(w, "--"):
+			name, value, attached := strings.Cut(w, "=")
+			if !attached && slices.Contains(takes, name) && i+1 < len(words) {
+				i++
+				value, attached = words[i], true
+			}
+			if !attached {
+				value = "true"
+			}
+			set(name, value)
+		case len(w) > 1 && w[0] == '-':
+			for j := 1; j < len(w); j++ {
+				name := "-" + w[j:j+1]
+				if !slices.Contains(takes, name) {
+					set(name, "true")
+					continue
+				}
+				value := strings.TrimPrefix(w[j+1:], "=")
+				if value == "" && i+1 < len(words) {
+					i++
+					value = words[i]
+				}
+				set(name, value)
+				break
+			}
+		default:
+			a.operands = append(a.operands, w)
+		}
+	}
+	return a
 }
 
 // describeGH reads one segment as a gh invocation. Like describeGit it opens
@@ -94,9 +170,13 @@ func describeGH(seg []string) (ghCommand, bool) {
 		return ghCommand{}, false
 	}
 	g := ghCommand{subcommand: gitUnknown, class: gitUnknown}
+	host, envRepo := ghDefaultHost, ""
 	for _, w := range seg[:len(seg)-len(inner)] {
+		if value, ok := strings.CutPrefix(w, "GH_HOST="); ok {
+			host = value
+		}
 		if value, ok := strings.CutPrefix(w, "GH_REPO="); ok {
-			g.repo = ghRepoSlug(value)
+			envRepo = value
 		}
 	}
 	args := inner[1:]
@@ -111,98 +191,158 @@ func describeGH(seg []string) (ghCommand, bool) {
 		}
 	}
 	if name == ghAPI {
-		sub, known = ghSub{class: ghAPIClass(rest)}, true
+		sub, known = ghSub{}, true
 	}
 	if !known {
 		return g, true
 	}
-	g.subcommand, g.class, g.scoped = name, sub.class, sub.repo
-	flags, operands := ghWords(rest)
-	if r, ok := flags["-R"]; ok {
-		g.repo = ghRepoSlug(r)
-	} else if r, ok := flags["--repo"]; ok {
-		g.repo = ghRepoSlug(r)
+	g.subcommand, g.class, g.scoped = name, sub.class, sub.scoped
+	a := parseGHArgs(name, rest)
+	if hostnames := a.values["--hostname"]; len(hostnames) > 0 {
+		host = hostnames[len(hostnames)-1]
 	}
+	slug := func(value string) string { return ghRepoSlug(value, host) }
+
 	switch {
-	case name == "pr review" && (flags["-a"] != "" || flags["--approve"] != ""):
-		g.class = ghMerge
-	case name == ghAPI && len(operands) > 0:
-		endpoint := strings.TrimPrefix(operands[0], "/")
-		if owner, rest, ok := strings.Cut(strings.TrimPrefix(endpoint, "repos/"), "/"); ok && strings.HasPrefix(endpoint, "repos/") {
-			repo, _, _ := strings.Cut(rest, "/")
-			// {owner} and {repo} are filled from the checkout, like no -R.
+	case name == ghAPI:
+		g.class = ghAPIClass(rest, a)
+		if endpoint, ok := strings.CutPrefix(strings.TrimPrefix(firstOf(a.operands), "/"), "repos/"); ok {
+			owner, repo, _ := strings.Cut(endpoint, "/")
+			repo, _, _ = strings.Cut(repo, "/")
 			g.scoped = true
-			if !strings.Contains(owner+repo, "{") {
-				g.repo = "github.com/" + owner + "/" + repo
+			// {owner} and {repo} are filled from the checkout, like no -R.
+			if strings.Contains(owner+repo, "{") {
+				g.checkout = true
+			} else {
+				g.repos = append(g.repos, slug(owner+"/"+repo))
 			}
 		}
-	case name == "repo clone" && len(operands) > 0:
-		g.repo = ghRepoSlug(operands[0])
+	case name == ghPRReview && a.has("-a", "--approve"):
+		g.class = ghMerge
+	case name == "pr close" && a.has("-d", "--delete-branch"):
+		g.class = gitRemote
+	case name == "auth status" && a.has("-t", "--show-token"):
+		g.class = gitExec
+	case name == "config set" && slices.Contains(ghProgramKeys, firstOf(a.operands)):
+		g.class = gitExec
 	default:
 	}
-	for _, flag := range []string{"-q", "--jq"} {
-		if jqProgram.MatchString(flags[flag]) {
+	for _, filter := range slices.Concat(a.values["-q"], a.values["--jq"]) {
+		if jqProgram.MatchString(filter) {
 			g.class = gitExec
 		}
 	}
+
+	// gh keeps the last -R, which outranks GH_REPO; a pull request, issue or
+	// repository given right after the subcommand outranks both.
+	named := false
+	if a.repoFlag != "" {
+		g.repos, named = append(g.repos, slug(a.repoFlag)), true
+	} else if envRepo != "" {
+		g.repos, named = append(g.repos, slug(envRepo)), true
+	}
+	if len(rest) > 0 && ghRepoShaped(name, rest[0]) {
+		g.repos, named = append(g.repos, slug(rest[0])), true
+	}
+	// A repository-shaped word anywhere else may be a selector behind a flag
+	// frisk reads as taking no value, or a value frisk reads as a selector.
+	for _, w := range rest[min(1, len(rest)):] {
+		if ghRepoShaped(name, w) {
+			g.repos = append(g.repos, slug(w))
+			g.checkout = g.checkout || !named
+		}
+	}
+	g.checkout = g.checkout || g.scoped && len(g.repos) == 0
 	return g, true
 }
 
-// ghWords splits a gh command's words into flag values and operands. A flag
-// without a value maps to "true".
-func ghWords(words []string) (map[string]string, []string) {
-	flags := map[string]string{}
-	var operands []string
-	for i := 0; i < len(words); i++ {
-		w := words[i]
-		switch {
-		case w == "--":
-			return flags, append(operands, words[i+1:]...)
-		case strings.HasPrefix(w, "-"):
-			name, value, attached := strings.Cut(w, "=")
-			if !attached && len(name) > 2 && name[1] != '-' && slices.Contains(ghValueFlags, name[:2]) {
-				name, value, attached = name[:2], name[2:], true // -Rowner/repo
-			}
-			if !attached && slices.Contains(ghValueFlags, name) && i+1 < len(words) {
-				i++
-				value, attached = words[i], true
-			}
-			if !attached {
-				value = "true"
-			}
-			flags[name] = value
-		default:
-			operands = append(operands, w)
-		}
+func firstOf(words []string) string {
+	if len(words) == 0 {
+		return ""
 	}
-	return flags, operands
+	return words[0]
 }
 
-// ghAPIClass reads gh api: a GET, or a GraphQL query with no mutation and no
-// query file, only reads.
-func ghAPIClass(args []string) string {
-	graphql := slices.Contains(args, "graphql")
-	switch {
-	case !graphql && ghAPIReads(args):
-		return gitRead
-	case graphql && slices.ContainsFunc(args, func(a string) bool { return strings.Contains(a, "=@") }):
-		return gitUnknown
-	case graphql && !slices.ContainsFunc(args, func(a string) bool { return strings.Contains(a, "mutation") }):
-		return gitRead
-	default:
+// ghRepoShaped reports a word that names a repository for this command: a
+// URL anywhere, and OWNER/REPO where a repo or clone command takes one.
+func ghRepoShaped(sub, w string) bool {
+	if strings.HasPrefix(w, "https://") || strings.HasPrefix(w, "http://") {
+		return !strings.ContainsAny(w, " \t\n")
+	}
+	return strings.HasPrefix(sub, "repo ") && !strings.HasPrefix(w, "-") && strings.Count(w, "/") >= 1 && strings.Count(w, "/") <= 2 &&
+		!strings.ContainsAny(w, " \t\n:")
+}
+
+// ghAPIClass reads gh api: a GET, or a GraphQL query written inline with no
+// mutation, only reads. A query from a file, stdin or a variable stays unknown.
+func ghAPIClass(rest []string, a ghArgs) string {
+	if firstOf(a.operands) != "graphql" {
+		if ghAPIReads(rest) {
+			return gitRead
+		}
 		return gitRemote
 	}
+	var queries []string
+	for _, field := range slices.Concat(a.values["-f"], a.values["--raw-field"], a.values["-F"], a.values["--field"]) {
+		if query, ok := strings.CutPrefix(field, "query="); ok {
+			queries = append(queries, query)
+		}
+	}
+	switch {
+	case a.has("--input"), len(queries) == 0,
+		slices.ContainsFunc(queries, func(q string) bool { return strings.HasPrefix(q, "@") || strings.Contains(q, "$") }):
+		return gitUnknown
+	case slices.ContainsFunc(queries, func(q string) bool { return strings.Contains(strings.ToLower(q), "mutation") }):
+		return gitRemote
+	default:
+		return gitRead
+	}
 }
 
-// ghRepoSlug reduces a -R or GH_REPO value (OWNER/REPO, HOST/OWNER/REPO or a
-// URL) to host/owner/repo.
-func ghRepoSlug(value string) string {
+// ghAPIReads reports a gh api call that can only send a GET. gh switches to
+// POST as soon as a field or an input body is given, and GraphQL needs one.
+func ghAPIReads(args []string) bool {
+	for i, a := range args {
+		name, value, attached := strings.Cut(a, "=")
+		short := len(a) > 1 && a[0] == '-' && a[1] != '-'
+		switch {
+		case a == "graphql", abbreviates(name, "--field"), abbreviates(name, "--raw-field"),
+			abbreviates(name, "--input"), short && strings.ContainsAny(a, "fF"):
+			return false
+		case abbreviates(name, "--method"):
+		case short && strings.Contains(a, "X"):
+			// Bundled or attached: -iX GET, -XGET, -X=GET.
+			value = strings.TrimPrefix(a[strings.IndexByte(a, 'X')+1:], "=")
+			attached = value != ""
+		default:
+			continue
+		}
+		if !attached && i+1 < len(args) {
+			value = args[i+1]
+		}
+		if value != "GET" {
+			return false
+		}
+	}
+	return true
+}
+
+// ghRepoSlug reduces a -R, GH_REPO or selector value (OWNER/REPO,
+// HOST/OWNER/REPO or a URL) to host/owner/repo; OWNER/REPO takes host.
+func ghRepoSlug(value, host string) string {
 	if strings.Contains(value, "://") || strings.Contains(value, "@") {
-		return remoteSlug(value)
+		u := remoteSlug(value)
+		h, path, _ := strings.Cut(u, "/")
+		owner, repo, _ := strings.Cut(path, "/")
+		repo, _, _ = strings.Cut(repo, "/") // a pull request or issue URL goes on past the repository
+		if h == "" || owner == "" || repo == "" {
+			return ""
+		}
+		return h + "/" + owner + "/" + repo
 	}
 	switch parts := strings.Split(strings.TrimSuffix(value, ".git"), "/"); len(parts) {
 	case 2:
-		return "github.com/" + strings.Join(parts, "/")
+		return host + "/" + strings.Join(parts, "/")
 	case 3:
 		return strings.Join(parts, "/")
 	default:
@@ -210,77 +350,109 @@ func ghRepoSlug(value string) string {
 	}
 }
 
-// ghFacts records each gh segment for the judge, reading the repository a
-// command leaves to the checkout the way gh picks it: the remote that
-// `gh repo set-default` marked, else the only remote. The string is the
-// records in short, for the log.
-func ghFacts(segments, env [][]string, cwd string) (map[string]any, []string) {
-	ctx, cancel := context.WithTimeout(context.Background(), gitFactsTimeout)
-	defer cancel()
-	git := newGitRunner(ctx)
-	resolved := map[string]string{}
-	dir := shellDir{path: cwd, known: cwd != ""}
-	var commands []map[string]any
-	var summary []string
-	truncated, rewired := false, false
-	for i, seg := range segments {
-		if len(seg) > 0 && dir.step(seg) {
-			continue
-		}
-		words := slices.Concat(env[i], seg)
-		if g, isGit := describeGit(words); isGit {
-			rewired = rewired || g.rewires || g.class == gitExec || g.class == gitUnknown
-			continue
-		}
-		g, isGH := describeGH(words)
-		if !isGH {
-			continue
-		}
-		if len(commands) == maxGitCommands {
-			truncated = true
-			break
-		}
-		rec := map[string]any{"subcommand": g.subcommand, "class": g.class}
-		if g.scoped || g.repo != "" {
-			repo := g.repo
-			if repo == "" && dir.known && !rewired {
-				if _, seen := resolved[dir.path]; !seen {
-					resolved[dir.path] = ghCheckoutRepo(dir.path, git)
-				}
-				repo = resolved[dir.path]
-			}
-			rec["repo"] = cmp.Or(repo, gitUnknown)
-		}
-		commands = append(commands, rec)
-		summary = append(summary, "gh "+g.subcommand+":"+g.class)
-		rewired = rewired || g.subcommand == "repo set-default" || g.class == gitExec || g.class == gitUnknown
-	}
-	if len(commands) == 0 {
+// ghTarget is one gh segment and the directory it runs in.
+type ghTarget struct {
+	cmd ghCommand
+	dir string
+	// current: the checkout's repository read in dir still holds when the
+	// segment runs: no earlier segment can have changed the remotes, the gh
+	// default or GH_REPO and GH_HOST.
+	current bool
+}
+
+// ghEnvWord matches a word that sets or unsets GH_REPO or GH_HOST for the
+// segments after it.
+func ghEnvWord(w string) bool {
+	return strings.HasPrefix(w, "GH_REPO") || strings.HasPrefix(w, "GH_HOST")
+}
+
+// ghRecords renders the gh segments for the judge, reading each checkout's
+// repository once with the git runner gitFacts shares.
+func ghRecords(targets []ghTarget, git gitRunner) (map[string]any, []string) {
+	if len(targets) == 0 {
 		return nil, nil
 	}
-	facts := map[string]any{"commands": commands}
-	if truncated {
-		facts["commands_truncated"] = true
+	resolved := map[string]string{}
+	commands := make([]map[string]any, 0, min(len(targets), maxGitCommands))
+	summary := make([]string, 0, cap(commands))
+	facts := map[string]any{}
+	for i, t := range targets {
+		if i == maxGitCommands {
+			facts["commands_truncated"] = true
+			break
+		}
+		c := t.cmd
+		rec := map[string]any{"subcommand": c.subcommand, "class": c.class}
+		if c.scoped || len(c.repos) > 0 {
+			rec["repo"] = t.repo(git, resolved)
+		}
+		commands = append(commands, rec)
+		summary = append(summary, "gh "+c.subcommand+":"+c.class)
 	}
+	facts["commands"] = commands
 	return facts, summary
 }
 
+// repo is the repository every source agrees on, or unknown. resolved
+// caches the checkout's repository per directory.
+func (t ghTarget) repo(git gitRunner, resolved map[string]string) string {
+	repos := t.cmd.repos
+	if t.cmd.checkout {
+		checkout := ""
+		if t.current {
+			if _, seen := resolved[t.dir]; !seen {
+				resolved[t.dir] = ghCheckoutRepo(t.dir, git)
+			}
+			checkout = resolved[t.dir]
+		}
+		repos = append(slices.Clone(repos), checkout)
+	}
+	if len(repos) == 0 || repos[0] == "" || slices.ContainsFunc(repos, func(r string) bool { return r != repos[0] }) {
+		return gitUnknown
+	}
+	return repos[0]
+}
+
+// ghRemoteScore is gh's preference among remotes: upstream, then github,
+// then origin, then the rest in config order.
+func ghRemoteScore(name string) int {
+	return map[string]int{"upstream": 3, "github": 2, "origin": 1}[strings.ToLower(name)]
+}
+
 // ghCheckoutRepo is the repository gh acts on in dir when the words name
-// none, or "" when gh would have to ask.
+// none: the one `gh repo set-default` recorded on a remote ("base" for the
+// remote's own, else OWNER/REPO on its host), else the only remote. "" when gh
+// would have to choose. One git call reads every remote's URL and mark.
 func ghCheckoutRepo(dir string, git gitRunner) string {
-	name := ""
-	if out, ok := git(dir, "config", "--get-regexp", `^remote\..*\.gh-resolved$`); ok {
-		key, _, _ := strings.Cut(out, " ")
-		name = strings.TrimSuffix(strings.TrimPrefix(key, "remote."), ".gh-resolved")
-	} else if out, ok := git(dir, "remote"); ok && out != "" && !strings.Contains(out, "\n") {
-		name = out
-	}
-	if name == "" {
-		return ""
-	}
-	url, ok := git(dir, "remote", "get-url", name)
+	out, ok := git(dir, "config", "--get-regexp", `^remote\.`)
 	if !ok {
 		return ""
 	}
-	return remoteSlug(url)
+	var names []string
+	urls, marks := map[string]string{}, map[string]string{}
+	for line := range strings.SplitSeq(out, "\n") {
+		key, value, _ := strings.Cut(line, " ")
+		key = strings.TrimPrefix(key, "remote.")
+		if name, ok := strings.CutSuffix(key, ".url"); ok {
+			names, urls[name] = append(names, name), value
+		} else if name, ok := strings.CutSuffix(key, ".gh-resolved"); ok {
+			marks[name] = value
+		}
+	}
+	slices.SortStableFunc(names, func(a, b string) int { return ghRemoteScore(b) - ghRemoteScore(a) })
+	for _, name := range names {
+		slug := remoteSlug(urls[name])
+		switch mark := marks[name]; {
+		case mark == "base":
+			return slug
+		case mark != "":
+			host, _, _ := strings.Cut(slug, "/")
+			return ghRepoSlug(mark, cmp.Or(host, ghDefaultHost))
+		default:
+		}
+	}
+	if len(names) == 1 {
+		return remoteSlug(urls[names[0]])
+	}
+	return ""
 }

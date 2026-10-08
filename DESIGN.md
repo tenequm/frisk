@@ -194,7 +194,7 @@ runs in (`-C`, or the directory a literal `cd` led to).
 |-------|------|-------|
 | `subcommand`, `class` | always | as described, or `unknown` |
 | `forced`, `deletes_ref` | class `remote` and every push; otherwise only when true, and never on a branch or tag deletion | boolean |
-| `deleted_refs` | a branch or tag deletion | one entry per ref: `ref` (full refname); `unique_commits`, the commits no other ref holds with the refs deleted alongside excluded, from one `rev-list --count`, or `unknown`; `tip_fetched` when the ref's newest reflog entry is a fetch |
+| `deleted_refs` | a branch or tag deletion | one entry per ref: `ref` (full refname); `unique_commits`, the commits no other ref holds with the refs deleted alongside excluded, or `unknown` (out of time, or past the first five refs) - one `rev-list --count` over all of them settles the usual 0, and only a non-zero total is counted per ref; `tip_fetched` when the ref's newest reflog entry is a fetch |
 | `no_verify`, `amend`, `config_override` | only when true | `true` |
 | `remote` | push | host/owner/repo of the push URL, or `unknown` |
 | `destination` | push | the branch the arguments name; with no refspec the upstream branch, when the push goes to the upstream's remote; `HEAD` is the current branch; else `unknown` |
@@ -246,24 +246,28 @@ The lookups change nothing: git runs with `--no-optional-locks` and
 starts a program its config names.
 
 `gh.commands` does the same for gh, five at most (`gh.commands_truncated`
-marks a longer command), read offline in `gh.go` - no network call, so no
-pull request's base branch or author:
+marks a longer command), built in the same walk and under the same deadline
+(`gh.go`). It is read offline - no network call, so no pull request's base
+branch or author - and the words are split the way gh's flag parser splits
+them: short flags unbundled, and a value flag taking the rest of its word or
+the next one, from a per-command list that is complete where a value hides
+what the record reads.
 
 | field | when | value |
 |-------|------|-------|
 | `subcommand`, `class` | always | `pr checks`, `api`, ...; a class from the table, or `unknown` for an alias, an extension or a missing pair |
-| `repo` | a command on one repository, or one whose words name it | host/owner/repo from `-R`/`--repo`, a `GH_REPO=` prefix, an `api` endpoint under `repos/`, or the checkout: the remote `gh repo set-default` marked, else the only remote; `unknown` when gh would have to ask or an earlier segment may have changed the remotes |
+| `repo` | a command on one repository, or one whose words name it | host/owner/repo from the last `-R`/`--repo` (over a `GH_REPO=` prefix), a URL or, for `repo` commands, an `OWNER/REPO` right after the subcommand, an `api` endpoint under `repos/`, or the checkout: the remote `gh repo set-default` marked (`base`, or `OWNER/REPO` on that remote's host; upstream, github, origin first, as gh orders them), else the only remote. `--hostname` or a `GH_HOST=` prefix sets the host of an `OWNER/REPO`. Every source must agree: a URL or repository elsewhere in the words also counts the checkout, since a flag frisk reads as taking no value may have hidden a selector. `unknown` on any disagreement, when gh would have to choose a remote, or once an earlier segment may have changed the remotes, the gh default, `GH_REPO` or `GH_HOST`. A `GH_REPO` or `GH_HOST` already exported in the session is not visible |
 
 The classes reuse git's where the meaning carries over and add two:
 
 | class | gh commands |
 |-------|-------------|
-| `read` | `pr view/list/checks/diff/status`, `issue view/list/status`, `run view/list/watch`, `release view/list`, `repo view/list`, `workflow view/list`, `search`, `status`, `browse`, list and get commands, `api` with a GET or a GraphQL query without `mutation` |
-| `local` | `pr checkout`, `run download`, `release download`, `repo clone`, `repo set-default`, `config set` |
+| `read` | `pr view/list/checks/diff/status`, `issue view/list/status`, `run view/list/watch`, `release view/list`, `repo view/list`, `workflow view/list`, `search`, `status`, `browse`, list and get commands, `api` with a GET or an inline GraphQL query without `mutation` (a query from a file, stdin or a variable is `unknown`) |
+| `local` | `pr checkout`, `run download`, `release download`, `repo clone`, `repo set-default`, `config set` of a key that names no program |
 | `collaborate` | pull requests, issues and comments: create, edit, comment, review, ready, close, reopen; `run rerun/cancel` |
-| `merge` | `pr merge`, and `pr review --approve` |
-| `remote` | every other change on GitHub: releases, repository settings, labels, secrets, variables, `workflow run`, `api` writes |
-| `exec` | `auth` changes and `auth token`, extensions, aliases, and a `--jq` filter that reads the environment |
+| `merge` | `pr merge`, and `pr review` with `-a`/`--approve`, bundled or not |
+| `remote` | every other change on GitHub: releases, repository settings, labels, secrets, variables, `workflow run`, `pr close --delete-branch`, `api` writes |
+| `exec` | `auth` changes, `auth token` and `auth status --show-token`, extensions, aliases, `config set` of `editor`, `pager` or `browser`, and a `--jq` filter that reads the environment |
 
 The builtin prose decides gh commands from these records: `read` and `local`
 anywhere, `collaborate` on any repository, `merge` on the user's own; `merge`

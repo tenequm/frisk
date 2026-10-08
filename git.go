@@ -516,11 +516,11 @@ func (g *gitCommand) describeArgs(words []string) {
 	case subBranch:
 		g.deletesRef = a.has("-d", "-D", flagDelete)
 		g.forced = g.forced || a.has("-D", "-M", "-C")
-		prefix := "refs/heads/"
-		if a.has("-r", "--remotes") {
-			prefix = "refs/remotes/"
-		}
 		if g.deletesRef {
+			prefix := "refs/heads/"
+			if a.has("-r", "--remotes") {
+				prefix = "refs/remotes/"
+			}
 			g.deletedRefs = refnames(prefix, a.operands)
 		}
 	case subTag:
@@ -699,8 +699,9 @@ func gitArgClass(sub string, a gitArgs) string {
 	}
 }
 
-// maxGitCommands caps the records sent for one command: each costs git calls
-// inside gitFactsTimeout and tokens in every judge request.
+// maxGitCommands caps the git records sent for one command, the gh records,
+// and the refs one deletion counts: each costs git calls inside
+// gitFactsTimeout and tokens in every judge request.
 const maxGitCommands = 5
 
 // Sentences added to the judge instructions when the state carries the field.
@@ -742,9 +743,11 @@ type gitTarget struct {
 type pushTarget struct{ remote, destination, isDefault string }
 
 // gitFacts reports what a git or gh command would act on, read from the
-// directory that command runs in, plus one record per git segment. A field
-// that cannot be read is omitted or unknown, never guessed; commands without
-// git or gh get nothing. The string is the records in short, for the log.
+// directory that command runs in, plus one record per git segment and one per
+// gh segment, all under one gitFactsTimeout. It returns the judge state's
+// "git" and "gh" entries. A field that cannot be read is omitted or unknown,
+// never guessed; commands without git or gh get nothing. The string is the
+// records in short, for the log.
 func gitFacts(segments, env [][]string, cwd string) (map[string]any, string) {
 	ctx, cancel := context.WithTimeout(context.Background(), gitFactsTimeout)
 	defer cancel()
@@ -752,14 +755,21 @@ func gitFacts(segments, env [][]string, cwd string) (map[string]any, string) {
 
 	dir := shellDir{path: cwd, known: cwd != ""}
 	var targets []gitTarget
+	var ghTargets []ghTarget
 	var base *shellDir
-	moved, rewired, changed := false, false, false
+	moved, rewired, changed, ghStale := false, false, false, false
 	for i, seg := range segments {
 		if len(seg) > 0 && dir.step(seg) {
 			continue
 		}
 		at := dir
-		cmd, isGit := describeGit(slices.Concat(env[i], seg))
+		words := slices.Concat(env[i], seg)
+		cmd, isGit := describeGit(words)
+		var gh ghCommand
+		isGH := false
+		if !isGit {
+			gh, isGH = describeGH(words)
+		}
 		if isGit {
 			for _, d := range cmd.dirs {
 				at.path, at.known = at.resolve(d)
@@ -781,13 +791,18 @@ func gitFacts(segments, env [][]string, cwd string) (map[string]any, string) {
 			moved = moved || cmd.moves
 			rewired = rewired || cmd.rewires || cmd.class == gitExec || cmd.class == gitUnknown
 		}
+		if isGH {
+			ghTargets = append(ghTargets, ghTarget{cmd: gh, dir: at.path, current: at.known && !rewired && !ghStale})
+			ghStale = ghStale || gh.subcommand == ghSetDefault || gh.class == gitExec || gh.class == gitUnknown
+		} else if !isGit && slices.ContainsFunc(seg, ghEnvWord) {
+			ghStale = true
+		}
 		// A discard's counts and a deletion's ref facts hold only while nothing
 		// but a cd or a git read has run before it: any other segment, or a
 		// redirect, may have written a file or moved a ref.
 		redirects := slices.ContainsFunc(seg, func(w string) bool { return strings.Contains(w, ">") })
 		changed = changed || !isGit || cmd.class != gitRead || redirects
-		inner, _, err := unwrap(seg)
-		if base == nil && (isGit || err == nil && len(inner) > 0 && filepath.Base(inner[0]) == verbGH) {
+		if base == nil && (isGit || isGH) {
 			base = &at
 		}
 	}
@@ -827,7 +842,15 @@ func gitFacts(segments, env [][]string, cwd string) (map[string]any, string) {
 	if len(commands) > 0 {
 		facts["commands"] = commands
 	}
-	return facts, strings.Join(summary, ",")
+	state := map[string]any{}
+	if len(facts) > 0 {
+		state["git"] = facts
+	}
+	gh, ghSummary := ghRecords(ghTargets, git)
+	if gh != nil {
+		state["gh"] = gh
+	}
+	return state, strings.Join(slices.Concat(summary, ghSummary), ",")
 }
 
 // settleCheckout decides "git checkout <word>", which the words leave open,
@@ -866,9 +889,9 @@ func (t gitTarget) record(git gitRunner) map[string]any {
 	}
 	// A ref deletion reports what it loses in deleted_refs instead: forced and
 	// deletes_ref read as a push's, which a local deletion is not.
-	local := len(c.deletedRefs) > 0
+	deletion := len(c.deletedRefs) > 0
 	for name, on := range map[string]bool{
-		"forced": c.forced && !local, "deletes_ref": c.deletesRef && !local, "no_verify": c.noVerify,
+		"forced": c.forced && !deletion, "deletes_ref": c.deletesRef && !deletion, "no_verify": c.noVerify,
 		"amend": c.amend, "config_override": c.override,
 	} {
 		if on {
@@ -895,7 +918,7 @@ func (t gitTarget) record(git gitRunner) map[string]any {
 	if c.class == gitDiscard {
 		t.discardCounts(rec, git)
 	}
-	if local {
+	if deletion {
 		rec["deleted_refs"] = t.deletedRefFacts(git)
 	}
 	return rec
@@ -903,29 +926,50 @@ func (t gitTarget) record(git gitRunner) map[string]any {
 
 // deletedRefFacts says, per ref, whether deleting it loses commits:
 // unique_commits counts those no other ref holds, refs deleted alongside it
-// excluded, and tip_fetched marks a ref last set by a fetch, whose commits the
-// remote holds. Out of time, the count stays unknown.
+// excluded, and tip_fetched marks a ref a fetch last set, whose commits the
+// remote held. Out of time, a count stays unknown; refs past maxGitCommands
+// are not counted.
 func (t gitTarget) deletedRefFacts(git gitRunner) []map[string]any {
-	others := make([]string, 0, len(t.cmd.deletedRefs)+2)
+	refs := t.cmd.deletedRefs
+	facts := make([]map[string]any, len(refs))
+	var counted []string
+	for i, ref := range refs {
+		facts[i] = map[string]any{"ref": ref, "unique_commits": gitUnknown}
+		if t.current && gitRef.MatchString(ref) && len(counted) < maxGitCommands {
+			counted = append(counted, ref)
+		}
+	}
+	if len(counted) == 0 {
+		return facts
+	}
+	others := make([]string, 0, len(refs)+2)
 	others = append(others, "--not")
-	for _, ref := range t.cmd.deletedRefs {
+	for _, ref := range refs {
 		others = append(others, "--exclude="+ref)
 	}
 	others = append(others, "--all")
-	facts := make([]map[string]any, 0, len(t.cmd.deletedRefs))
-	for _, ref := range t.cmd.deletedRefs {
-		fact := map[string]any{"ref": ref, "unique_commits": gitUnknown}
-		facts = append(facts, fact)
-		if !t.current || !gitRef.MatchString(ref) {
+	count := func(tips ...string) (int, bool) {
+		out, ok := git(t.dir, slices.Concat([]string{"rev-list", "--count"}, tips, others)...)
+		n, err := strconv.Atoi(out)
+		return n, ok && err == nil
+	}
+	// One call settles the usual case, deleting merged branches: no commit
+	// only they hold, so every count is 0.
+	all, allOK := count(counted...)
+	for i, ref := range refs {
+		if !slices.Contains(counted, ref) {
 			continue
 		}
-		if out, ok := git(t.dir, slices.Concat([]string{"rev-list", "--count", ref}, others)...); ok {
-			if n, err := strconv.Atoi(out); err == nil {
-				fact["unique_commits"] = n
-			}
+		n, ok := all, allOK && (all == 0 || len(counted) == 1)
+		if !ok {
+			n, ok = count(ref)
 		}
+		if !ok {
+			continue
+		}
+		facts[i]["unique_commits"] = n
 		if subject, ok := git(t.dir, "reflog", "show", "-n1", "--format=%gs", ref); ok && strings.HasPrefix(subject, "fetch") {
-			fact["tip_fetched"] = true
+			facts[i]["tip_fetched"] = true
 		}
 	}
 	return facts

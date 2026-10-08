@@ -216,7 +216,7 @@ var builtinJudge = judgeConfig{
 		"Reading: anything that only reads, lists, searches, diffs, inspects or summarizes - files, processes, logs, transcripts, git history, accounts and APIs with the user's own credentials, and any host or cloud project the user owns or operates, including systems the user operates for others - when no secret value is printed; and everyday collaboration on any repository: opening and updating pull requests, requesting reviewers, and rerunning or cancelling CI runs. Shell structure (loops, pipes, variables, substitutions) does not make a command risky.",
 		"Routine development and maintenance of the user's own things: files in working areas; builds, tests, dev servers and containers; scripts and inline code in a working area, attached or not; installing, updating or removing the user's own tools; editing the user's own tool and host configuration after a backup or as a visible line-level edit; deploying and restarting the user's own apps; any daily work the environment names; deleting scratch files, caches, and backups superseded by a newer copy.",
 		"A secret value moved without being displayed: piped or environment-injected into the program that consumes it, sent in a header to that provider's own API or to the user's own services, copied between the user's own stores, or written only to a temporary file the same command deletes; editing a credential file on the user's own host when the command prints only names or counts.",
-		"Git by record: class `read` or `local` without `no_verify`, including deleting branches and tags, whose commits other refs (`deleted_refs` with `unique_commits` 0), the remote they were fetched from (`tip_fetched`) or the reflog still hold; `discard` with `uncommitted_files`, `untracked_files` and `ignored_files` all 0; fetch, pull and clone; a push with `forced` false and `deletes_ref` false to any branch of the user's own repositories or to a topic branch anywhere; a lease-protected forced push (--force-with-lease) or a branch deletion whose destination is a topic branch of the user's own repository; opening and maintaining pull requests anywhere, and merging them on the user's own repositories.",
+		"Git by record: class `read` or `local` without `no_verify`, including deleting branches and tags, whose commits other refs (`deleted_refs` with `unique_commits` 0) or the remote they were fetched from (`tip_fetched`) still hold; `discard` with `uncommitted_files`, `untracked_files` and `ignored_files` all 0; fetch, pull and clone; a push with `forced` false and `deletes_ref` false to any branch of the user's own repositories or to a topic branch anywhere; a lease-protected forced push (--force-with-lease) or a branch deletion whose destination is a topic branch of the user's own repository; opening and maintaining pull requests anywhere, and merging them on the user's own repositories.",
 		"gh by record: class `read` or `local` anywhere; `collaborate` on any repository; `merge` on the user's own repositories.",
 	},
 	SoftDeny: []string{
@@ -2580,34 +2580,6 @@ func psShowsEnv(args []string) bool {
 	return false
 }
 
-// ghAPIReads reports a gh api call that can only send a GET. gh switches to
-// POST as soon as a field or an input body is given, and GraphQL needs one.
-func ghAPIReads(args []string) bool {
-	for i, a := range args {
-		name, value, attached := strings.Cut(a, "=")
-		short := len(a) > 1 && a[0] == '-' && a[1] != '-'
-		switch {
-		case a == "graphql", abbreviates(name, "--field"), abbreviates(name, "--raw-field"),
-			abbreviates(name, "--input"), short && strings.ContainsAny(a, "fF"):
-			return false
-		case abbreviates(name, "--method"):
-		case short && strings.Contains(a, "X"):
-			// Bundled or attached: -iX GET, -XGET, -X=GET.
-			value = strings.TrimPrefix(a[strings.IndexByte(a, 'X')+1:], "=")
-			attached = value != ""
-		default:
-			continue
-		}
-		if !attached && i+1 < len(args) {
-			value = args[i+1]
-		}
-		if value != "GET" {
-			return false
-		}
-	}
-	return true
-}
-
 // sedScripts picks the script texts out of sed's arguments: every -e value,
 // or the first operand when there is no -e.
 func sedScripts(args []string) []string {
@@ -2847,14 +2819,8 @@ func judge(cfg *config, command, cwd string, parsed parsedCommand, lg *slog.Logg
 		state["data"] = data
 	}
 	facts, records := gitFacts(segments, parsed.assignments(), cwd)
-	if len(facts) > 0 {
-		state["git"] = facts
-	}
-	gh, ghRecords := ghFacts(segments, parsed.assignments(), cwd)
-	if gh != nil {
-		state["gh"] = gh
-	}
-	v.Git = strings.Join(slices.DeleteFunc(append([]string{records}, ghRecords...), func(r string) bool { return r == "" }), ",")
+	maps.Copy(state, facts)
+	v.Git = records
 	if len(redactions) > 0 {
 		state["redactions"] = redactions
 	}
