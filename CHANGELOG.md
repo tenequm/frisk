@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.4.2](https://github.com/tenequm/frisk/compare/v0.4.1...v0.4.2) - 2026-10-08
+
+### <!-- 1 -->🎉 New Features
+- **git:** sum a deletion up as loses_commits for the judge ([9a0e2ab](https://github.com/tenequm/frisk/commit/9a0e2ab36ff8c837a4e0bf244e22ea2ae8c18cdd))
+
+### <!-- 2 -->🐛 Bug Fixes
+- **judge:** say what tip_fetched shows, not that the remote still holds the commits ([6646f23](https://github.com/tenequm/frisk/commit/6646f230c9e10ceea48cda65ffcef4c8e6c01775))
+
+### <!-- 4 -->🚜 Refactor
+- **gh:** drop GraphQL query inspection, graphql is unknown ([66e9695](https://github.com/tenequm/frisk/commit/66e96955bf1eaba8f71de0c349911bc22fc2dcff))
+
+### <!-- 5 -->📚 Documentation
+- describe loses_commits ([3d7aafb](https://github.com/tenequm/frisk/commit/3d7aafbde9634f59959cbce699247b2be171152a))
+
+**Full Changelog**: https://github.com/tenequm/frisk/compare/v0.4.1...v0.4.2
+
 ## [0.4.1](https://github.com/tenequm/frisk/compare/v0.4.0...v0.4.1) - 2026-10-08
 
 ### <!-- 1 -->🎉 New Features
