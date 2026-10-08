@@ -2621,6 +2621,7 @@ func TestProbeScripts(t *testing.T) {
 		{"write hidden by quotes read apart", ".", "S={root}/proj; echo \"$(echo \"'\")\"; S=/b; echo \\'; python3 $S/run.py", probeUnresolvable, nil},
 		{"heredoc inside a parameter default", ".", "S={root}/proj\necho ${X:-<<EOF}\ntrue\nS=/b\nEOF}\npython3 $S/run.py", probeUnresolvable, nil},
 		{"printf -v bundled", ".", "S={root}/proj; printf -vS /b; python3 $S/run.py", probeUnresolvable, nil},
+		// Regression: every "indirect write" row must keep resolving nothing.
 		{"indirect write printf indirect target", ".", "S={root}/proj; N=$(printf '\\x53'); printf -v \"$N\" /evil; python3 $S/run.py", probeUnresolvable, nil},
 		{"indirect write declare indirect target", ".", "S={root}/proj; N=$(printf '\\x53'); declare \"$N=/b\"; python3 $S/run.py", probeUnresolvable, nil},
 		{"indirect write read indirect target", ".", "S={root}/proj; N=$(printf '\\x53'); read \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
@@ -2664,7 +2665,7 @@ func TestProbeScripts(t *testing.T) {
 		{"indirect write mapfile indirect target", ".", "S={root}/proj; mapfile \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
 		{"indirect write readarray indirect target", ".", "S={root}/proj; readarray \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
 		{"indirect write unset indirect target", ".", "S={root}/proj; unset \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
-		{"indirect write indirect write before assignment", ".", "S={root}/proj; read \"$N\"; T=/b; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write before assignment", ".", "S={root}/proj; read \"$N\"; T=/b; python3 $S/run.py", probeUnresolvable, nil},
 		{"indirect write hidden by quotes read apart", ".", "S={root}/proj; N=$(printf '\\x53'); echo \"$(echo \"'\")\"; printf -v \"$N\" /b; echo \\'; python3 $S/run.py", probeUnresolvable, nil},
 		{"indirect write expanding heredoc zsh", ".", "S={root}/proj; cat <<EOF\n\"${(P)N::=x}\"\nEOF\npython3 $S/run.py", probeUnresolvable, nil},
 		{"indirect write expanding heredoc bash", ".", "S={root}/proj; cat <<EOF\n${!N:=x}\nEOF\npython3 $S/run.py", probeUnresolvable, nil},
@@ -2694,6 +2695,46 @@ func TestProbeScripts(t *testing.T) {
 		{"declare literal name expanded value", ".", "S={root}/proj; declare T=$N; python3 $S/run.py", probeAttached, []string{"proj/run.py"}},
 		{"read literal other target", ".", "S={root}/proj; read T; python3 $S/run.py", probeAttached, []string{"proj/run.py"}},
 		{"indirect write literal script path", "proj", "read \"$N\"; python3 run.py", probeAttached, []string{"proj/run.py"}},
+		{"indirect write read array flag", ".", "S={root}/proj; read -r -a \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write printf attached quoted target", ".", "S={root}/proj; printf -v\"$N\" x; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write printf dashes as target", ".", "S={root}/proj; printf -v -- \"$N\" x; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write printf percent n after dashes", ".", "S={root}/proj; printf -- '%n' \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write builtin printf", ".", "S={root}/proj; builtin printf -v \"$N\" x; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write command printf", ".", "S={root}/proj; command printf -v \"$N\" x; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write escaped printf", ".", "S={root}/proj; \\printf -v \"$N\" x; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write quoted printf", ".", "S={root}/proj; 'printf' -v \"$N\" x; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write typeset global", ".", "S={root}/proj; typeset -g \"$N=x\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write mapfile flag", ".", "S={root}/proj; mapfile -t \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write fd redirect names the variable", ".", "S={root}/proj; exec {S}>/dev/null; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write expanded format", ".", "S={root}/proj; printf \"$F\" \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write expanded format may be an option", ".", "S={root}/proj; printf \"$X\" fmt; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write unquoted format may split", ".", "S={root}/proj; printf -- $X; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write zsh print format", ".", "S={root}/proj; print -f '%n' \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write zsh print bundled format", ".", "S={root}/proj; print -rf '%n' \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write let operand value", ".", "S={root}/proj; x=$(printf '\\x53=5'); let x; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write builtin let", ".", "S={root}/proj; builtin let x; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write unquoted command variable", ".", "S={root}/proj; $EDITOR f; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write array command word", ".", "S={root}/proj; \"${A[@]}\" ls; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write substituted command path", ".", "S={root}/proj; \"$(echo x)/x.sh\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"read literal options", ".", "S={root}/proj; read -t 5 x; read -n 1 key; read -p \"Continue? \" ans; python3 $S/run.py", probeAttached, []string{"proj/run.py"}},
+		{"typeset literal option value", ".", "S={root}/proj; typeset -L 10 x; python3 $S/run.py", probeAttached, []string{"proj/run.py"}},
+		{"writer verb as a search pattern", ".", "S={root}/proj; grep -n read src/; rg -n export .; python3 $S/run.py", probeAttached, []string{"proj/run.py"}},
+		{"test brackets before the run", ".", "S={root}/proj; [ -f \"$S/run.py\" ] && [[ -f $S/run.py ]] && python3 \"$S/run.py\"", probeAttached, []string{"proj/run.py"}},
+		{"quoted command path", ".", "S={root}/proj; V={root}/proj; \"$V/blob\" a; \"${V}/blob\" b; python3 $S/run.py", probeAttached, []string{"proj/run.py"}},
+		{"printf expanded format alone", ".", "S={root}/proj; printf \"Found $n files\\n\"; printf -- \"$n\"; python3 $S/run.py", probeAttached, []string{"proj/run.py"}},
+		{"printf expanded format after a substitution", ".", "S={root}/proj; n=$(ls | wc -l); printf \"Found $n files\\n\"; python3 $S/run.py", probeAttached, []string{"proj/run.py"}},
+		{"printf expanded format may split after a substitution", ".", "S={root}/proj; n=$(ls); printf -- \"$n\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"printf escaped percent before n", ".", "S={root}/proj; printf '100%%nice' \"$N\"; python3 $S/run.py", probeAttached, []string{"proj/run.py"}},
+		{"zsh print without a format", ".", "S={root}/proj; print '%n' \"$N\"; python3 $S/run.py", probeAttached, []string{"proj/run.py"}},
+		{"bash key and name lists", ".", "S={root}/proj; echo \"${!arr[@]}\" ${!arr[*]} ${!pre@} ${!pre*}; python3 $S/run.py", probeAttached, []string{"proj/run.py"}},
+		{"jq filters read without quotes", ".", "S={root}/proj; X=$(date); jq -r '.rows[].values | .[] | .data[]? | {id, name}' f; python3 $S/run.py", probeAttached, []string{"proj/run.py"}},
+		{"indirect write class expanded builtin verb", ".", "S={root}/proj; re[]a]d \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write glob may name dot", ".", "S={root}/proj; .* f; python3 $S/run.py", probeUnresolvable, nil},
+		{"indirect write expanded glob verb", ".", "S={root}/proj; $X.x* \"$N\"; python3 $S/run.py", probeUnresolvable, nil},
+		{"zsh key flag", ".", "S={root}/proj; echo ${(k)arr}; python3 $S/run.py", probeUnresolvable, nil},
+		{"script heredoc before a substitution", ".", "S={root}/proj; cat > $S/m.js <<'EOF'\n(async () => {\n  let all = [];\n  for (let p = 1; p <= 4; p++) { const r = await fetch('https://x/y?page='+p); all = all.concat((await r.json()).data || []); }\n  export { all };\n  return JSON.stringify({n: all.length});\n})()\nEOF\nWS=$(curl -s 127.0.0.1:9322/json/list | jq -r '.[0].webSocketDebuggerUrl'); uv run --with websocket-client python $S/run.py $WS < $S/m.js | jq .", probeAttached, []string{"proj/run.py"}},
+		{"script heredoc after a substitution", ".", "S={root}/proj; X=$(date); cat > $S/m.js <<'EOF'\nlet all = [];\nEOF\npython3 $S/run.py", probeUnresolvable, nil},
+		{"heredoc hidden by quotes is no data", ".", "S={root}/proj; B=read; echo \"<<X\"; echo \"$(echo \"'\")\"\n$B \"$N\"; echo \\'\nX\npython3 $S/run.py", probeUnresolvable, nil},
 		{"zsh foreach", ".", "S={root}/proj\nforeach S (/b)\ntrue\nend\npython3 $S/run.py", probeUnresolvable, nil},
 		{"subscript arithmetic in an expanding body", ".", "S={root}/proj\n: <<EOF\n${A[S=5]}\nEOF\npython3 $S/run.py", probeUnresolvable, nil},
 		{"command . sources stdin", ".", "S={root}/proj\ncommand . /dev/stdin <<'EOF'\ntrue\nEOF\npython3 $S/run.py", probeUnresolvable, nil},
@@ -2895,6 +2936,10 @@ func TestIndirectWritesResolveNothing(t *testing.T) {
 		`read -A "$N"`, `declare "$N=x"`, `typeset "$N=x"`, `export "$N=x"`,
 		`local "$N=x"`, `readonly "$N=x"`, `declare -n R=T; R=x`,
 		`typeset -n R=$N; R=x`, `eval "$N=x"`, `: "${(P)N::=x}"`, `: "${!N:=x}"`,
+		`read -r -a "$N"`, `printf -v"$N" x`, `printf -v -- "$N" x`, `builtin printf -v "$N" x`,
+		`command printf -v "$N" x`, `\printf -v "$N" x`, `'printf' -v "$N" x`, `typeset -g "$N=x"`,
+		`local -n R=$N`, `declare -n R=$N; R=x`, `mapfile -t "$N"`, `printf '%n' "$N"`, `printf "$F" "$N"`,
+		`printf "$X" fmt`, `print -f '%n' "$N"`, `x=$Y; let x`, `let i++`, `B=let; $B x`,
 	} {
 		t.Run(form, func(t *testing.T) {
 			command := `S=/safe; N=T; ` + form + `; cat $S/a $HOME/a $TMPDIR/a`
@@ -2907,6 +2952,20 @@ func TestIndirectWritesResolveNothing(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Writer verbs once rescanned every word after them, which took seconds on
+// a long command; a linear scan reads this in milliseconds even under -race.
+func TestIndirectWritesLinear(t *testing.T) {
+	t.Parallel()
+	command := "X=/tmp/a; Y=$(true); echo" + strings.Repeat(" read a printf a declare -x a", 5000)
+	parsed := tokenize(command)
+	start := time.Now()
+	parsed.literalVars()
+	parsed.probeVars(command)
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("took %v", took)
 	}
 }
 
