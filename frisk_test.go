@@ -2034,6 +2034,7 @@ type jevState struct {
 	Cwd       string         `json:"cwd"`
 	Probe     *jevProbeState `json:"probe"`
 	Git       map[string]any `json:"git"`
+	GH        map[string]any `json:"gh"`
 	Data      []any          `json:"data"`
 	Untrusted jevUntrusted   `json:"untrusted"`
 }

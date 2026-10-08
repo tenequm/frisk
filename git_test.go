@@ -442,7 +442,7 @@ func TestGitRecords(t *testing.T) {
 				`{"class":"remote","deletes_ref":false,"destination":"main","destination_is_default":"yes","forced":false,"remote":"github.com/owner/repo","state":"current","subcommand":"push"}]`,
 			"checkout:local,push:remote",
 		},
-		{"gh command gets facts and no record", "gh pr create --fill", "", ""},
+		{"gh command gets no git record", "gh pr create --fill", "", "gh pr create:collaborate"},
 		{"non-git command", "terraform plan", "", ""},
 	}
 	for _, tt := range tests {

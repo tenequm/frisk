@@ -245,6 +245,30 @@ The lookups change nothing: git runs with `--no-optional-locks` and
 `core.fsmonitor=false`, so reading a repository neither rewrites its index nor
 starts a program its config names.
 
+`gh.commands` does the same for gh, five at most (`gh.commands_truncated`
+marks a longer command), read offline in `gh.go` - no network call, so no
+pull request's base branch or author:
+
+| field | when | value |
+|-------|------|-------|
+| `subcommand`, `class` | always | `pr checks`, `api`, ...; a class from the table, or `unknown` for an alias, an extension or a missing pair |
+| `repo` | a command on one repository, or one whose words name it | host/owner/repo from `-R`/`--repo`, a `GH_REPO=` prefix, an `api` endpoint under `repos/`, or the checkout: the remote `gh repo set-default` marked, else the only remote; `unknown` when gh would have to ask or an earlier segment may have changed the remotes |
+
+The classes reuse git's where the meaning carries over and add two:
+
+| class | gh commands |
+|-------|-------------|
+| `read` | `pr view/list/checks/diff/status`, `issue view/list/status`, `run view/list/watch`, `release view/list`, `repo view/list`, `workflow view/list`, `search`, `status`, `browse`, list and get commands, `api` with a GET or a GraphQL query without `mutation` |
+| `local` | `pr checkout`, `run download`, `release download`, `repo clone`, `repo set-default`, `config set` |
+| `collaborate` | pull requests, issues and comments: create, edit, comment, review, ready, close, reopen; `run rerun/cancel` |
+| `merge` | `pr merge`, and `pr review --approve` |
+| `remote` | every other change on GitHub: releases, repository settings, labels, secrets, variables, `workflow run`, `api` writes |
+| `exec` | `auth` changes and `auth token`, extensions, aliases, and a `--jq` filter that reads the environment |
+
+The builtin prose decides gh commands from these records: `read` and `local`
+anywhere, `collaborate` on any repository, `merge` on the user's own; `merge`
+and `remote` elsewhere ask.
+
 Every script the command runs rides along with its sha256: one as
 `untrusted.script`, several as `untrusted.scripts`, 32 KiB combined. The probe
 sees through wrappers (`time`, `timeout`, `env`, `nice`, `nohup`, `exec`,

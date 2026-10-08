@@ -719,6 +719,17 @@ const (
 // gitRunner runs git in dir and reports whether it succeeded.
 type gitRunner func(dir string, args ...string) (string, bool)
 
+// newGitRunner runs git until ctx ends. frisk only reads: no index refresh is
+// written back, and a repository cannot have git status start its fsmonitor
+// program.
+func newGitRunner(ctx context.Context) gitRunner {
+	return func(dir string, args ...string) (string, bool) {
+		args = append([]string{"-C", dir, "--no-optional-locks", "-c", "core.fsmonitor=false"}, args...)
+		out, err := exec.CommandContext(ctx, verbGit, args...).Output()
+		return strings.TrimSpace(string(out)), err == nil
+	}
+}
+
 // gitTarget is one git segment and the directory it runs in.
 type gitTarget struct {
 	cmd gitCommand
@@ -737,13 +748,7 @@ type pushTarget struct{ remote, destination, isDefault string }
 func gitFacts(segments, env [][]string, cwd string) (map[string]any, string) {
 	ctx, cancel := context.WithTimeout(context.Background(), gitFactsTimeout)
 	defer cancel()
-	// frisk only reads: no index refresh is written back, and a repository
-	// cannot have git status start its fsmonitor program.
-	git := func(dir string, args ...string) (string, bool) {
-		args = append([]string{"-C", dir, "--no-optional-locks", "-c", "core.fsmonitor=false"}, args...)
-		out, err := exec.CommandContext(ctx, verbGit, args...).Output()
-		return strings.TrimSpace(string(out)), err == nil
-	}
+	git := newGitRunner(ctx)
 
 	dir := shellDir{path: cwd, known: cwd != ""}
 	var targets []gitTarget

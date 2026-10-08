@@ -217,9 +217,10 @@ var builtinJudge = judgeConfig{
 		"Routine development and maintenance of the user's own things: files in working areas; builds, tests, dev servers and containers; scripts and inline code in a working area, attached or not; installing, updating or removing the user's own tools; editing the user's own tool and host configuration after a backup or as a visible line-level edit; deploying and restarting the user's own apps; any daily work the environment names; deleting scratch files, caches, and backups superseded by a newer copy.",
 		"A secret value moved without being displayed: piped or environment-injected into the program that consumes it, sent in a header to that provider's own API or to the user's own services, copied between the user's own stores, or written only to a temporary file the same command deletes; editing a credential file on the user's own host when the command prints only names or counts.",
 		"Git by record: class `read` or `local` without `no_verify`, including deleting branches and tags, whose commits other refs (`deleted_refs` with `unique_commits` 0), the remote they were fetched from (`tip_fetched`) or the reflog still hold; `discard` with `uncommitted_files`, `untracked_files` and `ignored_files` all 0; fetch, pull and clone; a push with `forced` false and `deletes_ref` false to any branch of the user's own repositories or to a topic branch anywhere; a lease-protected forced push (--force-with-lease) or a branch deletion whose destination is a topic branch of the user's own repository; opening and maintaining pull requests anywhere, and merging them on the user's own repositories.",
+		"gh by record: class `read` or `local` anywhere; `collaborate` on any repository; `merge` on the user's own repositories.",
 	},
 	SoftDeny: []string{
-		"Changing a system the user does not own: merging or approving pull requests, triggering deploy or promote workflows, deploying, or writing cloud, cluster, IAM or secret resources there; anything beyond reading on a host the user does not own; publishing packages to public registries or releases of repositories that are not the user's own; sending messages, emails or posts as the user, including pull request comments other than the collaboration named in allow. Reading and the everyday collaboration named in allow are not covered.",
+		"Changing a system the user does not own: merging or approving pull requests (gh class `merge`), gh class `remote`, triggering deploy or promote workflows, deploying, or writing cloud, cluster, IAM or secret resources there; anything beyond reading on a host the user does not own; publishing packages to public registries or releases of repositories that are not the user's own; sending messages, emails or posts as the user, including pull request comments other than the collaboration named in allow. Reading and the everyday collaboration named in allow are not covered.",
 		"Loss or access the user cannot undo: a git `discard` whose record has `uncommitted_files`, `untracked_files` or `ignored_files` above 0; a push with `forced` true or `deletes_ref` true to a default or shared branch or to a repository that is not the user's own; deleting data, databases, backups or secret-store entries that the same command does not recreate, including emptying the Trash and deleting agent memory files; destroying cloud or cluster resources; creating or widening standing access (authorized_keys entries, keys registered with a provider, long-lived tokens, IAM grants, secret-store access). The user's ownership does not remove these consequences.",
 		"Writing the live gate or agent guardrails: frisk's config file, the frisk binary on PATH, or Claude Code settings, permissions or hook files. Not covered: reading them, copies of the config elsewhere, and configs under an XDG_CONFIG_HOME in a scratch directory.",
 		"A concrete risk that cannot be resolved from the command: running code that is neither shown nor in a working area (a download piped into a shell, a decoded payload executed, a script outside the working areas whose body was not attached), or a secret value whose recipient or output cannot be read.",
@@ -475,7 +476,7 @@ type verdict struct {
 	ScriptSHA     string
 	Probe         string // probe status, set on judge-tier verdicts
 	Scripts       int    // script bodies sent to the judge
-	Git           string // "subcommand:class" per git record sent to the judge
+	Git           string // "subcommand:class" per git record sent to the judge, then "gh subcommand:class" per gh record
 	AskRule       jevAnswer
 	DenyRule      jevAnswer
 	Tool          string
@@ -2551,7 +2552,7 @@ func riskyArgs(seg []string) bool {
 	case "kubectl":
 		return slices.Contains(args, "get") && slices.ContainsFunc(args, kubeSecret.MatchString)
 	case verbGH:
-		return len(args) > 0 && args[0] == "api" && !ghAPIReads(args[1:])
+		return len(args) > 0 && args[0] == ghAPI && !ghAPIReads(args[1:])
 	case "ps":
 		return psShowsEnv(args)
 	default:
@@ -2849,7 +2850,11 @@ func judge(cfg *config, command, cwd string, parsed parsedCommand, lg *slog.Logg
 	if len(facts) > 0 {
 		state["git"] = facts
 	}
-	v.Git = records
+	gh, ghRecords := ghFacts(segments, parsed.assignments(), cwd)
+	if gh != nil {
+		state["gh"] = gh
+	}
+	v.Git = strings.Join(slices.DeleteFunc(append([]string{records}, ghRecords...), func(r string) bool { return r == "" }), ",")
 	if len(redactions) > 0 {
 		state["redactions"] = redactions
 	}
@@ -3858,6 +3863,12 @@ func judgeRequest(model string, rules judgeConfig, state map[string]any) ([]byte
 		}
 		if git["commands_truncated"] != nil {
 			instructions += gitTruncatedInstruction
+		}
+	}
+	if gh, ok := state["gh"].(map[string]any); ok {
+		instructions += ghCommandsInstruction
+		if gh["commands_truncated"] != nil {
+			instructions += ghTruncatedInstruction
 		}
 	}
 	if _, ok := state["data"]; ok {
