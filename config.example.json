@@ -30,7 +30,8 @@
     "allow": ["$defaults", "Running the project's database migrations against the local development database"],
     "soft_deny": ["$defaults", "Anything beyond reading on the production database host db.prod.example.com"],
     "hard_deny": ["$defaults"],
-    "decisions": ["allow", "ask", "deny"]
+    "decisions": ["allow", "ask", "deny"],
+    "askMinConfidence": 0.85
   },
   "backend": {
     "endpoint": "https://api.typesafe.ai/v1/systemone",

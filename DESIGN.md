@@ -39,6 +39,7 @@ parse into pipeline segments (|, &&, ||, ;, newline)
      deny  + confidence >= 0.50 -> "deny" (below: "ask")
      ask   + confidence >= 0.50 -> "ask"  (below: silence)
      anything else              -> silence
+     an "ask" below judge.askMinConfidence  -> silence
      a decision missing from judge.decisions -> silence
   |
 silence -> Claude Code native flow (rules -> classifier -> prompt)
@@ -152,6 +153,8 @@ run or load something else: `PATH` and zsh's `path`, `HOME`, `BASH_ENV`,
 
 `judge.decisions` lists which of `allow`, `ask`, `deny` the judge may issue;
 unset means all three. An empty list or any other value is a malformed config.
+`judge.askMinConfidence` is the lowest confidence a judge ask prompts at; unset
+keeps the builtin 0.50, and a value outside 0.50 to 1 is a malformed config.
 
 ## The judge
 
@@ -488,12 +491,25 @@ judge.decisions; closest rule: soft_deny "..." (0.71)`. It covers the judge
 tier only: `permissions.deny` / `permissions.ask` rules, the static tier and the
 file-tool guardrails are untouched.
 
+`judge.askMinConfidence` raises the ask floor, checked before
+`judge.decisions`: any ask the judge issues below it becomes silence, with the
+reason `ask below judge.askMinConfidence (0.84 < 0.85)`. That includes a deny
+the floors turned into an ask, which sits below 0.50 by construction, so any
+value set silences every downgraded deny. It exists for users who withhold ask:
+over 7 days of one user's traffic, 404 judge asks were withheld, and auto mode
+then hard-denied production actions it never prompts for, but admitting ask as
+is would prompt on about half of them, mostly low-confidence noise. Unset
+changes nothing. It takes 0.50 to 1 and can only raise the floor: below 0.50 the
+measured ask floor still applies.
+
 Hardcoded on purpose: the 0.75 confidence floor on `allow` (measured
 authority-claim injections drag confidence to ~0.68), the 0.50 floor under
-`deny` (an uncertain deny costs one prompt, not a hard block), the 0.50 floor
+`deny` (an uncertain deny costs one prompt, not a hard block), the 0.50 minimum
 under `ask` (every unwanted prompt in live traffic sat at 0.31-0.47 with allow
 and ask nearly tied; below it Claude Code's own flow decides), the script cap,
-the model pin in config (a threshold is a fact about one model version).
+the model pin in config (a threshold is a fact about one model version). Only
+the ask floor moves, and only up: raising it trades prompts for silence, which
+hands the call to Claude Code's own flow and never allows anything.
 
 ## Git
 
@@ -599,7 +615,8 @@ already `0600`.
 `frisk check --replay <file>` (`-` for stdin) reads JSONL such as `frisk.log`
 or an excerpt and, for every line with a `request`, sends its `state` as logged
 except the `policy`, which like the questions is built from the current `judge`
-prose, then applies the same floors and `judge.decisions` as a live call. The
+prose, then applies the same floors, `judge.askMinConfidence` and
+`judge.decisions` as a live call. The
 key is resolved once for the whole run, and one that does not resolve exits 1. It prints one `decision tier
 reason` line per replayed record in input order, then `replayed N, skipped M`;
 lines without a request state, malformed ones included, are skipped. With
@@ -630,7 +647,7 @@ bad-glob rules, empty `Edit()` patterns, bare `*` in deny/ask, `$defaults` in
 `permissions.allow` (a warning: it adds no rules), how many builtin read-only
 rules apply, whether each judge list is unset, extends (`$defaults`) or
 replaces the builtins, the
-effective `judge.decisions`, each `backend` value with where it came from
+effective `judge.decisions` and `judge.askMinConfidence`, each `backend` value with where it came from
 (flag, file or default), and whether `backend.apiKey` resolves - never printing
 any part of the key. No network unless `--live`, which makes one real judge
 call for `true`.
@@ -657,7 +674,8 @@ in that vendor's request logs. `endpoint` must be https, or http on a loopback
 host, and the judge never follows a redirect, because the key travels as a
 bearer token.
 
-The scalar options (`backend.*`, `judge.decisions`) also take flags on `hook`,
+The scalar options (`backend.*`, `judge.decisions`, `judge.askMinConfidence`)
+also take flags on `hook`,
 `check` and `validate`, named as in the file (`--backend.model=...`,
 `'--backend.apiKey=$(...)'`), which override it. The key flag refuses a literal,
 which would sit in argv. No option is read from the environment: a

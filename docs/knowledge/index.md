@@ -41,7 +41,8 @@ Conventions:
   policy live in their config, which extends the judge prose with "$defaults".
 - [Weak judge verdicts are not acted on](confidence-floors.md) - A judge allow
   below 0.75, an ask below 0.50 or a deny below 0.50 is downgraded rather than
-  enforced, because low-confidence verdicts were mostly wrong in live use.
+  enforced, because low-confidence verdicts were mostly wrong in live use; config
+  can raise only the ask floor.
 - [Config can stop the judge from prompting](judge-decisions-can-withhold-prompts.md) -
   judge.decisions lists which of allow, ask and deny the judge may issue; a user
   who lists only allow and deny gets no judge prompts, and the withheld verdicts

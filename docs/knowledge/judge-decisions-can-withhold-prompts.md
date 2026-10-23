@@ -4,7 +4,7 @@ title: Config can stop the judge from prompting
 description: judge.decisions lists which of allow, ask and deny the judge may issue; a user who lists only allow and deny gets no judge prompts, and the withheld verdicts stay countable in the log.
 tags: [judge, config, prompts]
 status: stable
-generated: { by: claude-code/opus-5-5, at: "2026-09-30T14:21:00Z" }
+generated: { by: claude-code/opus-5-5, at: "2026-10-23T20:33:00Z" }
 sources:
   - id: code
     resource: repository commit 0b27374, frisk.go (judgeConfig.decisions and the withheld branch in judge)
@@ -60,7 +60,10 @@ With asks withheld, a confirm-first action is decided by whatever sits behind
 frisk. That is acceptable only while frisk front-runs the classifier. See
 [frisk front-runs Claude Code's permission flow](front-run-not-bypass.md) and
 [Weak judge verdicts are not acted on](confidence-floors.md). An action that must
-always prompt belongs in `permissions.ask`, which the key does not touch.
+always prompt belongs in `permissions.ask`, which the key does not touch. To
+keep the judge's confident asks while dropping the noisy ones, keep `ask` listed
+and raise `judge.askMinConfidence` instead; see
+[Weak judge verdicts are not acted on](confidence-floors.md).
 
 [^code]: feat(judge): let config choose which decisions the judge issues
 [^live]: Live prompts on the first day

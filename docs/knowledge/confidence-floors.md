@@ -1,10 +1,10 @@
 ---
 type: Decision
 title: Weak judge verdicts are not acted on
-description: A judge allow below 0.75, an ask below 0.50 or a deny below 0.50 is downgraded rather than enforced, because low-confidence verdicts were mostly wrong in live use.
+description: A judge allow below 0.75, an ask below 0.50 or a deny below 0.50 is downgraded rather than enforced, because low-confidence verdicts were mostly wrong in live use; config can raise only the ask floor.
 tags: [judge, confidence, thresholds]
 status: stable
-generated: { by: claude-code/opus-5-5, at: "2026-10-06T21:55:00Z" }
+generated: { by: claude-code/opus-5-5, at: "2026-10-23T20:33:00Z" }
 sources:
   - id: code
     resource: repository commit 091465e, frisk.go (the confidence floor constants and the judge verdict mapping)
@@ -24,6 +24,9 @@ sources:
   - id: eval
     resource: 829-command regression and 831-command labeled five-run evaluation through `frisk check`, plus a leak battery, judge jev-1.13 via OpenRouter, 2026-10-06 (results not committed)
     title: Judge evaluation of 2026-10-06
+  - id: withheld
+    resource: frisk.log over 7 days of one user's live traffic with judge.decisions ["allow", "deny"], October 2026 (local, not committed)
+    title: Withheld judge asks
 ---
 
 # Decision
@@ -42,6 +45,11 @@ The judge's answer is enforced only when it is confident:[^code]
 Static `deny` and `ask` rules from config are not affected; they always apply.
 A config can also withhold whole decisions after this mapping; see
 [Config can stop the judge from prompting](judge-decisions-can-withhold-prompts.md).
+
+`judge.askMinConfidence` (0.50 to 1, unset by default) raises the ask floor and
+nothing else. Every ask at or above 0.50 but below it becomes silence, and so
+does every deny the table turns into an ask, since those sit below 0.50 by
+construction. The allow and deny floors stay hardcoded.
 
 # Why
 
@@ -73,6 +81,16 @@ scored deny at only 0.38 to 0.41 confidence, and the floor turned them into
 prompts rather than letting them through, while a prose version that denied
 eagerly had denied routine work in 595 of 3,745 runs.[^eval]
 
+Only the ask floor is configurable, and only upward, because raising it can
+only turn a prompt into silence, which hands the call to Claude Code's own flow
+and never allows anything. The allow floor is the injection defense, so it is
+not the user's to lower. The knob exists because withholding ask outright cost
+too much: in 7 days, 404 judge asks were withheld under `["allow", "deny"]`, and
+auto mode, which never prompts, then hard-denied production actions the user
+wanted to be asked about. Admitting ask at the 0.50 floor would have prompted on
+about half of them, mostly low-confidence noise; a raised floor keeps only the
+confident asks.[^withheld]
+
 # Cost
 
 A weak ask on something risky is no longer shown to the user; it goes to whatever
@@ -88,3 +106,4 @@ They need re-measuring when the model pin or the judge prose changes materially.
 [^confidence]: Jev confidence
 [^design]: frisk design
 [^eval]: Judge evaluation of 2026-10-06
+[^withheld]: Withheld judge asks
