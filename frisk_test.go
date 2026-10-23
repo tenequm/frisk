@@ -1259,6 +1259,11 @@ func TestFlagRules(t *testing.T) {
 		{"backtick key flag", []string{"--backend.apiKey=`echo k`"}, 0, "backend.apiKey: set (flag)"},
 		{"zero timeout means default", []string{"--backend.timeoutMs=0"}, 0, "backend.timeout: 5s (flag)"},
 		{"negative timeout flag", []string{"--backend.timeoutMs=-5"}, 1, "error: backend.timeoutMs -5"},
+		{"ask floor flag", []string{"--judge.askMinConfidence=0.85"}, 0, "judge.askMinConfidence: 0.85"},
+		{"ask floor unset", nil, 0, "judge.askMinConfidence: unset, an ask needs 0.50"},
+		{"ask floor below the builtin", []string{"--judge.askMinConfidence=0.49"}, 1, "error: judge.askMinConfidence 0.49"},
+		{"ask floor above one", []string{"--judge.askMinConfidence=1.01"}, 1, "error: judge.askMinConfidence 1.01"},
+		{"ask floor not a number", []string{"--judge.askMinConfidence=NaN"}, 1, "error: judge.askMinConfidence NaN"},
 		{"endpoint userinfo redacted", []string{"--backend.endpoint=https://user:hunter2@example.com/v1/systemone"}, 0, "backend.endpoint: https://user:xxxxx@example.com/v1/systemone (flag)"},
 	}
 	for _, tt := range tests {
@@ -2367,6 +2372,60 @@ func TestJudgeDecisions(t *testing.T) {
 			}
 			if rec.Decision != cmp.Or(tt.decision, "silent") || rec.Reason != tt.reason {
 				t.Fatalf("log record = %s", buf.String())
+			}
+		})
+	}
+}
+
+// judge.askMinConfidence silences every ask the judge issues below it, a
+// downgraded deny included, and leaves allow and deny to their own floors.
+func TestJudgeAskMinConfidence(t *testing.T) {
+	split := map[string]float64{"allow": 0.10, "ask": 0.85, "deny": 0.05}
+	tests := []struct {
+		name     string
+		min      *float64
+		answer   jevAnswer
+		decision string
+		reason   string
+	}{
+		{
+			"ask below the raised floor is silence", new(0.85),
+			jevAnswer{Choice: "ask", Confidence: 0.84},
+			"", "judge ask (0.84); ask below judge.askMinConfidence (0.84 < 0.85)",
+		},
+		{
+			"ask at the raised floor prompts", new(0.85),
+			jevAnswer{Choice: "ask", Confidence: 0.85, Probabilities: split},
+			decisionAsk, "judge ask (allow 0.10 / ask 0.85 / deny 0.05)",
+		},
+		{
+			"downgraded deny is held to the raised floor", new(0.50),
+			jevAnswer{Choice: "deny", Confidence: 0.40},
+			"", "judge deny below confidence floor (0.40), asking; ask below judge.askMinConfidence (0.40 < 0.50)",
+		},
+		{
+			"unset keeps the downgraded deny", nil,
+			jevAnswer{Choice: "deny", Confidence: 0.40},
+			decisionAsk, "judge deny below confidence floor (0.40), asking",
+		},
+		{
+			"allow keeps its own floor", new(0.95),
+			jevAnswer{Choice: "allow", Confidence: 0.80},
+			decisionAllow, "judge allow (0.80)",
+		},
+		{
+			"confident deny keeps its own floor", new(0.95),
+			jevAnswer{Choice: "deny", Confidence: 0.60},
+			decisionDeny, "judge deny (0.60)",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, _ := fakeJevAnswers(t, map[string]any{"decision": tt.answer})
+			cfg.Judge.AskMinConfidence = tt.min
+			v := decide(cfg, "terraform apply", t.TempDir(), testLogger)
+			if v.Decision != tt.decision || v.Reason != tt.reason {
+				t.Fatalf("verdict = (%q, %q), want (%q, %q)", v.Decision, v.Reason, tt.decision, tt.reason)
 			}
 		})
 	}

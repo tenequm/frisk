@@ -400,6 +400,9 @@ type judgeConfig struct {
 	SoftDeny    []string `json:"soft_deny"`
 	HardDeny    []string `json:"hard_deny"`
 	Decisions   []string `json:"decisions"`
+	// AskMinConfidence raises askConfidenceFloor for every ask the judge
+	// issues, a downgraded deny included; unset keeps the builtin floors.
+	AskMinConfidence *float64 `json:"askMinConfidence"`
 }
 
 // judgeDecisions is what the judge may issue when judge.decisions is unset.
@@ -613,6 +616,14 @@ func bindConfigFlags(flags *goflag.FlagSet, cfg *config) {
 			return errTimeoutMs
 		}
 		cfg.Backend.TimeoutMs = ms
+		return nil
+	})
+	flags.Func("judge.askMinConfidence", "lowest confidence an ask of the judge prompts at, 0.50 to 1", func(v string) error {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return errAskMinConfidence
+		}
+		cfg.Judge.AskMinConfidence = &f
 		return nil
 	})
 	flags.Func("judge.decisions", "comma-separated verdicts the judge may issue", func(v string) error {
@@ -3183,6 +3194,11 @@ func askJudge(cfg *config, state map[string]any, v verdict, missed string, lg *s
 	// A decision judge.decisions leaves out is silence, so Claude Code's own
 	// flow decides; the reason keeps it so the log can still count them.
 	withheld := ""
+	// A raised ask floor sends a weak ask to Claude Code's own flow instead of
+	// prompting, so judge.decisions can admit ask without prompt noise.
+	if m := cfg.Judge.AskMinConfidence; m != nil && v.Decision == decisionAsk && ans.Confidence < *m {
+		v.Decision, withheld = "", fmt.Sprintf("ask below judge.askMinConfidence (%.2f < %.2f)", ans.Confidence, *m)
+	}
 	if v.Decision != "" && !slices.Contains(cfg.Judge.decisions(), v.Decision) {
 		v.Decision, withheld = "", v.Decision+" withheld by judge.decisions"
 	}
@@ -4209,6 +4225,7 @@ var (
 	errBackendMalformed = errors.New("judge backend answer malformed")
 	errJudgeDecisions   = errors.New("want a non-empty list drawn from allow, ask, deny")
 	errTimeoutMs        = errors.New("want a whole number of milliseconds, 0 for the default")
+	errAskMinConfidence = errors.New("want a number from 0.50 to 1: below 0.50 the builtin ask floor already applies")
 	errNoKey            = errors.New("no API key")
 	errEndpoint         = errors.New("want an https URL, or http on a loopback host")
 	errJevConflict      = errors.New("set in both jev and backend; keep only backend")
@@ -4324,6 +4341,10 @@ func checkConfig(cfg *config) error {
 	unknown := func(d string) bool { return !slices.Contains(judgeDecisions, d) }
 	if d := cfg.Judge.Decisions; d != nil && (len(d) == 0 || slices.ContainsFunc(d, unknown)) {
 		return fmt.Errorf("judge.decisions %q: %w", d, errJudgeDecisions)
+	}
+	// Negated so a NaN from the flag is refused too.
+	if m := cfg.Judge.AskMinConfidence; m != nil && !(*m >= askConfidenceFloor && *m <= 1) {
+		return fmt.Errorf("judge.askMinConfidence %v: %w", *m, errAskMinConfidence)
 	}
 	// A literal key on the command line sits in argv, which every local process can read.
 	if cfg.flagged["backend.apiKey"] && !isKeyExpression(cfg.Backend.APIKey) {
@@ -4689,6 +4710,11 @@ func validateConfig(report func(level, format string, a ...any), cfg *config, cf
 		report("info", "judge.%s: %s", l.name, listState(l.items))
 	}
 	report("info", "judge.decisions: %s", strings.Join(cfg.Judge.decisions(), ", "))
+	if m := cfg.Judge.AskMinConfidence; m != nil {
+		report("info", "judge.askMinConfidence: %.2f", *m)
+	} else {
+		report("info", "judge.askMinConfidence: unset, an ask needs %.2f", askConfidenceFloor)
+	}
 
 	return checkBackend(report, cfg)
 }
