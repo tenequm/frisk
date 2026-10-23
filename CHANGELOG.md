@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.4.4](https://github.com/tenequm/frisk/compare/v0.4.3...v0.4.4) - 2026-10-23
+
+### <!-- 1 -->🎉 New Features
+- **judge:** judge.askMinConfidence raises the ask floor ([#44](https://github.com/tenequm/frisk/pull/44)) ([e917faa](https://github.com/tenequm/frisk/commit/e917faa02b3937774fa042a84582e83e25e22a11))
+  New `judge.askMinConfidence` (0.50 to 1, also a flag) sets how confident
+  a judge ask must be to prompt; weaker asks, and denies downgraded to
+  ask, go to Claude Code's own flow instead. Unset changes nothing. Pick a
+  value with `frisk check --replay`.
+
+### <!-- 2 -->🐛 Bug Fixes
+- **judge:** judge.askMinConfidence leaves downgraded denies prompting ([#46](https://github.com/tenequm/frisk/pull/46)) ([97f1e47](https://github.com/tenequm/frisk/commit/97f1e4798b971b320032c833f890ebfcfdb4581a))
+  With `judge.askMinConfidence` set, a judge deny below its confidence
+  floor still prompts as before; the key only silences the judge's own
+  weak asks.
+
+**Full Changelog**: https://github.com/tenequm/frisk/compare/v0.4.3...v0.4.4
+
 ## [0.4.3](https://github.com/tenequm/frisk/compare/v0.4.2...v0.4.3) - 2026-10-08
 
 ### <!-- 2 -->🐛 Bug Fixes
