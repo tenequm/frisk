@@ -400,8 +400,8 @@ type judgeConfig struct {
 	SoftDeny    []string `json:"soft_deny"`
 	HardDeny    []string `json:"hard_deny"`
 	Decisions   []string `json:"decisions"`
-	// AskMinConfidence raises askConfidenceFloor for every ask the judge
-	// issues, a downgraded deny included; unset keeps the builtin floors.
+	// AskMinConfidence raises askConfidenceFloor for the judge's own asks,
+	// never for a deny the floors downgraded to ask; unset keeps the builtin floor.
 	AskMinConfidence *float64 `json:"askMinConfidence"`
 }
 
@@ -3191,14 +3191,15 @@ func askJudge(cfg *config, state map[string]any, v verdict, missed string, lg *s
 		}
 	default:
 	}
-	// A decision judge.decisions leaves out is silence, so Claude Code's own
-	// flow decides; the reason keeps it so the log can still count them.
 	withheld := ""
 	// A raised ask floor sends a weak ask to Claude Code's own flow instead of
-	// prompting, so judge.decisions can admit ask without prompt noise.
-	if m := cfg.Judge.AskMinConfidence; m != nil && v.Decision == decisionAsk && ans.Confidence < *m {
-		v.Decision, withheld = "", fmt.Sprintf("ask below judge.askMinConfidence (%.2f < %.2f)", ans.Confidence, *m)
+	// prompting, so judge.decisions can admit ask without prompt noise. A weak
+	// deny keeps its prompt: measured leaks scored deny below 0.50.
+	if m := cfg.Judge.AskMinConfidence; m != nil && v.Decision == decisionAsk && ans.Choice == decisionAsk && ans.Confidence < *m {
+		v.Decision, withheld = "", fmt.Sprintf("ask below judge.askMinConfidence (%.2f < %v)", ans.Confidence, *m)
 	}
+	// A decision judge.decisions leaves out is silence, so Claude Code's own
+	// flow decides; the reason keeps it so the log can still count them.
 	if v.Decision != "" && !slices.Contains(cfg.Judge.decisions(), v.Decision) {
 		v.Decision, withheld = "", v.Decision+" withheld by judge.decisions"
 	}
@@ -4711,7 +4712,7 @@ func validateConfig(report func(level, format string, a ...any), cfg *config, cf
 	}
 	report("info", "judge.decisions: %s", strings.Join(cfg.Judge.decisions(), ", "))
 	if m := cfg.Judge.AskMinConfidence; m != nil {
-		report("info", "judge.askMinConfidence: %.2f", *m)
+		report("info", "judge.askMinConfidence: %v", *m)
 	} else {
 		report("info", "judge.askMinConfidence: unset, an ask needs %.2f", askConfidenceFloor)
 	}

@@ -967,6 +967,9 @@ func TestValidateFlagsOverrideFile(t *testing.T) {
 	if out, code = validateOutput(t, "", "--backend.timeoutMs=soon"); code != 2 {
 		t.Errorf("bad timeout flag: code = %d, out = %s", code, out)
 	}
+	if out, code = validateOutput(t, "", "--judge.askMinConfidence=high"); code != 2 {
+		t.Errorf("bad ask floor flag: code = %d, out = %s", code, out)
+	}
 	if out, code = validateOutput(t, "", "--backend.endpoint=http://example.com"); code != 1 || !strings.Contains(out, "error: backend.endpoint") {
 		t.Errorf("plain http flag: code = %d, out = %s", code, out)
 	}
@@ -978,7 +981,7 @@ func TestValidateFlagsOverrideFile(t *testing.T) {
 func TestHookFlagErrorsStaySilent(t *testing.T) {
 	newHookEnv(t, `{"permissions":{"deny":["rm *"]}}`)
 	in := `{"tool_name":"Bash","tool_input":{"command":"rm -rf x"},"cwd":"/tmp"}`
-	for _, args := range [][]string{{"hook", "--backend.timeoutMs=soon"}, {"hook", "--nope"}, {"hook", "--backend.endpoint=http://example.com"}, {"hook", "--backend.apiKey=sk-literal"}, {"--log-level=debug", "hook"}} {
+	for _, args := range [][]string{{"hook", "--backend.timeoutMs=soon"}, {"hook", "--judge.askMinConfidence=high"}, {"hook", "--nope"}, {"hook", "--backend.endpoint=http://example.com"}, {"hook", "--backend.apiKey=sk-literal"}, {"--log-level=debug", "hook"}} {
 		var out strings.Builder
 		if code := run(args, strings.NewReader(in), &out); code != 0 || out.Len() != 0 {
 			t.Errorf("%v: code = %d, out = %q", args, code, out.String())
@@ -1260,6 +1263,7 @@ func TestFlagRules(t *testing.T) {
 		{"zero timeout means default", []string{"--backend.timeoutMs=0"}, 0, "backend.timeout: 5s (flag)"},
 		{"negative timeout flag", []string{"--backend.timeoutMs=-5"}, 1, "error: backend.timeoutMs -5"},
 		{"ask floor flag", []string{"--judge.askMinConfidence=0.85"}, 0, "judge.askMinConfidence: 0.85"},
+		{"ask floor shown unrounded", []string{"--judge.askMinConfidence=0.855"}, 0, "judge.askMinConfidence: 0.855"},
 		{"ask floor unset", nil, 0, "judge.askMinConfidence: unset, an ask needs 0.50"},
 		{"ask floor below the builtin", []string{"--judge.askMinConfidence=0.49"}, 1, "error: judge.askMinConfidence 0.49"},
 		{"ask floor above one", []string{"--judge.askMinConfidence=1.01"}, 1, "error: judge.askMinConfidence 1.01"},
@@ -2377,8 +2381,8 @@ func TestJudgeDecisions(t *testing.T) {
 	}
 }
 
-// judge.askMinConfidence silences every ask the judge issues below it, a
-// downgraded deny included, and leaves allow and deny to their own floors.
+// judge.askMinConfidence silences the judge's own asks below it and leaves
+// allow, deny and a deny downgraded to ask to their own floors.
 func TestJudgeAskMinConfidence(t *testing.T) {
 	split := map[string]float64{"allow": 0.10, "ask": 0.85, "deny": 0.05}
 	tests := []struct {
@@ -2399,9 +2403,9 @@ func TestJudgeAskMinConfidence(t *testing.T) {
 			decisionAsk, "judge ask (allow 0.10 / ask 0.85 / deny 0.05)",
 		},
 		{
-			"downgraded deny is held to the raised floor", new(0.50),
+			"downgraded deny keeps its prompt", new(0.85),
 			jevAnswer{Choice: "deny", Confidence: 0.40},
-			"", "judge deny below confidence floor (0.40), asking; ask below judge.askMinConfidence (0.40 < 0.50)",
+			decisionAsk, "judge deny below confidence floor (0.40), asking",
 		},
 		{
 			"unset keeps the downgraded deny", nil,

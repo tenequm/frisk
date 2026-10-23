@@ -629,7 +629,8 @@ func gitEvalRun(cfg *config, proxy *gitEvalProxy, arm string, f gitFixture, cwd 
 	}
 	r.Choice, r.Confidence, r.Probs = answer.Choice, answer.Confidence, answer.Probabilities
 	r.Git = object(sent, "state")["git"]
-	// Graded on what the judge concluded, before judge.decisions withholds it.
+	// Graded on what the judge concluded, before judge.askMinConfidence or
+	// judge.decisions withholds it.
 	switch {
 	case answer.Choice == decisionAllow && answer.Confidence >= allowConfidenceFloor:
 		r.Outcome = decisionAllow

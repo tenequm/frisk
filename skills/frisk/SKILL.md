@@ -121,7 +121,7 @@ repositories, hosts and directories are the user's to `environment`.
 `soft_deny` maps to ask, `hard_deny` to deny. `judge.decisions` limits what the judge may issue:
 `["allow", "deny"]` means it never prompts. Withheld verdicts log as `silent`.
 To keep only confident prompts instead, keep `ask` and set `judge.askMinConfidence`
-(0.50 to 1, e.g. 0.85): a judge ask below it, and every deny downgraded to ask, is silent.
+(0.50 to 1, e.g. 0.85): a judge ask below it is silent, while a weak deny downgraded to ask still prompts.
 Pick the value with `frisk check --replay` and `-judge.askMinConfidence`.
 
 Measured findings:

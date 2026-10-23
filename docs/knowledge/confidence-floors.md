@@ -4,7 +4,7 @@ title: Weak judge verdicts are not acted on
 description: A judge allow below 0.75, an ask below 0.50 or a deny below 0.50 is downgraded rather than enforced, because low-confidence verdicts were mostly wrong in live use; config can raise only the ask floor.
 tags: [judge, confidence, thresholds]
 status: stable
-generated: { by: claude-code/opus-5-5, at: "2026-10-23T20:33:00Z" }
+generated: { by: claude-code/opus-5-5, at: "2026-10-23T21:00:00Z" }
 sources:
   - id: code
     resource: repository commit 091465e, frisk.go (the confidence floor constants and the judge verdict mapping)
@@ -27,6 +27,9 @@ sources:
   - id: withheld
     resource: frisk.log over 7 days of one user's live traffic with judge.decisions ["allow", "deny"], October 2026 (local, not committed)
     title: Withheld judge asks
+  - id: askfloor
+    resource: repository file frisk.go (judgeConfig.AskMinConfidence, its range check in checkConfig and the ask-floor check in askJudge)
+    title: judge.askMinConfidence
 ---
 
 # Decision
@@ -47,9 +50,10 @@ A config can also withhold whole decisions after this mapping; see
 [Config can stop the judge from prompting](judge-decisions-can-withhold-prompts.md).
 
 `judge.askMinConfidence` (0.50 to 1, unset by default) raises the ask floor and
-nothing else. Every ask at or above 0.50 but below it becomes silence, and so
-does every deny the table turns into an ask, since those sit below 0.50 by
-construction. The allow and deny floors stay hardcoded.
+nothing else. Every ask the judge itself issues at or above 0.50 but below it
+becomes silence. A deny the table turns into an ask keeps its prompt, because
+that prompt is what stops the weak-deny leaks described below. The allow and
+deny floors stay hardcoded.[^askfloor]
 
 # Why
 
@@ -107,3 +111,4 @@ They need re-measuring when the model pin or the judge prose changes materially.
 [^design]: frisk design
 [^eval]: Judge evaluation of 2026-10-06
 [^withheld]: Withheld judge asks
+[^askfloor]: judge.askMinConfidence
