@@ -2,7 +2,7 @@ version: 3
 skills:
   https://github.com/tenequm/skills::go-dev:
     destination: .claude/skills/go-dev,.agents/skills/go-dev
-    hash: 6ab6896b7ea427e6068f68f9ad781bcfe84869c9f878d2ea1bb5c90d91c56881
+    hash: a64ddd31c42e532af1b80f5f74971b54fcc25474e111d8cf89ad2906aa236056
     skill: go-dev
     description: Opinionated Go setup with golangci-lint v2, gofumpt, gotestsum, golang-migrate, and just. Use when starting a Go project, configuring lint, format, test, coverage or CI, writing a Justfile, wiring migrations, or leaving a Makefile workflow.
     source: https://github.com/tenequm/skills
